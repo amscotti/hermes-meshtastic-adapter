@@ -2,6 +2,12 @@
 
 `hermes-meshtastic-adapter` is a Hermes Agent platform plugin that connects Hermes to a Meshtastic LoRa mesh. It receives plain-text messages from mesh nodes, forwards them into Hermes sessions, and sends replies back over LoRa as direct messages or channel broadcasts.
 
+<p align="center">
+  <img src="assets/demo-meshtastic-chat.jpg" alt="Chatting with the Hermes agent from the Meshtastic phone app, with replies split into numbered chunks and per-message SNR/RSSI" width="300">
+  <br>
+  <em>Talking to the Hermes agent over LoRa from the Meshtastic app: long replies are split into numbered chunks, each tagged with live signal quality.</em>
+</p>
+
 Public naming:
 
 - GitHub repo: `hermes-meshtastic-adapter`
