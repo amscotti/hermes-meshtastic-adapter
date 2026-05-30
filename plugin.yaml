@@ -1,0 +1,47 @@
+name: meshtastic-platform
+label: Meshtastic
+kind: platform
+version: 1.0.0
+description: >
+  Meshtastic platform adapter for Hermes Agent.
+  Connects to a Meshtastic LoRa mesh node over USB serial and relays
+  messages between LoRa nodes/channels and the Hermes agent.
+author: Anthony Scotti
+requires_env:
+  - name: MESHTASTIC_SERIAL_PORT
+    description: "Path to the Meshtastic USB-serial port (e.g. /dev/cu.usbserial-110 or 'auto')"
+    prompt: "Meshtastic serial port"
+    password: false
+optional_env:
+  - name: MESHTASTIC_BAUD_RATE
+    description: "Baud rate for serial connection (default: 115200)"
+    prompt: "Baud rate"
+    password: false
+  - name: MESHTASTIC_ALLOWED_NODES
+    description: "Comma-separated Meshtastic node IDs allowed to talk to the bot (preferred, e.g. !da1b1613)"
+    prompt: "Allowed node IDs"
+    password: false
+  - name: MESHTASTIC_ALLOWED_USERS
+    description: "Legacy alias for MESHTASTIC_ALLOWED_NODES"
+    prompt: "Allowed node IDs (legacy alias)"
+    password: false
+  - name: MESHTASTIC_ALLOW_ALL_USERS
+    description: "Allow all nodes on the mesh to talk to the bot (true/false, default: false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: MESHTASTIC_HOME_CHANNEL
+    description: "Default channel or node ID for cron/notification delivery (e.g. meshtastic:channel:0)"
+    prompt: "Home channel"
+    password: false
+  - name: MESHTASTIC_CHUNK_BYTES
+    description: "Maximum UTF-8 bytes per outbound LoRa chunk (default: 237; set 170 for conservative multi-hop reliability)"
+    prompt: "Chunk byte limit"
+    password: false
+  - name: MESHTASTIC_CHUNK_DELAY
+    description: "Delay in seconds between outbound chunks (default: 4.0)"
+    prompt: "Chunk delay seconds"
+    password: false
+  - name: MESHTASTIC_ACK_TIMEOUT
+    description: "Seconds to wait for ACK/NACK per outbound chunk (default: 0, non-blocking; set e.g. 30 to fail on NAK/timeout)"
+    prompt: "ACK timeout seconds"
+    password: false

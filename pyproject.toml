@@ -1,0 +1,63 @@
+[project]
+name = "hermes-meshtastic-adapter"
+version = "1.0.0"
+description = "Hermes Agent platform plugin for Meshtastic LoRa mesh networks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Anthony Scotti" }]
+dependencies = [
+    "meshtastic>=2.3.0",
+    "pyserial>=3.5",
+    "pypubsub>=4.0.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["_deps"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = [
+    # Hermes plugin handlers and tests lean on dynamic framework objects.
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_meshtastic.py" = [
+    # Tests patch sys.path before importing Hermes and local plugin modules.
+    "E402",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.pyrefly]
+project-includes = [
+    "__init__.py",
+    "adapter.py",
+    "schemas.py",
+    "telemetry_db.py",
+    "tools.py",
+]
+project-excludes = [
+    "/.git",
+    "/.github",
+    "/.pytest_cache",
+    "/__pycache__",
+    "/_deps",
+    "/venv",
+    "/.venv",
+]
+search-path = ["."]
+python-platform = "linux"
+python-version = "3.11"
+ignore-missing-imports = [
+    "gateway.",
+    "meshtastic.",
+    "pubsub.",
+    "serial.",
+]
