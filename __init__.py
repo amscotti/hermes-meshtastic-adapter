@@ -37,6 +37,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_LIST_NODES_SCHEMA,
         handler=handle_mesh_list_nodes,
+        is_async=True,
         emoji="📡",
     )
     ctx.register_tool(
@@ -44,6 +45,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_NODE_INFO_SCHEMA,
         handler=handle_mesh_node_info,
+        is_async=True,
         emoji="ℹ️",
     )
     ctx.register_tool(
@@ -51,6 +53,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_SIGNAL_QUALITY_SCHEMA,
         handler=handle_mesh_signal_quality,
+        is_async=True,
         emoji="📶",
     )
     ctx.register_tool(
@@ -58,6 +61,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_SEND_DM_SCHEMA,
         handler=handle_mesh_send_dm,
+        is_async=True,
         emoji="💬",
     )
     ctx.register_tool(
@@ -65,6 +69,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_SEND_BROADCAST_SCHEMA,
         handler=handle_mesh_send_broadcast,
+        is_async=True,
         emoji="📢",
     )
     ctx.register_tool(
@@ -72,6 +77,7 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_TELEMETRY_SCHEMA,
         handler=handle_mesh_telemetry,
+        is_async=True,
         emoji="📊",
     )
     ctx.register_tool(
@@ -79,5 +85,6 @@ def register(ctx):
         toolset="meshtastic",
         schema=MESH_TELEMETRY_HISTORY_SCHEMA,
         handler=handle_mesh_telemetry_history,
+        is_async=True,
         emoji="📈",
     )

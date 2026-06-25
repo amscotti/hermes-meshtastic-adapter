@@ -4,18 +4,28 @@ kind: platform
 version: 1.0.0
 description: >
   Meshtastic platform adapter for Hermes Agent.
-  Connects to a Meshtastic LoRa mesh node over USB serial and relays
+  Connects to a Meshtastic LoRa mesh node over USB serial or TCP/IP and relays
   messages between LoRa nodes/channels and the Hermes agent.
 author: Anthony Scotti
-requires_env:
+# No strictly-required env: the adapter connects over serial (defaulting to
+# 'auto' discovery) OR TCP (MESHTASTIC_TCP_HOST). Either transport works, so
+# neither is mandatory — configure one below.
+optional_env:
   - name: MESHTASTIC_SERIAL_PORT
-    description: "Path to the Meshtastic USB-serial port (e.g. /dev/cu.usbserial-110 or 'auto')"
+    description: "Path to the Meshtastic USB-serial port (e.g. /dev/cu.usbserial-110 or 'auto'). Leave unset when connecting via MESHTASTIC_TCP_HOST."
     prompt: "Meshtastic serial port"
     password: false
-optional_env:
   - name: MESHTASTIC_BAUD_RATE
     description: "Baud rate for serial connection (default: 115200)"
     prompt: "Baud rate"
+    password: false
+  - name: MESHTASTIC_TCP_HOST
+    description: "Hostname or IP of a WiFi/Ethernet Meshtastic node. When set, connects over TCP instead of serial."
+    prompt: "Node TCP host/IP"
+    password: false
+  - name: MESHTASTIC_TCP_PORT
+    description: "TCP API port of the Meshtastic node (default: 4403)"
+    prompt: "Node TCP port"
     password: false
   - name: MESHTASTIC_ALLOWED_NODES
     description: "Comma-separated Meshtastic node IDs allowed to talk to the bot (preferred, e.g. !da1b1613)"
@@ -34,7 +44,7 @@ optional_env:
     prompt: "Home channel"
     password: false
   - name: MESHTASTIC_CHUNK_BYTES
-    description: "Maximum UTF-8 bytes per outbound LoRa chunk (default: 237; set 170 for conservative multi-hop reliability)"
+    description: "Maximum UTF-8 bytes per outbound LoRa chunk (default: 170, conservative for multi-hop + encrypted-DM overhead; raw protocol ceiling is 237)"
     prompt: "Chunk byte limit"
     password: false
   - name: MESHTASTIC_CHUNK_DELAY

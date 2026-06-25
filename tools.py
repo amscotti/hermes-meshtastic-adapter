@@ -133,7 +133,7 @@ def assess_signal_quality(snr: float | None) -> str:
 # --- Tool Handlers ---
 
 
-async def handle_mesh_list_nodes(args: dict) -> str:
+async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     """Get a formatted list of all visible Meshtastic nodes in the mesh."""
     adapter_inst = _get_adapter()
     if not adapter_inst:
@@ -186,7 +186,7 @@ async def handle_mesh_list_nodes(args: dict) -> str:
     return json.dumps({"nodes": results}, indent=2)
 
 
-async def handle_mesh_node_info(args: dict) -> str:
+async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     """Retrieve detailed configuration and hardware status for a specific node."""
     node_id_query = args.get("node_id")
     if not node_id_query:
@@ -231,7 +231,7 @@ async def handle_mesh_node_info(args: dict) -> str:
     return json.dumps(details, indent=2)
 
 
-async def handle_mesh_signal_quality(args: dict) -> str:
+async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     """Check the signal strength and quality assessment for a specific node."""
     node_id_query = args.get("node_id")
     if not node_id_query:
@@ -284,7 +284,7 @@ async def handle_mesh_signal_quality(args: dict) -> str:
     return json.dumps(result, indent=2)
 
 
-async def handle_mesh_send_dm(args: dict) -> str:
+async def handle_mesh_send_dm(args: dict, **kwargs) -> str:
     """Send a private direct message (DM) to a specific node."""
     node_id_query = args.get("node_id")
     message = args.get("message")
@@ -331,7 +331,7 @@ async def handle_mesh_send_dm(args: dict) -> str:
     )
 
 
-async def handle_mesh_send_broadcast(args: dict) -> str:
+async def handle_mesh_send_broadcast(args: dict, **kwargs) -> str:
     """Broadcast a text message to all nodes on primary or secondary channel."""
     message = args.get("message")
     channel_query = args.get("channel", "0")
@@ -357,7 +357,7 @@ async def handle_mesh_send_broadcast(args: dict) -> str:
     )
 
 
-async def handle_mesh_telemetry(args: dict) -> str:
+async def handle_mesh_telemetry(args: dict, **kwargs) -> str:
     """Fetch the most recent telemetry readings from a sensor-equipped node."""
     node_id_query = args.get("node_id")
     if not node_id_query:
@@ -416,7 +416,7 @@ async def handle_mesh_telemetry(args: dict) -> str:
     )
 
 
-async def handle_mesh_telemetry_history(args: dict) -> str:
+async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
     """Query historical telemetry, positions, or signal qualities."""
     node_id_query = args.get("node_id")
     metric_type = args.get("metric_type", "telemetry")

@@ -26,7 +26,7 @@ Public naming:
 
 ## Supported Hardware
 
-The v1 transport targets USB serial Meshtastic nodes.
+The adapter connects to a gateway node over USB serial or over TCP/IP.
 
 - ESP32 USB-serial boards such as Heltec WiFi LoRa 32 V3 are supported and are the recommended gateway hardware.
 - The gateway node should be wall-powered or USB-powered and configured as a stable base/client node.
@@ -89,15 +89,28 @@ Environment variables:
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `MESHTASTIC_SERIAL_PORT` | Yes | None | Serial path such as `/dev/cu.usbserial-0001`, or `auto` for discovery. |
+| `MESHTASTIC_SERIAL_PORT` | No* | `auto` | Serial path such as `/dev/cu.usbserial-0001`, or `auto` for discovery. *Configure either this or `MESHTASTIC_TCP_HOST`. |
 | `MESHTASTIC_BAUD_RATE` | No | `115200` | Serial baud rate. |
+| `MESHTASTIC_TCP_HOST` | No | None | Hostname or IP of a WiFi/Ethernet node. When set, the adapter connects over TCP instead of serial. |
+| `MESHTASTIC_TCP_PORT` | No | `4403` | TCP API port of the Meshtastic node. |
 | `MESHTASTIC_ALLOWED_NODES` | No | Empty | Preferred allowlist. Comma-separated node IDs that may talk to Hermes. |
 | `MESHTASTIC_ALLOWED_USERS` | No | Empty | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. |
 | `MESHTASTIC_ALLOW_ALL_USERS` | No | `false` | If true, any mesh node may talk to Hermes. Use with caution. |
 | `MESHTASTIC_HOME_CHANNEL` | No | Empty | Cron/default delivery target, such as `meshtastic:!da1b1613` or `meshtastic:channel:0`. |
-| `MESHTASTIC_CHUNK_BYTES` | No | `237` | Max UTF-8 bytes per outbound LoRa chunk. `170` is recommended for conservative multi-hop reliability. |
+| `MESHTASTIC_CHUNK_BYTES` | No | `170` | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and leaves headroom for encrypted-DM (PKI) overhead; the raw protocol ceiling is `237`. |
 | `MESHTASTIC_CHUNK_DELAY` | No | `4.0` | Delay in seconds between chunk sends. |
 | `MESHTASTIC_ACK_TIMEOUT` | No | `0` | Seconds to wait for ACK/NACK per outbound chunk. `0` is non-blocking. Set `30` to fail sends on NAK or timeout. |
+
+## Connecting Over IP (TCP)
+
+WiFi- or Ethernet-capable nodes expose a TCP API (default port `4403`). Set `MESHTASTIC_TCP_HOST` to connect over the network instead of USB serial:
+
+```env
+MESHTASTIC_TCP_HOST=192.168.1.50
+MESHTASTIC_TCP_PORT=4403
+```
+
+When `MESHTASTIC_TCP_HOST` is set it takes precedence and serial discovery is skipped — the adapter uses a single transport at a time. Enable WiFi/Ethernet and the network API on the node through the Meshtastic app first. Reconnect with exponential backoff and the outbound queue work the same as over serial.
 
 ## Chat IDs
 
@@ -243,8 +256,8 @@ Pull requests are checked by GitHub Actions for Ruff formatting, Ruff linting, P
 
 ## Known Limitations
 
-- USB serial only in v1.
-- BLE support is not implemented.
+- USB serial and TCP/IP transports are supported; BLE is not implemented.
+- Serial and TCP cannot be used at the same time; setting `MESHTASTIC_TCP_HOST` selects TCP.
 - ACK/NACK waiting is optional via `MESHTASTIC_ACK_TIMEOUT`; default sends are non-blocking and log later ACK/NACK callbacks when they arrive.
 - Cron delivery uses a short-lived serial connection rather than the live gateway adapter.
 - The outbound queue is in-memory only (bounded at 100, oldest-first eviction); messages queued during a disconnect are lost if the gateway restarts before the queue drains.

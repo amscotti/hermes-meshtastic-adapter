@@ -40,7 +40,13 @@ sys.modules["meshtastic_tools"] = meshtastic_tools
 tools_spec.loader.exec_module(meshtastic_tools)
 
 import telemetry_db
-from adapter import MeshtasticAdapter, MockSerialInterface, _env_enablement, _standalone_send
+from adapter import (
+    HAS_MESHTASTIC,
+    MeshtasticAdapter,
+    MockSerialInterface,
+    _env_enablement,
+    _standalone_send,
+)
 from telemetry_db import get_position_history, get_telemetry_history, init_db
 
 handle_mesh_list_nodes = meshtastic_tools.handle_mesh_list_nodes
@@ -280,6 +286,23 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         res_send = await handle_mesh_send_broadcast({"message": "Emergency alert!"})
         self.assertIn('"success": true', res_send)
 
+    async def test_tool_handlers_accept_task_id_kwarg(self):
+        """Hermes invokes tool handlers with extra kwargs (e.g. task_id)."""
+        res_list = await handle_mesh_list_nodes({}, task_id="t-1")
+        self.assertIn("Phoenix HQ", res_list)
+        res_info = await handle_mesh_node_info({"node_id": "PARK"}, task_id="t-1")
+        self.assertIn("SENSECAP_T1000", res_info)
+        res_sig = await handle_mesh_signal_quality({"node_id": "!da1b1613"}, task_id="t-1")
+        self.assertIn("quality", res_sig)
+        res_tel = await handle_mesh_telemetry({"node_id": "PARK"}, task_id="t-1")
+        self.assertIn("temperature", res_tel)
+        res_hist = await handle_mesh_telemetry_history({"node_id": "PARK"}, task_id="t-1")
+        self.assertIn("history", res_hist)
+        res_dm = await handle_mesh_send_dm({"node_id": "PARK", "message": "hi"}, task_id="t-1")
+        self.assertIn("success", res_dm)
+        res_bc = await handle_mesh_send_broadcast({"message": "hi"}, task_id="t-1")
+        self.assertIn("success", res_bc)
+
     async def test_standalone_send(self):
         """Test that cron standalone ephemeral send routes through adapter.send."""
         res = await _standalone_send(
@@ -317,6 +340,23 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         reconstructed = "".join(chunk.split("] ", 1)[1] for chunk in chunks)
         self.assertEqual(reconstructed, message)
+
+    def test_default_chunk_budget_is_conservative(self):
+        """With no override, chunks stay within the conservative default budget.
+
+        237 leaves no room for encrypted-DM (PKI) overhead — the radio NAKs
+        oversized DM chunks with TOO_LARGE — so the default must be lower.
+        """
+        self.assertEqual(self.adapter.DEFAULT_CHUNK_BYTES, 170)
+        # setUp leaves MESHTASTIC_CHUNK_BYTES blank → default budget applies.
+        chunks = self.adapter._chunk_message("A" * 400)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.encode("utf-8")), self.adapter.DEFAULT_CHUNK_BYTES)
+
+    def test_declares_native_chunking(self):
+        """The adapter chunks in send(), so the gateway must not truncate payloads."""
+        self.assertTrue(self.adapter.splits_long_messages)
 
     async def test_send_without_queueing_fails_when_disconnected(self):
         """Verify cron-style sends do not silently queue on disconnected adapters."""
@@ -498,6 +538,102 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIn("!ab12cd34", adapter.allowed_nodes)
         self.assertNotIn("bad55555", adapter.allowed_nodes)
         self.assertEqual(env_config["allowed_nodes"], "ab12cd34")
+
+
+class TestMeshtasticTcpTransport(unittest.IsolatedAsyncioTestCase):
+    """Cover the TCP/IP transport selection and connection path."""
+
+    _BLANK_ENV = {
+        "MESHTASTIC_SERIAL_PORT": "",
+        "MESHTASTIC_BAUD_RATE": "",
+        "MESHTASTIC_ALLOWED_NODES": "",
+        "MESHTASTIC_ALLOWED_USERS": "",
+        "MESHTASTIC_ALLOW_ALL_USERS": "",
+        "MESHTASTIC_HOME_CHANNEL": "",
+        "MESHTASTIC_CHUNK_BYTES": "",
+        "MESHTASTIC_CHUNK_DELAY": "0",
+        "MESHTASTIC_ACK_TIMEOUT": "",
+        "MESHTASTIC_TCP_HOST": "",
+        "MESHTASTIC_TCP_PORT": "",
+    }
+
+    async def asyncSetUp(self):
+        # Isolate telemetry writes (MeshtasticAdapter.__init__ calls init_db()).
+        self._tmp_db = tempfile.NamedTemporaryFile(delete=False)
+        self._tmp_db.close()
+        telemetry_db.DB_PATH = self._tmp_db.name
+        init_db()
+
+    async def asyncTearDown(self):
+        try:
+            os.unlink(self._tmp_db.name)
+        except Exception:
+            pass
+
+    def _adapter(self, **env):
+        merged = {**self._BLANK_ENV, **env}
+        with patch.dict(os.environ, merged):
+            config = MagicMock()
+            config.extra = {}
+            return MeshtasticAdapter(config)
+
+    def test_tcp_host_selected_as_target(self):
+        """A configured TCP host produces a single tcp:// target, skipping serial."""
+        adapter = self._adapter(
+            MESHTASTIC_SERIAL_PORT="/dev/ttyUSB0",
+            MESHTASTIC_TCP_HOST="192.168.1.50",
+            MESHTASTIC_TCP_PORT="4403",
+        )
+        self.assertEqual(adapter.tcp_host, "192.168.1.50")
+        self.assertEqual(adapter.tcp_port, 4403)
+        self.assertEqual(adapter._connection_targets(), ["tcp://192.168.1.50:4403"])
+
+    def test_serial_target_when_no_tcp_host(self):
+        """Without a TCP host the adapter keeps the existing serial behaviour."""
+        adapter = self._adapter(MESHTASTIC_SERIAL_PORT="/dev/ttyUSB0")
+        self.assertEqual(adapter._connection_targets(), ["/dev/ttyUSB0"])
+
+    def test_tcp_port_defaults_to_4403(self):
+        adapter = self._adapter(MESHTASTIC_TCP_HOST="meshgw.local")
+        self.assertEqual(adapter.tcp_port, 4403)
+        self.assertEqual(adapter._connection_targets(), ["tcp://meshgw.local:4403"])
+
+    def test_parse_tcp_target(self):
+        self.assertEqual(
+            MeshtasticAdapter._parse_tcp_target("tcp://192.168.1.50:4403"),
+            ("192.168.1.50", 4403),
+        )
+        # Missing port falls back to the default.
+        self.assertEqual(
+            MeshtasticAdapter._parse_tcp_target("tcp://meshgw.local"),
+            ("meshgw.local", 4403),
+        )
+
+    def test_env_enablement_for_tcp_only(self):
+        """The platform enables on a TCP host even without a serial port."""
+        with patch.dict(os.environ, {**self._BLANK_ENV, "MESHTASTIC_TCP_HOST": "10.0.0.7"}):
+            env_config = _env_enablement()
+        self.assertIsNotNone(env_config)
+        self.assertEqual(env_config["tcp_host"], "10.0.0.7")
+        self.assertEqual(env_config["tcp_port"], 4403)
+
+    @unittest.skipUnless(HAS_MESHTASTIC, "meshtastic library not installed")
+    async def test_connect_opens_tcp_interface(self):
+        """connect() routes a TCP target through TCPInterface with host/port."""
+        adapter = self._adapter(MESHTASTIC_TCP_HOST="192.168.1.50", MESHTASTIC_TCP_PORT="4403")
+        adapter.handle_message = AsyncMock()
+
+        fake_iface = MagicMock()
+        fake_iface.nodes = {}
+
+        with patch("meshtastic.tcp_interface.TCPInterface", return_value=fake_iface) as tcp_ctor:
+            await adapter.connect()
+            await asyncio.sleep(0.1)
+            try:
+                tcp_ctor.assert_called_once_with(hostname="192.168.1.50", portNumber=4403)
+                self.assertEqual(adapter.get_interfaces(), [fake_iface])
+            finally:
+                await adapter.disconnect()
 
 
 if __name__ == "__main__":
