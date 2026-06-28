@@ -36,8 +36,12 @@ indent-style = "space"
 line-ending = "auto"
 
 [tool.pyrefly]
+# NOTE: __init__.py is intentionally NOT listed. The repo dir name is hyphenated
+# ("hermes-meshtastic-adapter"), an invalid package name, so with __init__.py as
+# a project root pyrefly resolves its relative imports (`from .adapter import …`)
+# to `__unknown__` and errors. The shim's symbols are still type-checked via
+# adapter.py / tools.py.
 project-includes = [
-    "__init__.py",
     "adapter.py",
     "schemas.py",
     "telemetry_db.py",

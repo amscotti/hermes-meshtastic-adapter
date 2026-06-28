@@ -287,8 +287,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Update the active adapter reference in the companion tools module."""
         self._tools_set_adapter_fn()(adapter)
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Meshtastic node(s) and start listening."""
+        # is_reconnect is part of the base-class contract but ignored here: the
+        # only outbound buffer is in-memory and persists across in-process
+        # reconnects, so there is no server-side queue to preserve.
+        del is_reconnect
         self._running = True
         self.loop = asyncio.get_running_loop()
 
@@ -321,7 +325,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         for TCP, otherwise a serial device path (or ``mock_port`` fallback).
         """
         if self.tcp_host:
-            return [f"tcp://{self.tcp_host}:{self.tcp_port}"]
+            host = self.tcp_host
+            # Bracket bare IPv6 literals so "host:port" stays unambiguous.
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            return [f"tcp://{host}:{self.tcp_port}"]
 
         if self.serial_port == "auto":
             ports = self._discover_serial_ports()
@@ -333,8 +341,24 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _parse_tcp_target(target: str) -> tuple[str, int]:
-        """Parse a ``tcp://host:port`` target key into ``(host, port)``."""
+        """Parse a ``tcp://host:port`` target key into ``(host, port)``.
+
+        Handles bracketed IPv6 literals, e.g. ``tcp://[::1]:4403``.
+        """
         rest = target[len("tcp://") :]
+
+        if rest.startswith("["):
+            # Bracketed IPv6 literal: "[host]" or "[host]:port".
+            host, sep, after = rest[1:].partition("]")
+            if not sep:
+                return rest, DEFAULT_TCP_PORT
+            if after.startswith(":") and after[1:]:
+                try:
+                    return host, int(after[1:])
+                except ValueError:
+                    return host, DEFAULT_TCP_PORT
+            return host, DEFAULT_TCP_PORT
+
         host, sep, port_str = rest.rpartition(":")
         if not sep:
             return rest, DEFAULT_TCP_PORT
@@ -351,6 +375,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         are unavailable so the plugin still loads.
         """
         if target == "mock_port" or not HAS_MESHTASTIC:
+            if target.startswith("tcp://") and not HAS_MESHTASTIC:
+                logger.warning(
+                    "Meshtastic library not installed — falling back to the mock interface "
+                    "for TCP target %s. Install requirements.txt to reach the real node.",
+                    target,
+                )
             return MockSerialInterface(devPath=target)
         if target.startswith("tcp://"):
             host, port = self._parse_tcp_target(target)
@@ -380,27 +410,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
             ports.extend(glob.glob(pat))
         return ports
 
-    async def _reconnect_loop(self, port: str):
-        """Exponential backoff reconnect loop for serial ports."""
+    async def _reconnect_loop(self, target: str):
+        """Exponential backoff reconnect loop for one connection target."""
         backoff = 1.0
         while self._running:
             try:
-                if port not in self._interfaces:
-                    logger.info(f"Attempting to connect to port: {port}...")
+                if target not in self._interfaces:
+                    logger.info(f"Attempting to connect to Meshtastic target: {target}...")
 
-                    if port == "mock_port" or not HAS_MESHTASTIC:
-                        iface = self._open_interface(port)
+                    if target == "mock_port" or not HAS_MESHTASTIC:
+                        iface = self._open_interface(target)
                     else:
                         # Real connections perform blocking USB/TCP handshakes.
                         loop = asyncio.get_running_loop()
                         iface = await loop.run_in_executor(
-                            None, lambda p=port: self._open_interface(p)
+                            None, lambda t=target: self._open_interface(t)
                         )
 
                     # Save interface
-                    self._interfaces[port] = iface
+                    self._interfaces[target] = iface
                     backoff = 1.0  # Reset backoff on success
-                    logger.info(f"Successfully connected to Meshtastic on port {port}")
+                    logger.info(f"Successfully connected to Meshtastic on {target}")
 
                     # Security warnings for local node
                     my_node = getattr(iface, "localNode", None)
@@ -420,40 +450,24 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     # Register PubSub listener
                     if HAS_MESHTASTIC and pub:
                         pub.subscribe(self._on_receive_pubsub, "meshtastic.receive")
-                        logger.info(f"Registered Meshtastic PubSub topic for port {port}")
+                        logger.info(f"Registered Meshtastic PubSub topic for {target}")
 
             except Exception as e:
-                logger.error(f"Failed to connect to Meshtastic on port {port}: {e}")
-                if port in self._interfaces:
-                    self._interfaces.pop(port)
+                logger.error(f"Failed to connect to Meshtastic on {target}: {e}")
+                if target in self._interfaces:
+                    self._interfaces.pop(target)
 
                 # Sleep with exponential backoff
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
 
-            # If successfully connected, sleep until connection drops
-            while self._running and port in self._interfaces:
-                iface = self._interfaces[port]
-                # Keepalive check: prefer Meshtastic's connection API, then PySerial fallback.
-                is_alive = True
-                if hasattr(iface, "isConnected"):
-                    try:
-                        is_alive = bool(iface.isConnected())
-                    except Exception:
-                        is_alive = True
-                elif hasattr(iface, "stream") and iface.stream:
-                    if hasattr(iface.stream, "isOpen"):
-                        is_alive = bool(iface.stream.isOpen())
-                    elif hasattr(iface.stream, "is_open"):
-                        is_alive = bool(iface.stream.is_open)
-                elif hasattr(iface, "socket"):
-                    # TCPInterface exposes the live socket; None means it dropped.
-                    is_alive = iface.socket is not None
-
-                if not is_alive:
-                    logger.warning(f"Meshtastic port {port} dropped connection!")
-                    self._interfaces.pop(port)
+            # If successfully connected, poll until the connection drops
+            while self._running and target in self._interfaces:
+                iface = self._interfaces[target]
+                if not self._interface_is_alive(iface):
+                    logger.warning(f"Meshtastic target {target} dropped connection!")
+                    self._interfaces.pop(target)
                     try:
                         iface.close()
                     except Exception:
@@ -461,6 +475,34 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     break
 
                 await asyncio.sleep(2.0)
+
+    def _interface_is_alive(self, iface: Any) -> bool:
+        """Best-effort liveness probe for a connected interface.
+
+        Probe transport-specific handles first. meshtastic's
+        ``MeshInterface.isConnected`` is a ``threading.Event`` *attribute* (not a
+        method) present on every real interface, so it must be checked LAST and
+        via ``is_set()``: checking it first would shadow the TCP/serial branches,
+        and calling it raises (an Event is not callable) — masking real drops on
+        both transports.
+        """
+        # TCP: TCPInterface exposes the live socket; None means it dropped.
+        if hasattr(iface, "socket"):
+            return iface.socket is not None
+        # Serial: pyserial stream exposes is_open / isOpen().
+        stream = getattr(iface, "stream", None)
+        if stream is not None:
+            if hasattr(stream, "isOpen"):
+                return bool(stream.isOpen())
+            if hasattr(stream, "is_open"):
+                return bool(stream.is_open)
+            return True
+        # Fallback: meshtastic's threading.Event liveness flag.
+        is_connected = getattr(iface, "isConnected", None)
+        if hasattr(is_connected, "is_set"):
+            return bool(is_connected.is_set())
+        # No known liveness handle (e.g. the mock interface) — assume alive.
+        return True
 
     async def _drain_queue_loop(self):
         """Monitor and drain the outbound messages queue when connections are active."""

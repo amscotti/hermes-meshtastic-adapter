@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -358,6 +359,35 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         """The adapter chunks in send(), so the gateway must not truncate payloads."""
         self.assertTrue(self.adapter.splits_long_messages)
 
+    def test_keepalive_tcp_socket(self):
+        """TCP liveness follows the socket handle (None == dropped)."""
+        self.assertTrue(self.adapter._interface_is_alive(SimpleNamespace(socket=object())))
+        self.assertFalse(self.adapter._interface_is_alive(SimpleNamespace(socket=None)))
+
+    def test_keepalive_serial_stream(self):
+        """Serial liveness follows the pyserial stream's is_open."""
+        alive = SimpleNamespace(stream=SimpleNamespace(is_open=True))
+        dead = SimpleNamespace(stream=SimpleNamespace(is_open=False))
+        self.assertTrue(self.adapter._interface_is_alive(alive))
+        self.assertFalse(self.adapter._interface_is_alive(dead))
+
+    def test_keepalive_isconnected_is_event_not_method(self):
+        """meshtastic's isConnected is a threading.Event attribute, not a callable.
+
+        Spec'd stub (only ``isConnected``, no socket/stream) reproduces the real
+        interface layout — a plain MagicMock would make ``isConnected()`` return a
+        truthy Mock and hide the regression this guards against.
+        """
+        event = threading.Event()
+        iface = SimpleNamespace(isConnected=event)
+        self.assertFalse(self.adapter._interface_is_alive(iface))  # cleared == dropped
+        event.set()
+        self.assertTrue(self.adapter._interface_is_alive(iface))
+
+    def test_keepalive_mock_interface_defaults_alive(self):
+        """An interface with no known liveness handle is treated as alive."""
+        self.assertTrue(self.adapter._interface_is_alive(self.adapter.get_interfaces()[0]))
+
     async def test_send_without_queueing_fails_when_disconnected(self):
         """Verify cron-style sends do not silently queue on disconnected adapters."""
         adapter = MeshtasticAdapter(self.config)
@@ -607,6 +637,20 @@ class TestMeshtasticTcpTransport(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             MeshtasticAdapter._parse_tcp_target("tcp://meshgw.local"),
             ("meshgw.local", 4403),
+        )
+
+    def test_ipv6_target_round_trip(self):
+        """IPv6 literals are bracketed when built and unbracketed when parsed."""
+        adapter = self._adapter(MESHTASTIC_TCP_HOST="2001:db8::1", MESHTASTIC_TCP_PORT="8080")
+        self.assertEqual(adapter._connection_targets(), ["tcp://[2001:db8::1]:8080"])
+        self.assertEqual(
+            MeshtasticAdapter._parse_tcp_target("tcp://[2001:db8::1]:8080"),
+            ("2001:db8::1", 8080),
+        )
+        # Bracketed literal without a port falls back to the default.
+        self.assertEqual(
+            MeshtasticAdapter._parse_tcp_target("tcp://[fe80::1]"),
+            ("fe80::1", 4403),
         )
 
     def test_env_enablement_for_tcp_only(self):
