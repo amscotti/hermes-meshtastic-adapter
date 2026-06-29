@@ -1,7 +1,7 @@
 """
 Meshtastic Platform Adapter for Hermes Agent.
 
-Connects to Meshtastic LoRa nodes over USB-serial (and BLE) and bridges them
+Connects to Meshtastic LoRa nodes over USB-serial or TCP/IP and bridges them
 with the Hermes gateway runner.
 """
 
@@ -39,12 +39,16 @@ logger = logging.getLogger(__name__)
 try:
     import meshtastic
     import meshtastic.serial_interface
+    import meshtastic.tcp_interface
     from pubsub import pub
 
     HAS_MESHTASTIC = True
 except ImportError:
     HAS_MESHTASTIC = False
     pub = None
+
+# Default Meshtastic TCP API port exposed by WiFi/Ethernet-capable nodes.
+DEFAULT_TCP_PORT = 4403
 
 
 # --- Mock Implementation for Testing / Dry Run ---
@@ -128,7 +132,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
     with Hermes async message routing.
     """
 
+    # Meshtastic's raw Data payload ceiling (bytes).
     MAX_MESSAGE_LENGTH = 237
+
+    # Default per-chunk byte budget. The 237 ceiling leaves no headroom for the
+    # PKI/encryption overhead on direct messages — the radio NAKs oversized DM
+    # chunks with TOO_LARGE — so the out-of-the-box default is conservative and
+    # also helps multi-hop reliability. Override with MESHTASTIC_CHUNK_BYTES.
+    DEFAULT_CHUNK_BYTES = 170
+
+    # This adapter chunks long replies natively in send() (numbered LoRa-safe
+    # chunks), so the gateway delivery router must hand us the full payload
+    # instead of truncating it at max_message_length.
+    splits_long_messages = True
 
     # Upper bound on retained ACK/NACK bookkeeping records to avoid unbounded
     # memory growth on a long-running gateway. Oldest non-pending records evict first.
@@ -147,6 +163,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         self.serial_port = os.getenv("MESHTASTIC_SERIAL_PORT") or extra.get("serial_port") or "auto"
         self.baud_rate = int(os.getenv("MESHTASTIC_BAUD_RATE") or extra.get("baud_rate", 115200))
+
+        # Optional TCP/IP transport for WiFi/Ethernet-capable nodes. When a host
+        # is configured the adapter connects over TCP instead of serial; the two
+        # transports are mutually exclusive (one connection at a time).
+        self.tcp_host = (os.getenv("MESHTASTIC_TCP_HOST") or extra.get("tcp_host") or "").strip()
+        self.tcp_port = int(
+            os.getenv("MESHTASTIC_TCP_PORT") or extra.get("tcp_port") or DEFAULT_TCP_PORT
+        )
 
         # Access control list (Allowed node IDs, e.g. '!da1b1613')
         allowed_nodes_raw = (
@@ -263,8 +287,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Update the active adapter reference in the companion tools module."""
         self._tools_set_adapter_fn()(adapter)
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Meshtastic node(s) and start listening."""
+        # is_reconnect is part of the base-class contract but ignored here: the
+        # only outbound buffer is in-memory and persists across in-process
+        # reconnects, so there is no server-side queue to preserve.
+        del is_reconnect
         self._running = True
         self.loop = asyncio.get_running_loop()
 
@@ -274,27 +302,90 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._incoming_queue = asyncio.Queue()
         self._incoming_consumer_task = asyncio.create_task(self._consume_incoming_queue())
 
-        # Determine ports to open
-        ports = []
-        if self.serial_port == "auto":
-            ports = self._discover_serial_ports()
-            if not ports:
-                logger.warning("No serial ports discovered. Using fallback mock interface.")
-                ports = ["mock_port"]
-        else:
-            ports = [self.serial_port]
+        # Determine connection targets to open
+        targets = self._connection_targets()
+        logger.info(f"Connecting to Meshtastic targets: {targets}")
 
-        logger.info(f"Connecting to Meshtastic ports: {ports}")
-
-        # Start connection routine for each port
-        for port in ports:
-            self._reconnect_tasks[port] = asyncio.create_task(self._reconnect_loop(port))
+        # Start connection routine for each target
+        for target in targets:
+            self._reconnect_tasks[target] = asyncio.create_task(self._reconnect_loop(target))
 
         # Start queue drain monitoring
         self._queue_drain_task = asyncio.create_task(self._drain_queue_loop())
 
         self._mark_connected()
         return True
+
+    def _connection_targets(self) -> list[str]:
+        """Resolve the connection target keys to open.
+
+        A configured TCP host takes precedence over serial: the two transports
+        are mutually exclusive. Targets are opaque keys understood by
+        ``_reconnect_loop`` and ``_open_interface`` — a ``tcp://host:port`` URL
+        for TCP, otherwise a serial device path (or ``mock_port`` fallback).
+        """
+        if self.tcp_host:
+            host = self.tcp_host
+            # Bracket bare IPv6 literals so "host:port" stays unambiguous.
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            return [f"tcp://{host}:{self.tcp_port}"]
+
+        if self.serial_port == "auto":
+            ports = self._discover_serial_ports()
+            if not ports:
+                logger.warning("No serial ports discovered. Using fallback mock interface.")
+                return ["mock_port"]
+            return ports
+        return [self.serial_port]
+
+    @staticmethod
+    def _parse_tcp_target(target: str) -> tuple[str, int]:
+        """Parse a ``tcp://host:port`` target key into ``(host, port)``.
+
+        Handles bracketed IPv6 literals, e.g. ``tcp://[::1]:4403``.
+        """
+        rest = target[len("tcp://") :]
+
+        if rest.startswith("["):
+            # Bracketed IPv6 literal: "[host]" or "[host]:port".
+            host, sep, after = rest[1:].partition("]")
+            if not sep:
+                return rest, DEFAULT_TCP_PORT
+            if after.startswith(":") and after[1:]:
+                try:
+                    return host, int(after[1:])
+                except ValueError:
+                    return host, DEFAULT_TCP_PORT
+            return host, DEFAULT_TCP_PORT
+
+        host, sep, port_str = rest.rpartition(":")
+        if not sep:
+            return rest, DEFAULT_TCP_PORT
+        try:
+            return host, int(port_str)
+        except ValueError:
+            return rest, DEFAULT_TCP_PORT
+
+    def _open_interface(self, target: str) -> Any:
+        """Open the serial/TCP interface for a connection target.
+
+        Runs the blocking Meshtastic constructors; callers offload this to an
+        executor. Falls back to the mock interface when the Meshtastic libraries
+        are unavailable so the plugin still loads.
+        """
+        if target == "mock_port" or not HAS_MESHTASTIC:
+            if target.startswith("tcp://") and not HAS_MESHTASTIC:
+                logger.warning(
+                    "Meshtastic library not installed — falling back to the mock interface "
+                    "for TCP target %s. Install requirements.txt to reach the real node.",
+                    target,
+                )
+            return MockSerialInterface(devPath=target)
+        if target.startswith("tcp://"):
+            host, port = self._parse_tcp_target(target)
+            return meshtastic.tcp_interface.TCPInterface(hostname=host, portNumber=port)
+        return meshtastic.serial_interface.SerialInterface(devPath=target)
 
     def _discover_serial_ports(self) -> list[str]:
         """Discover active serial connections cross-platform."""
@@ -319,27 +410,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
             ports.extend(glob.glob(pat))
         return ports
 
-    async def _reconnect_loop(self, port: str):
-        """Exponential backoff reconnect loop for serial ports."""
+    async def _reconnect_loop(self, target: str):
+        """Exponential backoff reconnect loop for one connection target."""
         backoff = 1.0
         while self._running:
             try:
-                if port not in self._interfaces:
-                    logger.info(f"Attempting to connect to port: {port}...")
+                if target not in self._interfaces:
+                    logger.info(f"Attempting to connect to Meshtastic target: {target}...")
 
-                    if port == "mock_port" or not HAS_MESHTASTIC:
-                        iface = MockSerialInterface(devPath=port)
+                    if target == "mock_port" or not HAS_MESHTASTIC:
+                        iface = self._open_interface(target)
                     else:
-                        # Real connection; SerialInterface performs blocking USB handshakes.
+                        # Real connections perform blocking USB/TCP handshakes.
                         loop = asyncio.get_running_loop()
                         iface = await loop.run_in_executor(
-                            None, lambda: meshtastic.serial_interface.SerialInterface(devPath=port)
+                            None, lambda t=target: self._open_interface(t)
                         )
 
                     # Save interface
-                    self._interfaces[port] = iface
+                    self._interfaces[target] = iface
                     backoff = 1.0  # Reset backoff on success
-                    logger.info(f"Successfully connected to Meshtastic on port {port}")
+                    logger.info(f"Successfully connected to Meshtastic on {target}")
 
                     # Security warnings for local node
                     my_node = getattr(iface, "localNode", None)
@@ -359,37 +450,24 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     # Register PubSub listener
                     if HAS_MESHTASTIC and pub:
                         pub.subscribe(self._on_receive_pubsub, "meshtastic.receive")
-                        logger.info(f"Registered Meshtastic PubSub topic for port {port}")
+                        logger.info(f"Registered Meshtastic PubSub topic for {target}")
 
             except Exception as e:
-                logger.error(f"Failed to connect to Meshtastic on port {port}: {e}")
-                if port in self._interfaces:
-                    self._interfaces.pop(port)
+                logger.error(f"Failed to connect to Meshtastic on {target}: {e}")
+                if target in self._interfaces:
+                    self._interfaces.pop(target)
 
                 # Sleep with exponential backoff
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
 
-            # If successfully connected, sleep until connection drops
-            while self._running and port in self._interfaces:
-                iface = self._interfaces[port]
-                # Keepalive check: prefer Meshtastic's connection API, then PySerial fallback.
-                is_alive = True
-                if hasattr(iface, "isConnected"):
-                    try:
-                        is_alive = bool(iface.isConnected())
-                    except Exception:
-                        is_alive = True
-                elif hasattr(iface, "stream") and iface.stream:
-                    if hasattr(iface.stream, "isOpen"):
-                        is_alive = bool(iface.stream.isOpen())
-                    elif hasattr(iface.stream, "is_open"):
-                        is_alive = bool(iface.stream.is_open)
-
-                if not is_alive:
-                    logger.warning(f"Meshtastic port {port} dropped connection!")
-                    self._interfaces.pop(port)
+            # If successfully connected, poll until the connection drops
+            while self._running and target in self._interfaces:
+                iface = self._interfaces[target]
+                if not self._interface_is_alive(iface):
+                    logger.warning(f"Meshtastic target {target} dropped connection!")
+                    self._interfaces.pop(target)
                     try:
                         iface.close()
                     except Exception:
@@ -397,6 +475,34 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     break
 
                 await asyncio.sleep(2.0)
+
+    def _interface_is_alive(self, iface: Any) -> bool:
+        """Best-effort liveness probe for a connected interface.
+
+        Probe transport-specific handles first. meshtastic's
+        ``MeshInterface.isConnected`` is a ``threading.Event`` *attribute* (not a
+        method) present on every real interface, so it must be checked LAST and
+        via ``is_set()``: checking it first would shadow the TCP/serial branches,
+        and calling it raises (an Event is not callable) — masking real drops on
+        both transports.
+        """
+        # TCP: TCPInterface exposes the live socket; None means it dropped.
+        if hasattr(iface, "socket"):
+            return iface.socket is not None
+        # Serial: pyserial stream exposes is_open / isOpen().
+        stream = getattr(iface, "stream", None)
+        if stream is not None:
+            if hasattr(stream, "isOpen"):
+                return bool(stream.isOpen())
+            if hasattr(stream, "is_open"):
+                return bool(stream.is_open)
+            return True
+        # Fallback: meshtastic's threading.Event liveness flag.
+        is_connected = getattr(iface, "isConnected", None)
+        if hasattr(is_connected, "is_set"):
+            return bool(is_connected.is_set())
+        # No known liveness handle (e.g. the mock interface) — assume alive.
+        return True
 
     async def _drain_queue_loop(self):
         """Monitor and drain the outbound messages queue when connections are active."""
@@ -812,7 +918,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _chunk_message(self, content: str) -> list[str]:
         """Split text into LoRa-safe UTF-8 byte chunks with sequence prefixes."""
         content = (content or "").strip()
-        limit = int(os.getenv("MESHTASTIC_CHUNK_BYTES") or self.MAX_MESSAGE_LENGTH)
+        limit = int(os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES)
 
         if len(content.encode("utf-8")) <= limit:
             return [content] if content else []
@@ -1216,12 +1322,18 @@ class MeshtasticAdapter(BasePlatformAdapter):
 def _env_enablement() -> dict | None:
     """Helper to register and seed config extra from environment."""
     port = os.getenv("MESHTASTIC_SERIAL_PORT")
-    if not port:
+    tcp_host = os.getenv("MESHTASTIC_TCP_HOST")
+    # Enable the platform when either transport is configured.
+    if not port and not tcp_host:
         return None
 
     return {
         "serial_port": port,
-        "baud_rate": int(os.getenv("MESHTASTIC_BAUD_RATE", 115200)),
+        # ``or`` (not the getenv default) so a blank ``VAR=`` in .env still
+        # falls back to the default instead of raising on ``int("")``.
+        "baud_rate": int(os.getenv("MESHTASTIC_BAUD_RATE") or 115200),
+        "tcp_host": tcp_host or "",
+        "tcp_port": int(os.getenv("MESHTASTIC_TCP_PORT") or DEFAULT_TCP_PORT),
         "allowed_nodes": os.getenv("MESHTASTIC_ALLOWED_NODES")
         or os.getenv("MESHTASTIC_ALLOWED_USERS", ""),
         "allow_all_users": os.getenv("MESHTASTIC_ALLOW_ALL_USERS", "").lower()
@@ -1278,7 +1390,11 @@ def register(ctx):
         label="Meshtastic",
         adapter_factory=lambda cfg: MeshtasticAdapter(cfg),
         check_fn=lambda: True,  # Fallback to mock logic guarantees loading
-        required_env=["MESHTASTIC_SERIAL_PORT"],
+        # No strictly-required env var: the adapter connects over serial (auto
+        # discovery) OR TCP (MESHTASTIC_TCP_HOST). required_env only drives setup
+        # UI display, and listing one transport's var would mislabel the other as
+        # "not configured".
+        required_env=[],
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
@@ -1287,7 +1403,7 @@ def register(ctx):
         pii_safe=True,
         platform_hint=(
             "You are chatting over the Meshtastic LoRa mesh network. "
-            "LoRa has limited bandwidth; individual packets are kept around 237 UTF-8 bytes for reliability. "
+            "LoRa has limited bandwidth; individual packets are kept around 170 UTF-8 bytes for reliability. "
             "The adapter automatically splits longer replies into numbered chunks. Prefer concise answers, "
             "but provide enough detail when the user asks for research, scheduling, or technical help."
         ),

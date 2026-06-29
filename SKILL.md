@@ -8,7 +8,7 @@ The `meshtastic-platform` plugin integrates Meshtastic LoRa radios as a messagin
 
 LoRa mesh radios operate over unlicensed sub-GHz bands (such as 915 MHz in the US or 868 MHz in Europe) with highly constrained bandwidth. Please observe the following constraints:
 
-1. **Length Limits**: The maximum payload size is approximately **237 UTF-8 bytes**. Direct messages or replies exceeding this limit are automatically chunked and delivered sequentially.
+1. **Length Limits**: The raw payload ceiling is approximately **237 UTF-8 bytes**, but encrypted direct messages (PKI) leave less usable room, so outbound replies are chunked at a conservative **~170 UTF-8 bytes** by default (override via `MESHTASTIC_CHUNK_BYTES`). Longer messages are automatically split into numbered chunks and delivered sequentially.
 2. **Delivery Speed**: Message propagation is slow, averaging 1–3 seconds per hop. Responses may have noticeable latency.
 3. **No Rich Media**: Images, voice, or files are **not supported**. The channel relies strictly on plain-text messaging.
 4. **Duty Cycle Limits**: European operators must adhere to standard 10% duty-cycle limits to manage shared channel airtime.
@@ -23,6 +23,8 @@ Configure the adapter via your `config.yaml` or directly using these environment
 |---|---|---|---|
 | `MESHTASTIC_SERIAL_PORT` | String | Path to serial device (e.g. `/dev/cu.usbserial-110`) or `auto` for discovery. | `auto` |
 | `MESHTASTIC_BAUD_RATE` | Integer | Connection speed of the serial interface. | `115200` |
+| `MESHTASTIC_TCP_HOST` | String | Hostname/IP of a WiFi/Ethernet node. When set, connects over TCP instead of serial. | None |
+| `MESHTASTIC_TCP_PORT` | Integer | TCP API port of the Meshtastic node. | `4403` |
 | `MESHTASTIC_ALLOWED_NODES` | List | Comma-separated list of permitted node IDs (e.g., `!da1b1613`). | None |
 | `MESHTASTIC_ALLOWED_USERS` | List | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. | None |
 | `MESHTASTIC_ALLOW_ALL_USERS`| Boolean| If set to `true`, permits any node in the mesh to interact with Hermes. | `false` |

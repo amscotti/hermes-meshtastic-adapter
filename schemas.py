@@ -67,7 +67,7 @@ MESH_SEND_DM_SCHEMA = {
                 },
                 "message": {
                     "type": "string",
-                    "description": "The text message content to send. Keep it brief (maximum 237 UTF-8 bytes).",
+                    "description": "The text message content to send. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
                 },
             },
             "required": ["node_id", "message"],
@@ -86,7 +86,7 @@ MESH_SEND_BROADCAST_SCHEMA = {
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "The text message content to broadcast. Keep it brief (maximum 237 UTF-8 bytes).",
+                    "description": "The text message content to broadcast. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
                 },
                 "channel": {
                     "type": "string",
