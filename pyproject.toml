@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Anthony Scotti" }]
 dependencies = [
-    "meshtastic>=2.3.0",
+    "meshtastic==2.7.10",
     "pyserial>=3.5",
     "pypubsub>=4.0.3",
 ]
@@ -34,6 +34,20 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+
+[tool.coverage.run]
+# tools.py is loaded dynamically as `meshtastic_tools` (see test_meshtastic.py
+# and adapter._load_tools_module) to avoid colliding with Hermes' `tools` pkg.
+source = ["adapter", "meshtastic_tools", "telemetry_db", "schemas"]
+branch = false
+
+[tool.coverage.report]
+# NOTE: setting exclude_lines replaces coverage's default, so re-include
+# "pragma: no cover" alongside our additions.
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
 
 [tool.pyrefly]
 # NOTE: __init__.py is intentionally NOT listed. The repo dir name is hyphenated

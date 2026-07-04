@@ -44,7 +44,7 @@ optional_env:
     prompt: "Home channel"
     password: false
   - name: MESHTASTIC_CHUNK_BYTES
-    description: "Maximum UTF-8 bytes per outbound LoRa chunk (default: 170, conservative for multi-hop + encrypted-DM overhead; raw protocol ceiling is 237)"
+    description: "Maximum UTF-8 bytes per outbound LoRa chunk (default: 170, conservative for multi-hop + encrypted-DM overhead; raw protocol payload ceiling/clamp is 233)"
     prompt: "Chunk byte limit"
     password: false
   - name: MESHTASTIC_CHUNK_DELAY
@@ -62,4 +62,8 @@ optional_env:
   - name: MESHTASTIC_RETRY_BACKOFF
     description: "Seconds between delivery retries (default: 5.0)"
     prompt: "Retry backoff seconds"
+    password: false
+  - name: MESHTASTIC_TELEMETRY_RETENTION_DAYS
+    description: "Age in days at which persisted telemetry/position/signal rows are pruned from SQLite (default: 30, 0 disables). Runs at most hourly."
+    prompt: "Telemetry retention days"
     password: false

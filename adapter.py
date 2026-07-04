@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
@@ -132,10 +133,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
     with Hermes async message routing.
     """
 
-    # Meshtastic's raw Data payload ceiling (bytes).
-    MAX_MESSAGE_LENGTH = 237
+    # Meshtastic's raw Data payload ceiling (bytes) —
+    # mesh_pb2.Constants.DATA_PAYLOAD_LEN (233), enforced by sendData which
+    # raises above it. (The 237 figure sometimes quoted is the LoRa frame size;
+    # the usable app-payload is 233.)
+    MAX_MESSAGE_LENGTH = 233
 
-    # Default per-chunk byte budget. The 237 ceiling leaves no headroom for the
+    # Default per-chunk byte budget. Even the 233 ceiling leaves no headroom for
     # PKI/encryption overhead on direct messages — the radio NAKs oversized DM
     # chunks with TOO_LARGE — so the out-of-the-box default is conservative and
     # also helps multi-hop reliability. Override with MESHTASTIC_CHUNK_BYTES.
@@ -151,8 +155,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
     ACK_RECORD_LIMIT = 1000
 
     # NAK reasons where re-sending the identical packet cannot help — retrying
-    # would only waste shared airtime. Everything else (timeouts, no-route,
-    # max-retransmit, unknown) is treated as transient and eligible for retry.
+    # would only waste shared airtime. Transient failures (timeouts, no-route,
+    # max-retransmit) are NOT listed here and remain eligible for retry. See
+    # mesh_pb2.Routing.Error for the full enum. INVALID_REQUEST is intentionally
+    # absent — it is not a real Routing.Error value (BAD_REQUEST is).
+    # DUTY_CYCLE_LIMIT / RATE_LIMIT_EXCEEDED are included because our fixed
+    # retry backoff (MESHTASTIC_RETRY_BACKOFF, ~seconds) is far shorter than
+    # their reset windows (minutes); retrying would only compound the limit.
     PERMANENT_NAK_REASONS = frozenset(
         {
             "TOO_LARGE",
@@ -161,7 +170,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
             "NOT_AUTHORIZED",
             "PKI_FAILED",
             "PKI_UNKNOWN_PUBKEY",
-            "INVALID_REQUEST",
+            "PKI_SEND_FAIL_PUBLIC_KEY",
+            "ADMIN_PUBLIC_KEY_UNAUTHORIZED",
+            "DUTY_CYCLE_LIMIT",
+            "RATE_LIMIT_EXCEEDED",
         }
     )
 
@@ -172,6 +184,54 @@ class MeshtasticAdapter(BasePlatformAdapter):
     @property
     def message_len_fn(self):
         return lambda text: len(str(text).encode("utf-8"))
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """This adapter gates inbound traffic itself in ``_on_receive``.
+
+        Tells the gateway's ``_is_user_authorized`` that it may trust an
+        already-gated Meshtastic event. The gateway only actually trusts when
+        ``_dm_policy`` resolves to ``"allowlist"`` (see below), mirroring
+        WeCom/Weixin/WhatsApp — defense-in-depth on top of the env allowlist
+        wired via the registry's ``allowed_users_env``.
+        """
+        return True
+
+    @property
+    def _dm_policy(self) -> str:
+        """Effective DM access policy read by the gateway trust path.
+
+        ``"allowlist"`` when a node allowlist is active (the gateway then trusts
+        the adapter's own intake gate); ``"open"`` when ``allow_all`` is set.
+        With no allowlist and ``allow_all=False`` the adapter default-denies at
+        intake, so the gateway never sees such traffic — "open" is inert there.
+        """
+        if self.allowed_nodes and not self.allow_all:
+            return "allowlist"
+        return "open"
+
+    @property
+    def _group_policy(self) -> str:
+        """Effective group/channel access policy read by the gateway trust path.
+
+        Meshtastic channel broadcasts map to ``chat_type="group"`` and pass
+        through the same ``_is_authorized_node`` intake gate as DMs, so the
+        effective policy is identical.
+        """
+        return self._dm_policy
+
+    def format_tool_event(
+        self, event: Any, *, mode: str = "all", preview_max_len: int = 40
+    ) -> str | None:
+        """Suppress tool-progress chrome over LoRa.
+
+        The base default renders per-tool progress text (emoji + name + preview),
+        which would become its own LoRa chunk(s) — real airtime cost on a ~170-
+        byte/4-s-per-chunk channel. Return None so tool events are dropped before
+        they reach the mesh (the final answer still delivers in full).
+        """
+        del event, mode, preview_max_len
+        return None
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("meshtastic")
@@ -524,7 +584,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     # Register PubSub listener
                     if HAS_MESHTASTIC and pub:
                         pub.subscribe(self._on_receive_pubsub, "meshtastic.receive")
-                        logger.info(f"Registered Meshtastic PubSub topic for {target}")
+                        # Connection-lifecycle topics: the library fires these
+                        # from _disconnected()/_connected() (e.g. on device
+                        # reboot), which the liveness poll can miss or lag.
+                        pub.subscribe(self._on_connection_lost, "meshtastic.connection.lost")
+                        pub.subscribe(
+                            self._on_connection_established, "meshtastic.connection.established"
+                        )
+                        logger.info(f"Registered Meshtastic PubSub topics for {target}")
 
             except Exception as e:
                 logger.error(f"Failed to connect to Meshtastic on {target}: {e}")
@@ -560,8 +627,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
         and calling it raises (an Event is not callable) — masking real drops on
         both transports.
         """
-        # TCP: TCPInterface exposes the live socket; None means it dropped.
+        # TCP: TCPInterface exposes the live socket, but its _readBytes self-heals
+        # dead sockets (close -> sleep 1 -> reconnect), creating a brief
+        # socket=None window. Probing the raw socket in that window would falsely
+        # report a drop and tear the interface down mid-self-heal. Trust the
+        # library's authoritative isConnected Event instead — it is cleared only
+        # in _disconnected() (a real drop), not during the self-heal window.
+        is_connected = getattr(iface, "isConnected", None)
         if hasattr(iface, "socket"):
+            if is_connected is not None and hasattr(is_connected, "is_set"):
+                return bool(is_connected.is_set())
             return iface.socket is not None
         # Serial: pyserial stream exposes is_open / isOpen().
         stream = getattr(iface, "stream", None)
@@ -630,6 +705,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
             try:
                 if HAS_MESHTASTIC and pub:
                     pub.unsubscribe(self._on_receive_pubsub, "meshtastic.receive")
+                    pub.unsubscribe(self._on_connection_lost, "meshtastic.connection.lost")
+                    pub.unsubscribe(
+                        self._on_connection_established, "meshtastic.connection.established"
+                    )
                 iface.close()
             except Exception as e:
                 logger.error(f"Error closing interface on {port}: {e}")
@@ -641,6 +720,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Wrapper callback called by the pubsub framework (running on PySub background thread)."""
         if self.loop and self.loop.is_running() and self._incoming_queue is not None:
             self.loop.call_soon_threadsafe(self._incoming_queue.put_nowait, (packet, interface))
+
+    def _on_connection_lost(self, interface=None):
+        """Log Meshtastic-reported connection drops (pubsub background thread).
+
+        The library fires ``meshtastic.connection.lost`` from ``_disconnected()``
+        — e.g. on a reader-thread exit or a device reboot — cases the liveness
+        poll can miss or lag. This is observability-only; the reconnect loop's
+        ``_interface_is_alive`` poll still owns teardown to avoid racing the
+        library's own TCP self-heal.
+        """
+        logger.warning("Meshtastic reported connection lost (interface=%s).", interface)
+
+    def _on_connection_established(self, interface=None):
+        """Log Meshtastic-reported connection establishment (pubsub background thread)."""
+        logger.info("Meshtastic reported connection established (interface=%s).", interface)
 
     async def _consume_incoming_queue(self):
         """Consume incoming packets from the asyncio Queue."""
@@ -846,6 +940,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 chat_type=chat_type,
             )
 
+            # Prefer the radio's receive time so session history reflects when the
+            # packet actually arrived over the air, not when the loop drained it
+            # (packets can sit in the incoming queue across reconnects). A skewed
+            # or garbage rxTime must never drop the message — fall back to now().
+            event_ts = datetime.now()
+            rx_time = packet.get("rxTime")
+            if rx_time:
+                try:
+                    event_ts = datetime.fromtimestamp(float(rx_time))
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+
+            # If the phone app sent this as a reply, surface the replied-to packet
+            # id so the agent/gateway has reply context.
+            reply_id = decoded.get("replyId")
+
             event = MessageEvent(
                 text=text,
                 message_type=MessageType.TEXT,
@@ -853,6 +963,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 raw_message=packet,
                 message_id=str(packet.get("id") or packet.get("rxTime") or time.time()),
                 channel_context=packet_context,
+                timestamp=event_ts,
+                reply_to_message_id=str(reply_id) if reply_id is not None else None,
             )
 
             # Bridge to Hermes Gateway
@@ -937,7 +1049,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         Send a message. Queue it if not connected.
         Splits oversized payloads into numbered chunks automatically.
         """
-        del reply_to
+        # Meshtastic reply threading: reply_to is a prior packet id (string); the
+        # radio's replyId is an int. Only valid integer ids become threaded replies.
+        reply_id = self._parse_reply_id(reply_to)
         wait_for_ack, ack_timeout = self._ack_wait_config(metadata)
         retries = self._send_retries(metadata)
 
@@ -954,7 +1068,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 ack_timeout = 30.0
 
         max_attempts = retries + 1 if (retries > 0 and wait_for_ack and is_dm) else 1
-        retry_backoff = float(os.getenv("MESHTASTIC_RETRY_BACKOFF", "5.0"))
+        retry_backoff = self._retry_backoff()
 
         chunks = self._chunk_message(content)
         logger.info(
@@ -988,6 +1102,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     allow_queueing=allow_queueing,
                     wait_for_ack=wait_for_ack,
                     ack_timeout=ack_timeout,
+                    reply_id=reply_id,
                 )
                 if res.success or attempt >= max_attempts or not self._is_retriable_failure(res):
                     break
@@ -1067,6 +1182,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return 0
 
+    def _retry_backoff(self) -> float:
+        """Seconds to wait between delivery retries (default 5.0).
+
+        An explicit ``0`` is honored (no delay); a missing/empty/garbage value
+        falls back to the default so a misconfiguration can't remove all pacing.
+        """
+        raw = os.getenv("MESHTASTIC_RETRY_BACKOFF", "")
+        if not raw:
+            return 5.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
     def _is_retriable_failure(self, result: SendResult) -> bool:
         """Decide whether a failed chunk send is worth re-sending.
 
@@ -1089,7 +1218,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _chunk_message(self, content: str) -> list[str]:
         """Split text into LoRa-safe UTF-8 byte chunks with sequence prefixes."""
         content = (content or "").strip()
-        limit = int(os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES)
+        # Clamp to the protocol hard ceiling — sendData raises above
+        # DATA_PAYLOAD_LEN (233), so a misconfigured larger value would NAK
+        # every full chunk with TOO_LARGE.
+        limit = min(
+            int(os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES),
+            self.MAX_MESSAGE_LENGTH,
+        )
 
         if len(content.encode("utf-8")) <= limit:
             return [content] if content else []
@@ -1155,6 +1290,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if pkt_id is None and isinstance(pkt, dict):
             pkt_id = pkt.get("id")
         return str(pkt_id) if pkt_id is not None else None
+
+    @staticmethod
+    def _parse_reply_id(reply_to: str | None) -> int | None:
+        """Coerce a Hermes reply_to (prior packet id string) to a Meshtastic int replyId.
+
+        Returns None for absent/non-integer ids (e.g. synthetic "queued" markers),
+        so sendText is only threaded onto a genuine prior packet.
+        """
+        if not reply_to:
+            return None
+        try:
+            return int(reply_to)
+        except (TypeError, ValueError):
+            return None
 
     def _track_pending_ack(
         self,
@@ -1297,6 +1446,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         *,
         wait_for_ack: bool = False,
         ack_timeout: float = 0.0,
+        reply_id: int | None = None,
     ) -> SendResult:
         """Helper to send a single wrapped chunk, queueing it on failure/disconnect."""
         if not self._interfaces:
@@ -1324,6 +1474,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             chunk,
             wait_for_ack=wait_for_ack,
             ack_timeout=ack_timeout,
+            reply_id=reply_id,
         )
 
     async def _send_immediate(
@@ -1333,6 +1484,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         *,
         wait_for_ack: bool = False,
         ack_timeout: float = 0.0,
+        reply_id: int | None = None,
     ) -> SendResult:
         """Dispatch one text chunk immediately to the interface."""
         try:
@@ -1363,12 +1515,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     )
                 pkt = await loop.run_in_executor(
                     None,
-                    lambda current_iface=iface, text=content, target=dest, cb=ack_callback: (
+                    lambda current_iface=iface, text=content, target=dest, cb=ack_callback, rid=reply_id: (
                         current_iface.sendText(
                             text=text,
                             destinationId=target,
                             wantAck=True,
                             onResponse=cb,
+                            replyId=rid,
                         )
                     ),
                 )
@@ -1390,12 +1543,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
                                     break
                 pkt = await loop.run_in_executor(
                     None,
-                    lambda current_iface=iface, text=content, idx=channel_index, cb=ack_callback: (
+                    lambda current_iface=iface, text=content, idx=channel_index, cb=ack_callback, rid=reply_id: (
                         current_iface.sendText(
                             text=text,
                             channelIndex=idx,
                             wantAck=True,
                             onResponse=cb,
+                            replyId=rid,
                         )
                     ),
                 )
@@ -1568,15 +1722,24 @@ def register(ctx):
         # "not configured".
         required_env=[],
         env_enablement_fn=_env_enablement,
+        # Declare the allowlist env vars so the gateway's own _is_user_authorized
+        # layer integrates with them (defense-in-depth + setup-UI visibility).
+        # The legacy MESHTASTIC_ALLOWED_USERS alias is still read adapter-locally.
+        allowed_users_env="MESHTASTIC_ALLOWED_NODES",
+        allow_all_env="MESHTASTIC_ALLOW_ALL_USERS",
         cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
-        max_message_length=237,
+        max_message_length=233,
         emoji="📡",
         pii_safe=True,
         platform_hint=(
-            "You are chatting over the Meshtastic LoRa mesh network. "
-            "LoRa has limited bandwidth; individual packets are kept around 170 UTF-8 bytes for reliability. "
-            "The adapter automatically splits longer replies into numbered chunks. Prefer concise answers, "
-            "but provide enough detail when the user asks for research, scheduling, or technical help."
+            "You are chatting with the user over the Meshtastic LoRa mesh network. "
+            "Only the message TRANSPORT is constrained: replies are split into ~170-byte "
+            "LoRa-safe chunks, so keep answers concise and avoid filler. Your capabilities "
+            "are NOT limited — you retain all your normal tools, including web search and "
+            "browsing (the gateway host has internet), code/file tools, and the mesh_* tools "
+            "for the local radio network. When asked for research, live data, or current "
+            "events, use web search and browse normally; the LoRa link only affects how the "
+            "final answer is delivered, never whether you can look things up."
         ),
     )

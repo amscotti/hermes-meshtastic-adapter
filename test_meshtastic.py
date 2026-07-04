@@ -76,6 +76,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 "MESHTASTIC_ACK_TIMEOUT": "",
                 "MESHTASTIC_SEND_RETRIES": "",
                 "MESHTASTIC_RETRY_BACKOFF": "0",
+                "MESHTASTIC_TELEMETRY_RETENTION_DAYS": "",
             },
         )
         self._env_patcher.start()
@@ -154,6 +155,39 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.chat_id, "meshtastic:!ab12cd34")
         self.assertEqual(event.source.chat_type, "dm")
         self.assertEqual(event.source.user_id, "!ab12cd34")
+
+    async def test_inbound_timestamp_from_rxtime(self):
+        """MessageEvent.timestamp mirrors the packet's rxTime, not loop-drain time."""
+        fixed = 1_700_000_000
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "rxTime": fixed,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"timed packet"},
+            "id": 12345,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertEqual(int(event.timestamp.timestamp()), fixed)
+
+    async def test_inbound_garbage_rxtime_still_delivers(self):
+        """A skewed/garbage rxTime must never drop the message (falls back to now)."""
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "rxTime": 99_999_999_999_999,  # would make fromtimestamp raise (year overflow)
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"still here"},
+            "id": 12346,
+        }
+        before = time.time()
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+
+        self.adapter.handle_message.assert_called_once()  # message delivered, not dropped
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertGreaterEqual(event.timestamp.timestamp(), before - 1)  # fallback: now()
 
     async def test_inbound_channel_scoping(self):
         """Test broadcasts create shared channel sessions."""
@@ -534,6 +568,55 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telemetry_db.DB_PATH, self._tmp_db.name)
         self.assertNotIn(".hermes/meshtastic_telemetry.db", telemetry_db.DB_PATH)
 
+    def test_prune_deletes_only_old_rows(self):
+        """prune() removes rows older than the cutoff and keeps recent ones."""
+        import sqlite3
+        from contextlib import closing
+
+        from telemetry_db import prune
+
+        now = time.time()
+        with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+            # One old (10 days ago) and one fresh signal row.
+            conn.execute(
+                "INSERT INTO signal_quality (node_id, timestamp, snr, rssi) VALUES (?, ?, ?, ?)",
+                ("!old", now - 10 * 86400, 1.0, -100),
+            )
+            conn.execute(
+                "INSERT INTO signal_quality (node_id, timestamp, snr, rssi) VALUES (?, ?, ?, ?)",
+                ("!new", now, 5.0, -90),
+            )
+            conn.commit()
+
+        deleted = prune(5.0)  # cutoff: 5 days
+        self.assertEqual(deleted, 1)
+
+        with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+            remaining = {r[0] for r in conn.execute("SELECT node_id FROM signal_quality")}
+        self.assertNotIn("!old", remaining)
+        self.assertIn("!new", remaining)
+
+    def test_prune_disabled_when_retention_zero(self):
+        """prune(0) is a no-op (retention disabled)."""
+        from telemetry_db import prune
+
+        self.assertEqual(prune(0.0), 0)
+
+    def test_maybe_prune_throttles_and_respects_env(self):
+        """maybe_prune runs at most once per interval and honors the env var."""
+        import telemetry_db as tdb
+
+        tdb._last_prune_epoch = time.time()  # just ran -> throttled
+        with patch.object(tdb, "prune") as mock_prune:
+            tdb.maybe_prune()
+        mock_prune.assert_not_called()  # throttled within the interval
+
+        tdb._last_prune_epoch = 0.0  # force a run
+        with patch.dict(os.environ, {"MESHTASTIC_TELEMETRY_RETENTION_DAYS": "7"}):
+            with patch.object(tdb, "prune") as mock_prune:
+                tdb.maybe_prune()
+        mock_prune.assert_called_once_with(7.0)
+
     async def test_send_result_uses_packet_id(self):
         """Verify SendResult exposes the packet id returned by sendText."""
         iface = self.adapter.get_interfaces()[0]
@@ -678,8 +761,192 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "TOO_LARGE"}))
         )
+        # PKI / auth failures are permanent — re-sending can't fix a key problem.
+        for reason in (
+            "PKI_FAILED",
+            "PKI_UNKNOWN_PUBKEY",
+            "PKI_SEND_FAIL_PUBLIC_KEY",
+            "ADMIN_PUBLIC_KEY_UNAUTHORIZED",
+            "NOT_AUTHORIZED",
+            "DUTY_CYCLE_LIMIT",
+            "RATE_LIMIT_EXCEEDED",
+        ):
+            self.assertFalse(
+                self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": reason})),
+                f"{reason} should be permanent",
+            )
         self.assertFalse(self.adapter._is_retriable_failure(r({"status": "ack"})))
         self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
+
+    def test_retry_backoff_defensive_parsing(self):
+        """_retry_backoff falls back to the default on non-numeric input."""
+        with patch.dict(os.environ, {"MESHTASTIC_RETRY_BACKOFF": "2.5"}):
+            self.assertEqual(self.adapter._retry_backoff(), 2.5)
+        with patch.dict(os.environ, {"MESHTASTIC_RETRY_BACKOFF": "garbage"}):
+            self.assertEqual(self.adapter._retry_backoff(), 5.0)  # default, no crash
+        with patch.dict(os.environ, {"MESHTASTIC_RETRY_BACKOFF": ""}):
+            self.assertEqual(self.adapter._retry_backoff(), 5.0)
+
+    async def test_get_chat_info_dm_resolves_name(self):
+        """get_chat_info returns the long name for a known DM node."""
+        info = await self.adapter.get_chat_info("meshtastic:!ab12cd34")
+        self.assertEqual(info["type"], "dm")
+        self.assertEqual(info["name"], "Park Sensor Node")
+
+    async def test_get_chat_info_dm_unknown_falls_back_to_id(self):
+        """An unknown DM node falls back to its raw id as the name."""
+        info = await self.adapter.get_chat_info("meshtastic:!deadbeef")
+        self.assertEqual(info["type"], "dm")
+        self.assertEqual(info["name"], "!deadbeef")
+
+    async def test_get_chat_info_channel(self):
+        """get_chat_info reports a channel as a group chat."""
+        info = await self.adapter.get_chat_info("meshtastic:channel:Primary")
+        self.assertEqual(info["type"], "group")
+        self.assertIn("Primary", info["name"])
+
+    def test_dm_policy_reflects_access_mode(self):
+        """_dm_policy mirrors the active access mode for the gateway trust path."""
+        # Default fixture: allowed_nodes set, allow_all False -> allowlist policy.
+        self.assertTrue(self.adapter.enforces_own_access_policy)
+        self.assertEqual(self.adapter._dm_policy, "allowlist")
+        # Channel broadcasts pass the same intake gate -> same policy.
+        self.assertEqual(self.adapter._group_policy, "allowlist")
+        # allow_all flips to "open" (adapter forwards everyone).
+        self.adapter.allow_all = True
+        self.assertEqual(self.adapter._dm_policy, "open")
+        self.assertEqual(self.adapter._group_policy, "open")
+        # No allowlist + not allow_all -> "open" (adapter default-denies at intake,
+        # so the gateway never sees this traffic).
+        self.adapter.allow_all = False
+        self.adapter.allowed_nodes = set()
+        self.assertEqual(self.adapter._dm_policy, "open")
+
+    def test_tool_event_chrome_suppressed(self):
+        """format_tool_event returns None so tool progress never hits LoRa."""
+        self.assertIsNone(self.adapter.format_tool_event(SimpleNamespace()))
+
+    def test_extract_packet_id_object_and_dict_shapes(self):
+        """_extract_packet_id reads id from protobuf objects and dict packets."""
+        self.assertEqual(self.adapter._extract_packet_id(SimpleNamespace(id=42)), "42")
+        self.assertEqual(self.adapter._extract_packet_id({"id": 99}), "99")
+        self.assertIsNone(self.adapter._extract_packet_id(SimpleNamespace()))
+        self.assertIsNone(self.adapter._extract_packet_id({}))
+
+    def test_parse_reply_id_coerces_valid_int_only(self):
+        """_parse_reply_id returns an int only for genuine packet-id strings."""
+        self.assertEqual(self.adapter._parse_reply_id("12345"), 12345)
+        self.assertIsNone(self.adapter._parse_reply_id(None))
+        self.assertIsNone(self.adapter._parse_reply_id("queued"))  # synthetic marker
+        self.assertIsNone(self.adapter._parse_reply_id("not-a-number"))
+
+    def test_tcp_liveness_prefers_isconnected_over_socket(self):
+        """A TCP iface mid-self-heal (socket=None, isConnected set) reads alive.
+
+        The library clears socket during its internal reconnect but leaves
+        isConnected set; tearing down on the raw socket probe would race the
+        self-heal. isConnected is the authoritative signal.
+        """
+        import threading
+
+        evt = threading.Event()
+        evt.set()
+        tcp_iface = SimpleNamespace(socket=None, isConnected=evt)
+        self.assertTrue(self.adapter._interface_is_alive(tcp_iface))
+        # A real drop clears isConnected -> dead.
+        evt.clear()
+        self.assertFalse(self.adapter._interface_is_alive(tcp_iface))
+
+    def test_connection_lifecycle_handlers_log_without_raising(self):
+        """The connection.lost/established pubsub handlers are safe no-ops."""
+        with self.assertLogs("adapter", level="WARNING"):
+            self.adapter._on_connection_lost(interface="tcp")
+        with self.assertLogs("adapter", level="INFO"):
+            self.adapter._on_connection_established(interface="tcp")
+
+    async def test_outbound_send_threads_reply_id(self):
+        """A valid reply_to is forwarded to sendText as replyId."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.sendText = MagicMock(return_value=SimpleNamespace(id=555))
+        await self.adapter.send(
+            chat_id="meshtastic:!ab12cd34", content="reply body", reply_to="4242"
+        )
+        self.assertEqual(iface.sendText.call_args.kwargs["replyId"], 4242)
+
+    async def test_outbound_send_no_reply_id_when_absent(self):
+        """When reply_to is absent, sendText gets replyId=None (no threading)."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.sendText = MagicMock(return_value=SimpleNamespace(id=556))
+        await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="plain")
+        self.assertIsNone(iface.sendText.call_args.kwargs["replyId"])
+
+    async def test_inbound_reply_id_mapped_to_event(self):
+        """decoded.replyId surfaces as MessageEvent.reply_to_message_id."""
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "decoded": {
+                "portnum": "TEXT_MESSAGE_APP",
+                "payload": b"a threaded reply",
+                "replyId": 7788,
+            },
+            "id": 9001,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertEqual(event.reply_to_message_id, "7788")
+
+    def test_chunk_bytes_clamped_to_protocol_ceiling(self):
+        """MESHTASTIC_CHUNK_BYTES above the 233-byte ceiling is clamped down."""
+        # A single-chunk payload (<= default 170) is unaffected by the override.
+        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "500"}):
+            chunks = self.adapter._chunk_message("short message")
+        self.assertEqual(chunks, ["short message"])
+        # A long payload over 233 bytes must still split — never a single 500-byte chunk.
+        long = "y" * 400
+        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "500"}):
+            chunks = self.adapter._chunk_message(long)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c.encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH)
+
+    def test_split_utf8_handles_no_whitespace_and_multibyte(self):
+        """_split_utf8 splits long runs without spaces and respects UTF-8 boundaries."""
+        # No whitespace: must still split by byte budget (char_idx<=0 path never trips).
+        no_ws = "x" * 500
+        parts = self.adapter._split_utf8(no_ws, 50)
+        self.assertTrue(len(parts) > 1)
+        self.assertEqual("".join(parts), no_ws)
+        # Multi-byte: a split point must never land inside a UTF-8 character.
+        multibyte = "日本語" * 50  # 3 bytes/char
+        parts = self.adapter._split_utf8(multibyte, 20)
+        self.assertEqual("".join(parts), multibyte)
+        for p in parts:
+            p.encode("utf-8")  # each part is valid UTF-8 on its own
+
+    async def test_outbound_queue_evicts_oldest_when_disconnected(self):
+        """With no interfaces, sends queue (bounded at 100) and evict oldest-first."""
+        self.adapter._interfaces.clear()
+        for i in range(102):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content=f"m{i}")
+            self.assertTrue(res.success)
+            self.assertEqual(res.message_id, "queued")
+        with self.adapter._queue_lock:
+            self.assertLessEqual(len(self.adapter._outbound_queue), 100)
+            # First two (m0, m1) evicted; m2 is now the oldest retained.
+            self.assertEqual(self.adapter._outbound_queue[0]["content"], "m2")
+
+    async def test_named_channel_send_resolves_index(self):
+        """Sending to a named channel resolves its channel index from localNode."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.sendText = MagicMock(return_value=SimpleNamespace(id=4242))
+
+        res = await self.adapter.send(chat_id="meshtastic:channel:Primary", content="hi")
+
+        self.assertTrue(res.success)
+        iface.sendText.assert_called_once()
+        self.assertEqual(iface.sendText.call_args.kwargs["channelIndex"], 0)
 
     async def test_send_errors_known_dm_without_public_key(self):
         """Verify direct sends fail hard when node info shows no public key."""
@@ -704,6 +971,153 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertIn("public key", result["error"])
         iface.sendText.assert_not_called()
+
+    async def test_all_tools_error_when_no_adapter(self):
+        """Every mesh_* handler returns a JSON error when no adapter is active."""
+        meshtastic_tools.set_adapter(None)
+        try:
+            calls = [
+                handle_mesh_list_nodes({}),
+                handle_mesh_node_info({"node_id": "!ab12cd34"}),
+                handle_mesh_signal_quality({"node_id": "!ab12cd34"}),
+                handle_mesh_send_dm({"node_id": "!ab12cd34", "message": "hi"}),
+                handle_mesh_send_broadcast({"message": "hi"}),
+                handle_mesh_telemetry({"node_id": "!ab12cd34"}),
+                handle_mesh_telemetry_history({"node_id": "!ab12cd34"}),
+            ]
+            for coro in calls:
+                result = json.loads(await coro)
+                self.assertIn("error", result)
+                self.assertIn("not connected", result["error"])
+        finally:
+            meshtastic_tools.set_adapter(self.adapter)
+
+    async def test_tools_error_on_missing_required_params(self):
+        """Handlers reject calls with missing required parameters."""
+        for coro in (
+            handle_mesh_node_info({}),
+            handle_mesh_signal_quality({}),
+            handle_mesh_send_dm({"node_id": "!ab12cd34"}),  # no message
+            handle_mesh_send_dm({"message": "hi"}),  # no node_id
+            handle_mesh_send_broadcast({}),
+            handle_mesh_telemetry({}),
+            handle_mesh_telemetry_history({}),
+        ):
+            result = json.loads(await coro)
+            self.assertIn("error", result)
+            self.assertIn("required", result["error"])
+
+    async def test_tools_error_on_unresolved_node(self):
+        """node_info and send_dm surface a clear error for unknown nodes."""
+        result = json.loads(await handle_mesh_node_info({"node_id": "!deadbeef"}))
+        self.assertIn("not found", result["error"])
+        result = json.loads(await handle_mesh_send_dm({"node_id": "!deadbeef", "message": "x"}))
+        self.assertIn("could not be resolved", result["error"])
+
+    def test_resolve_node_lookup_paths(self):
+        """resolve_node matches by id, name, numeric num — and misses cleanly."""
+        resolve_node = meshtastic_tools.resolve_node
+        # Empty query.
+        self.assertEqual(resolve_node("", self.adapter), (None, None))
+        # Numeric node-num lookup (mock PARK node num).
+        _, info = resolve_node("2870135092", self.adapter)
+        self.assertEqual(info["user"]["id"], "!ab12cd34")
+        # Miss returns (None, None).
+        self.assertEqual(resolve_node("no-such-node", self.adapter), (None, None))
+
+    def test_assess_signal_quality_bands(self):
+        """assess_signal_quality covers every SNR band."""
+        assess = meshtastic_tools.assess_signal_quality
+        self.assertEqual(assess(None), "Unknown")
+        self.assertEqual(assess(9.0), "Excellent")
+        self.assertEqual(assess(5.0), "Good")
+        self.assertEqual(assess(0.0), "Fair")
+        self.assertEqual(assess(-10.0), "Poor")
+        self.assertEqual(assess(-20.0), "No signal")
+
+    async def test_list_nodes_falls_back_to_signal_history(self):
+        """A node with no live/observed SNR gets its signal from the DB history."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!cc001122"] = {
+            "num": 1,
+            "user": {"id": "!cc001122", "longName": "Historic", "shortName": "HIS"},
+        }
+        telemetry_db.log_signal("!cc001122", snr=2.5, rssi=-110)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!cc001122")
+        self.assertEqual(node["snr"], 2.5)
+        self.assertEqual(node["rssi"], -110)
+
+    async def test_list_nodes_dedupes_across_interfaces(self):
+        """The same node seen on two interfaces appears once."""
+        iface = self.adapter.get_interfaces()[0]
+        self.adapter._interfaces["second_port"] = iface  # same node DB twice
+        try:
+            res = json.loads(await handle_mesh_list_nodes({}))
+            ids = [n["node_id"] for n in res["nodes"]]
+            self.assertEqual(len(ids), len(set(ids)))
+        finally:
+            self.adapter._interfaces.pop("second_port", None)
+
+    async def test_signal_quality_history_fallback_and_no_data(self):
+        """signal_quality falls back to DB history; errors when nothing is known."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!cc001122"] = {
+            "num": 2,
+            "user": {"id": "!cc001122", "longName": "Historic", "shortName": "HIS"},
+        }
+        # No live snr, no history -> explicit no-readings error.
+        result = json.loads(await handle_mesh_signal_quality({"node_id": "!cc001122"}))
+        self.assertIn("No signal quality readings", result["error"])
+        # With history -> falls back to the persisted reading and builds a trend.
+        telemetry_db.log_signal("!cc001122", snr=1.5, rssi=-115)
+        result = json.loads(await handle_mesh_signal_quality({"node_id": "!cc001122"}))
+        self.assertEqual(result["current"]["snr"], 1.5)
+        self.assertEqual(len(result["trend_history"]), 1)
+
+    async def test_telemetry_history_fallback_and_no_data(self):
+        """mesh_telemetry uses DB history when node metrics are absent; errors when neither."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!cc001122"] = {
+            "num": 3,
+            "user": {"id": "!cc001122", "longName": "Historic", "shortName": "HIS"},
+        }
+        # No metrics anywhere -> error.
+        result = json.loads(await handle_mesh_telemetry({"node_id": "!cc001122"}))
+        self.assertIn("No telemetry data", result["error"])
+        # Persisted telemetry -> served from the DB fallback.
+        telemetry_db.log_telemetry("!cc001122", battery_level=77, temperature=19.5)
+        result = json.loads(await handle_mesh_telemetry({"node_id": "!cc001122"}))
+        self.assertEqual(result["battery_level"], 77)
+        self.assertEqual(result["temperature"], 19.5)
+
+    async def test_telemetry_history_metric_types_and_limits(self):
+        """telemetry_history serves all metric types, rejects bad ones, clamps limits."""
+        telemetry_db.log_position("!ab12cd34", latitude=42.0, longitude=-71.0, altitude=10.0)
+        telemetry_db.log_signal("!ab12cd34", snr=4.0, rssi=-98)
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "positions"}
+            )
+        )
+        self.assertEqual(res["metric_type"], "positions")
+        self.assertEqual(len(res["history"]), 1)
+        self.assertIn("time", res["history"][0])  # formatted timestamp added
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "signal_quality", "limit": "not-a-number"}
+            )
+        )
+        self.assertEqual(res["metric_type"], "signal_quality")  # bad limit falls back to 10
+        self.assertEqual(len(res["history"]), 1)
+
+        res = json.loads(
+            await handle_mesh_telemetry_history({"node_id": "!ab12cd34", "metric_type": "bogus"})
+        )
+        self.assertIn("Invalid metric_type", res["error"])
 
     def test_ack_history_is_bounded(self):
         """Verify ACK bookkeeping does not grow without bound."""
@@ -756,6 +1170,26 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIn("!ab12cd34", adapter.allowed_nodes)
         self.assertNotIn("bad55555", adapter.allowed_nodes)
         self.assertEqual(env_config["allowed_nodes"], "ab12cd34")
+
+    def test_register_declares_gateway_authz_env(self):
+        """register() wires the allowlist env vars onto the PlatformEntry."""
+        from adapter import register
+
+        captured = {}
+
+        class FakeCtx:
+            def register_platform(self, **kwargs):
+                captured.update(kwargs)
+
+            def register_tool(self, **kwargs):
+                pass
+
+        register(FakeCtx())
+        self.assertEqual(captured["allowed_users_env"], "MESHTASTIC_ALLOWED_NODES")
+        self.assertEqual(captured["allow_all_env"], "MESHTASTIC_ALLOW_ALL_USERS")
+        self.assertEqual(captured["max_message_length"], 233)
+        self.assertEqual(captured["cron_deliver_env_var"], "MESHTASTIC_HOME_CHANNEL")
+        self.assertTrue(callable(captured["standalone_sender_fn"]))
 
 
 class TestMeshtasticTcpTransport(unittest.IsolatedAsyncioTestCase):
