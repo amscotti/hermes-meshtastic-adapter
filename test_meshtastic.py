@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -237,6 +238,70 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         # Verify handler was never called
         self.adapter.handle_message.assert_not_called()
+
+    def test_update_observed_last_heard_and_direct_signal(self):
+        """last_heard tracks rx_time; snr/rssi only from direct (0-hop) packets."""
+        self.adapter._update_observed("!aaaa1111", 1_700_000_000, 5.0, -80, 0)
+        obs = self.adapter.get_observed_node("!aaaa1111")
+        self.assertEqual(obs["last_heard"], 1_700_000_000)
+        self.assertEqual(obs["snr"], 5.0)
+        self.assertEqual(obs["rssi"], -80)
+        self.assertEqual(obs["hops_away"], 0)
+
+    def test_update_observed_relayed_packet_skips_signal(self):
+        """A relayed (hop>0) packet bumps last_heard but not snr/rssi."""
+        self.adapter._update_observed("!bbbb2222", None, 3.0, -90, 2)
+        obs = self.adapter.get_observed_node("!bbbb2222")
+        self.assertGreater(obs["last_heard"], 0)
+        self.assertEqual(obs["hops_away"], 2)
+        self.assertNotIn("snr", obs)  # relay metrics belong to the last hop
+        self.assertNotIn("rssi", obs)
+
+    def test_update_observed_future_rxtime_clamped(self):
+        """A future rx_time (clock skew) is clamped to now."""
+        self.adapter._update_observed("!cccc3333", time.time() + 10_000, None, None, None)
+        self.assertLessEqual(
+            self.adapter.get_observed_node("!cccc3333")["last_heard"], time.time() + 1
+        )
+
+    async def test_unauthorized_node_still_observed(self):
+        """An unauthorized node is filtered from Hermes but still tracked (watch-only)."""
+        packet = {
+            "fromId": "!9e754610",  # not in the allowlist
+            "toId": "^all",
+            "rxTime": int(time.time()),
+            "rxSnr": 6.0,
+            "rxRssi": -70,
+            "hopStart": 3,
+            "hopLimit": 3,  # hop_count == 0 → direct
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"watch me"},
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.02)
+
+        self.adapter.handle_message.assert_not_called()  # still not bridged to Hermes
+        obs = self.adapter.get_observed_node("!9e754610")
+        self.assertGreater(obs.get("last_heard", 0), 0)  # but its freshness IS recorded
+        self.assertEqual(obs.get("snr"), 6.0)
+
+    async def test_mesh_list_nodes_prefers_fresh_last_heard(self):
+        """mesh_list_nodes overlays observed last_heard over the stale library value."""
+        fresher = int(time.time() - 10)  # newer than mock !ab12cd34's lastHeard (now-300)
+        self.adapter._update_observed("!ab12cd34", fresher, None, None, None)
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!ab12cd34")
+        self.assertEqual(
+            node["last_heard"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fresher))
+        )
+
+    def test_observed_overlay_is_size_bounded(self):
+        """The observed overlay evicts the stalest entry past its cap."""
+        self.adapter.OBSERVED_NODE_LIMIT = 3
+        for i in range(10):
+            self.adapter._update_observed(f"!n{i:07d}", 1_700_000_000 + i, None, None, None)
+        self.assertLessEqual(len(self.adapter._node_observed), 3)
+        self.assertIn("!n0000009", self.adapter._node_observed)  # newest kept
+        self.assertNotIn("!n0000000", self.adapter._node_observed)  # stalest evicted
 
     async def test_payload_splitting_on_send(self):
         """Verify outbound messages >237 chars are split into chunks."""

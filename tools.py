@@ -153,17 +153,21 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
             user = info.get("user", {})
             metrics = info.get("deviceMetrics", {})
 
-            snr = info.get("snr")
-            rssi = info.get("rssi")
+            # Live-observed overlay (fresher than the library node DB, which only
+            # refreshes lastHeard/signal from periodic NodeInfo packets).
+            obs = adapter_inst.get_observed_node(nid)
 
-            # Fall back to telemetry db for SNR if not in memory
+            # Prefer observed signal, then library, then persisted history.
+            snr = obs.get("snr", info.get("snr"))
+            rssi = obs.get("rssi", info.get("rssi"))
             if snr is None or rssi is None:
                 history = telemetry_db.get_signal_history(nid, limit=1)
                 if history:
                     snr = snr if snr is not None else history[0].get("snr")
                     rssi = rssi if rssi is not None else history[0].get("rssi")
 
-            last_heard = info.get("lastHeard")
+            # last_heard: freshest of the library value and what we've observed.
+            last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
             last_heard_str = "Never"
             if last_heard:
                 last_heard_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_heard))
@@ -208,6 +212,10 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     # Check for public key to support security checking
     has_public_key = bool(user.get("publicKey"))
 
+    # Live-observed overlay (fresher than the library node DB).
+    obs = adapter_inst.get_observed_node(info.get("user", {}).get("id", ""))
+    last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
+
     details = {
         "node_id": info.get("user", {}).get("id", ""),
         "num": info.get("num"),
@@ -224,6 +232,15 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         "latitude": pos.get("latitude"),
         "longitude": pos.get("longitude"),
         "altitude": pos.get("altitude"),
+        "snr": obs.get("snr", info.get("snr")),
+        "rssi": obs.get("rssi", info.get("rssi")),
+        "hops_away": obs.get("hops_away", info.get("hopsAway")),
+        "last_heard": (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_heard))
+            if last_heard
+            else "Never"
+        ),
+        "last_heard_epoch": last_heard,
         "has_public_key": has_public_key,
         "raw_info": info,
     }
@@ -242,11 +259,13 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
         return json.dumps({"error": "Meshtastic platform adapter is not connected."})
 
     _, info = resolve_node(node_id_query, adapter_inst)
-
-    # Retrieve SNR/RSSI
-    snr = info.get("snr") if info else None
-    rssi = info.get("rssi") if info else None
     node_id = info.get("user", {}).get("id") if info else node_id_query
+
+    # Prefer live-observed SNR/RSSI (fresher than the library node DB), then the
+    # library value, then persisted history below.
+    obs = adapter_inst.get_observed_node(node_id) if node_id else {}
+    snr = obs.get("snr", info.get("snr") if info else None)
+    rssi = obs.get("rssi", info.get("rssi") if info else None)
 
     # Look up historic trend if available
     history = telemetry_db.get_signal_history(node_id, limit=5)
