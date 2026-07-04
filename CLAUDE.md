@@ -76,7 +76,9 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 **ACK/NACK is observability-first.** By default sends are non-blocking; `onAckNak` callbacks just record status into `_pending_acks` / `_ack_responses` (bounded at `ACK_RECORD_LIMIT`). Only when `MESHTASTIC_ACK_TIMEOUT > 0` (or send metadata requests it) does `_wait_for_ack` block and let a NAK/timeout make `SendResult.success` false.
 
-**Optional delivery retry.** `MESHTASTIC_SEND_RETRIES > 0` makes `send()` re-send un-ACKed **DM** chunks up to N times (implies ACK-waiting). `_is_retriable_failure` retries only transient failures (timeout / non-permanent NAK); `PERMANENT_NAK_REASONS` (e.g. `TOO_LARGE`) and broadcasts are never retried. Backoff is `MESHTASTIC_RETRY_BACKOFF`; the per-chunk attempt count lands in `raw_response["chunks"][i]["attempts"]`.
+**Real vs implicit ACK.** `_record_ack_response` distinguishes a **real** end-to-end ACK (the routing ACK's sender IS the destination → status `"ack"`, delivered) from an **implicit** ACK relayed by another node (sender ≠ destination → status `"implicit_ack"` — the packet reached the mesh but the destination has NOT confirmed receipt). This mirrors the official client's RECEIVED vs DELIVERED. Only a real ACK (or a NAK) resolves the `_wait_for_ack` future; an implicit ACK keeps the wait open so a real ACK can still arrive, and a timeout with only implicit ACKs is a retriable failure. Applies to DMs only (dest is a `!node` id).
+
+**Optional delivery retry.** `MESHTASTIC_SEND_RETRIES > 0` makes `send()` re-send un-confirmed **DM** chunks up to N times (implies ACK-waiting). `_is_retriable_failure` retries transient failures — timeout, `implicit_ack` (relay-only), or a non-permanent NAK; `PERMANENT_NAK_REASONS` (e.g. `TOO_LARGE`) and broadcasts are never retried. Backoff is `MESHTASTIC_RETRY_BACKOFF`; the per-chunk attempt count lands in `raw_response["chunks"][i]["attempts"]`.
 
 `edit_message` deliberately returns unsupported — LoRa has no edit primitive, and emulating it would flood the mesh.
 

@@ -151,6 +151,7 @@ Meshtastic and LoRa delivery are best-effort.
 
 - The adapter requests ACKs with `wantAck=True` for outbound packets.
 - The adapter registers an `onAckNak` callback and records/logs ACK/NACK responses by packet ID when Meshtastic surfaces them.
+- The adapter distinguishes a **real** end-to-end ACK (sent by the destination itself) from an **implicit** ACK relayed by another node (the packet reached the mesh but the destination did not confirm receipt) — mirroring the official client's RECEIVED vs DELIVERED. Only a real ACK counts as delivered; an implicit-only ACK is treated as un-confirmed (and, with retries enabled, re-sent).
 - By default, sends are non-blocking: `sendText()` returning success means the local radio accepted the packet, and later ACK/NACK callbacks are logged if they arrive.
 - Set `MESHTASTIC_ACK_TIMEOUT=30` or pass send metadata `meshtastic_ack_timeout` to wait for ACK/NACK per chunk. In this mode, NAKs and timeouts make `SendResult.success` false.
 - ACK results are exposed in `SendResult.raw_response["chunks"][i]["ack"]` for waited sends, and can be inspected later in code with `adapter.get_ack_status(packet_id)`.

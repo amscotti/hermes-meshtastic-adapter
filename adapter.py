@@ -1079,7 +1079,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if not isinstance(ack, dict):
             return False
         status = ack.get("status")
-        if status == "timeout":
+        # timeout = no confirmation; implicit_ack = only a relay confirmed, the
+        # destination did not — both warrant a retry.
+        if status in ("timeout", "implicit_ack"):
             return True
         if status == "nak":
             reason = str(ack.get("error_reason") or "").upper()
@@ -1182,7 +1184,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 self._ack_futures[pkt_id] = future
             self._prune_ack_history_locked()
 
-        if future and existing_response and not future.done():
+        # If a definitive response (real ACK / NAK) already arrived before the
+        # waiter was created, resolve immediately. An early *implicit* ACK is not
+        # definitive — leave the waiter open so a real ACK (or timeout) decides.
+        if (
+            future
+            and existing_response
+            and not future.done()
+            and existing_response.get("status") != "implicit_ack"
+        ):
             future.set_result(existing_response)
         return future
 
@@ -1220,8 +1230,25 @@ class MeshtasticAdapter(BasePlatformAdapter):
         routing = decoded.get("routing", {}) or {}
         request_id = decoded.get("requestId") or decoded.get("request_id")
         error_reason = routing.get("errorReason") or routing.get("error_reason")
-        status = "ack" if error_reason in (None, "", "NONE") else "nak"
         pkt_id = str(request_id) if request_id is not None else "unknown"
+
+        # Who sent this ACK. A routing ACK whose sender IS the destination is a
+        # real end-to-end confirmation ("delivered"); one relayed by another node
+        # is only an *implicit* ACK — the packet reached the mesh but the
+        # destination has NOT confirmed receipt. This mirrors the official client
+        # (RECEIVED vs DELIVERED). Only applied to DMs (dest is a "!node" id).
+        ack_from = None
+        if isinstance(packet, dict):
+            ack_from = packet.get("fromId") or packet.get("from")
+            if isinstance(ack_from, int):
+                ack_from = f"!{ack_from:08x}"
+
+        if error_reason not in (None, "", "NONE"):
+            status = "nak"
+        elif dest.startswith("!") and ack_from and str(ack_from).lower() != str(dest).lower():
+            status = "implicit_ack"
+        else:
+            status = "ack"
 
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id, {})
@@ -1231,11 +1258,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     "bytes": record.get("bytes", len(content.encode("utf-8"))),
                     "status": status,
                     "error_reason": error_reason,
+                    "ack_from": ack_from,
                     "response_at": time.time(),
                     "response": {
                         "packet_id": packet.get("id") if isinstance(packet, dict) else None,
                         "request_id": request_id,
-                        "from_id": packet.get("fromId") if isinstance(packet, dict) else None,
+                        "from_id": ack_from,
                         "to_id": packet.get("toId") if isinstance(packet, dict) else None,
                         "routing": routing,
                     },
@@ -1245,11 +1273,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._ack_responses[pkt_id] = record
             future = self._ack_futures.get(pkt_id)
 
-        if future and not future.done() and self.loop and self.loop.is_running():
+        # Resolve the waiter only on a DEFINITIVE outcome (real ACK or NAK). An
+        # implicit ACK updates the record but keeps the wait open, so a real ACK
+        # can still arrive — and if it doesn't, the timeout drives a retry.
+        if (
+            status in ("ack", "nak")
+            and future
+            and not future.done()
+            and self.loop
+            and self.loop.is_running()
+        ):
             self.loop.call_soon_threadsafe(self._set_ack_future_result, future, record)
 
         if status == "ack":
-            logger.info("Meshtastic ACK received: packet_id=%s dest=%s", pkt_id, dest)
+            logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
+        elif status == "implicit_ack":
+            logger.info(
+                "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
+                pkt_id,
+                dest,
+                ack_from,
+            )
         else:
             logger.warning(
                 "Meshtastic NAK received: packet_id=%s dest=%s reason=%s",
@@ -1274,16 +1318,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except TimeoutError:
             with self._ack_lock:
                 record = self._pending_acks.get(pkt_id, {})
-                record.update(
-                    {
-                        "status": "timeout",
-                        "error_reason": "ACK_TIMEOUT",
-                        "response_at": time.time(),
-                    }
-                )
+                # Preserve an implicit ACK if that's all we got — it's more
+                # informative than a bare timeout (and still "not confirmed").
+                if record.get("status") != "implicit_ack":
+                    record["status"] = "timeout"
+                    record["error_reason"] = "ACK_TIMEOUT"
+                record["response_at"] = time.time()
                 self._pending_acks[pkt_id] = record
                 self._ack_responses[pkt_id] = record
-            logger.warning("Meshtastic ACK timeout: packet_id=%s timeout=%.1fs", pkt_id, timeout)
+            logger.warning(
+                "Meshtastic ACK timeout: packet_id=%s timeout=%.1fs final_status=%s",
+                pkt_id,
+                timeout,
+                record.get("status"),
+            )
             return record
         finally:
             with self._ack_lock:
@@ -1436,6 +1484,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         success=False,
                         message_id=pkt_id,
                         error=f"Meshtastic NAK for packet {pkt_id}: {reason}",
+                        raw_response=raw_response,
+                    )
+                if ack_record.get("status") == "implicit_ack":
+                    return SendResult(
+                        success=False,
+                        message_id=pkt_id,
+                        error=(
+                            f"Meshtastic implicit ACK only for packet {pkt_id} "
+                            f"(relayed by {ack_record.get('ack_from')}; destination not confirmed)"
+                        ),
                         raw_response=raw_response,
                     )
                 return SendResult(

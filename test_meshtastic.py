@@ -679,7 +679,79 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "TOO_LARGE"}))
         )
         self.assertFalse(self.adapter._is_retriable_failure(r({"status": "ack"})))
+        self.assertTrue(self.adapter._is_retriable_failure(r({"status": "implicit_ack"})))
         self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
+
+    async def test_real_ack_from_destination_is_delivery(self):
+        """A routing ACK whose sender IS the destination confirms real delivery."""
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse(
+                {
+                    "fromId": "!ab12cd34",  # ACK came from the destination itself
+                    "decoded": {"requestId": 91001, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=91001)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "1"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="real ack")
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "ack")
+
+    async def test_implicit_ack_from_relay_is_not_delivery(self):
+        """A routing ACK relayed by another node is implicit — not confirmed delivery."""
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse(
+                {
+                    "fromId": "!9e77edec",  # a RELAY, not the destination !ab12cd34
+                    "decoded": {"requestId": 91002, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=91002)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "0.3"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="implicit ack")
+
+        self.assertFalse(res.success)  # relay heard it, destination did not confirm
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "implicit_ack")
+        self.assertIn("implicit ACK only", res.error or "")
+
+    async def test_implicit_ack_retries_until_real_ack(self):
+        """With retries on, an implicit-only ACK is re-sent; a later real ACK delivers."""
+        iface = self.adapter.get_interfaces()[0]
+        calls = {"n": 0}
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            calls["n"] += 1
+            pid = 92000 + calls["n"]
+            # Attempt 1 gets only a relay (implicit) ACK; attempt 2 the real one.
+            ack_from = "!9e77edec" if calls["n"] == 1 else "!ab12cd34"
+            onResponse(
+                {
+                    "fromId": ack_from,
+                    "decoded": {"requestId": pid, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=pid)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(
+            os.environ, {"MESHTASTIC_SEND_RETRIES": "2", "MESHTASTIC_ACK_TIMEOUT": "0.3"}
+        ):
+            res = await self.adapter.send(
+                chat_id="meshtastic:!ab12cd34", content="retry on implicit"
+            )
+
+        self.assertTrue(res.success)
+        self.assertEqual(iface.sendText.call_count, 2)  # implicit -> retry -> real ack
+        self.assertEqual(res.raw_response["chunks"][0]["attempts"], 2)
 
     async def test_send_errors_known_dm_without_public_key(self):
         """Verify direct sends fail hard when node info shows no public key."""
