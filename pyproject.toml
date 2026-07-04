@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Anthony Scotti" }]
 dependencies = [
-    "meshtastic==2.7.10",
+    "meshtastic>=2.7.10,<2.8",
     "pyserial>=3.5",
     "pypubsub>=4.0.3",
 ]
