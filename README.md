@@ -100,6 +100,8 @@ Environment variables:
 | `MESHTASTIC_CHUNK_BYTES` | No | `170` | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and leaves headroom for encrypted-DM (PKI) overhead; the raw protocol ceiling is `237`. |
 | `MESHTASTIC_CHUNK_DELAY` | No | `4.0` | Delay in seconds between chunk sends. |
 | `MESHTASTIC_ACK_TIMEOUT` | No | `0` | Seconds to wait for ACK/NACK per outbound chunk. `0` is non-blocking. Set `30` to fail sends on NAK or timeout. |
+| `MESHTASTIC_SEND_RETRIES` | No | `0` | Extra delivery attempts for un-ACKed **direct-message** chunks. `> 0` implies waiting for the ACK; transient failures (timeout, no-route) are re-sent, permanent ones (e.g. `TOO_LARGE`) are not. Broadcasts are never retried. |
+| `MESHTASTIC_RETRY_BACKOFF` | No | `5.0` | Seconds to wait between delivery retries. |
 
 ## Connecting Over IP (TCP)
 
@@ -148,6 +150,7 @@ Meshtastic and LoRa delivery are best-effort.
 - By default, sends are non-blocking: `sendText()` returning success means the local radio accepted the packet, and later ACK/NACK callbacks are logged if they arrive.
 - Set `MESHTASTIC_ACK_TIMEOUT=30` or pass send metadata `meshtastic_ack_timeout` to wait for ACK/NACK per chunk. In this mode, NAKs and timeouts make `SendResult.success` false.
 - ACK results are exposed in `SendResult.raw_response["chunks"][i]["ack"]` for waited sends, and can be inspected later in code with `adapter.get_ack_status(packet_id)`.
+- Set `MESHTASTIC_SEND_RETRIES=3` to automatically re-send un-ACKed **direct-message** chunks. A retry only fires on a transient failure (ACK timeout, no-route, max-retransmit); permanent NAKs (`TOO_LARGE`, `NO_CHANNEL`, auth/PKI errors) are not retried, and broadcasts are never retried (no per-recipient ACK). Each retry waits `MESHTASTIC_RETRY_BACKOFF` seconds; the per-chunk attempt count is exposed in `SendResult.raw_response["chunks"][i]["attempts"]`. Note: if a message was actually delivered but its ACK was lost, a retry sends a duplicate.
 - Long responses are split and paced, but any chunk may still be dropped by the mesh.
 
 Even with ACK waiting enabled, delivery is still best-effort because ACK behavior depends on route quality, node firmware behavior, and whether the destination is awake.
@@ -259,6 +262,7 @@ Pull requests are checked by GitHub Actions for Ruff formatting, Ruff linting, P
 - USB serial and TCP/IP transports are supported; BLE is not implemented.
 - Serial and TCP cannot be used at the same time; setting `MESHTASTIC_TCP_HOST` selects TCP.
 - ACK/NACK waiting is optional via `MESHTASTIC_ACK_TIMEOUT`; default sends are non-blocking and log later ACK/NACK callbacks when they arrive.
+- Delivery retry (`MESHTASTIC_SEND_RETRIES`) is opt-in and DM-only; a lost ACK on an already-delivered message causes a duplicate.
 - Cron delivery uses a short-lived serial connection rather than the live gateway adapter.
 - The outbound queue is in-memory only (bounded at 100, oldest-first eviction); messages queued during a disconnect are lost if the gateway restarts before the queue drains.
 - The plugin does not manage node sleep or power settings.

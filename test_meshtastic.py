@@ -73,6 +73,8 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 "MESHTASTIC_CHUNK_BYTES": "",
                 "MESHTASTIC_CHUNK_DELAY": "0",
                 "MESHTASTIC_ACK_TIMEOUT": "",
+                "MESHTASTIC_SEND_RETRIES": "",
+                "MESHTASTIC_RETRY_BACKOFF": "0",
             },
         )
         self._env_patcher.start()
@@ -492,6 +494,93 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res.success)
         self.assertIn("ACK timeout", res.error)
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "timeout")
+
+    async def test_retry_resends_transient_nak_until_ack(self):
+        """A transient NAK is re-sent; delivery succeeds on a later attempt."""
+        iface = self.adapter.get_interfaces()[0]
+        calls = {"n": 0}
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            calls["n"] += 1
+            pid = 5000 + calls["n"]
+            reason = "NONE" if calls["n"] >= 2 else "NO_ROUTE"  # NAK once, then ACK
+            onResponse({"decoded": {"requestId": pid, "routing": {"errorReason": reason}}})
+            return SimpleNamespace(id=pid)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+
+        with patch.dict(os.environ, {"MESHTASTIC_SEND_RETRIES": "2"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="retry me")
+
+        self.assertTrue(res.success)
+        self.assertEqual(iface.sendText.call_count, 2)
+        self.assertEqual(res.raw_response["chunks"][0]["attempts"], 2)
+
+    async def test_retry_gives_up_after_max_attempts(self):
+        """Persistent transient failure fails after retries+1 attempts."""
+        iface = self.adapter.get_interfaces()[0]
+        calls = {"n": 0}
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            calls["n"] += 1
+            pid = 6000 + calls["n"]
+            onResponse({"decoded": {"requestId": pid, "routing": {"errorReason": "NO_ROUTE"}}})
+            return SimpleNamespace(id=pid)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+
+        with patch.dict(os.environ, {"MESHTASTIC_SEND_RETRIES": "2"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="never lands")
+
+        self.assertFalse(res.success)
+        self.assertEqual(iface.sendText.call_count, 3)  # 1 + 2 retries
+        self.assertIn("after 3 attempt", res.error)
+
+    async def test_permanent_nak_not_retried(self):
+        """A permanent NAK (e.g. TOO_LARGE) is never re-sent, even with retries on."""
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse({"decoded": {"requestId": 7001, "routing": {"errorReason": "TOO_LARGE"}}})
+            return SimpleNamespace(id=7001)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+
+        with patch.dict(os.environ, {"MESHTASTIC_SEND_RETRIES": "3"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="too big")
+
+        self.assertFalse(res.success)
+        self.assertEqual(iface.sendText.call_count, 1)  # not retried
+
+    async def test_broadcast_not_retried(self):
+        """Broadcasts have no per-recipient ACK, so retry never applies to them."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.sendText = MagicMock(return_value=SimpleNamespace(id=8001))  # no ACK -> timeout
+
+        with patch.dict(
+            os.environ, {"MESHTASTIC_SEND_RETRIES": "3", "MESHTASTIC_ACK_TIMEOUT": "0.01"}
+        ):
+            res = await self.adapter.send(chat_id="meshtastic:channel:0", content="broadcast")
+
+        self.assertFalse(res.success)
+        self.assertEqual(iface.sendText.call_count, 1)  # single attempt, no retry
+
+    def test_is_retriable_failure_classification(self):
+        """Only ACK-observed transient failures are retriable."""
+        from gateway.platforms.base import SendResult
+
+        def r(ack):
+            return SendResult(success=False, raw_response={"ack": ack} if ack else None)
+
+        self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
+        self.assertTrue(
+            self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "NO_ROUTE"}))
+        )
+        self.assertFalse(
+            self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "TOO_LARGE"}))
+        )
+        self.assertFalse(self.adapter._is_retriable_failure(r({"status": "ack"})))
+        self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
 
     async def test_send_errors_known_dm_without_public_key(self):
         """Verify direct sends fail hard when node info shows no public key."""

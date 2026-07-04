@@ -150,6 +150,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
     # memory growth on a long-running gateway. Oldest non-pending records evict first.
     ACK_RECORD_LIMIT = 1000
 
+    # NAK reasons where re-sending the identical packet cannot help — retrying
+    # would only waste shared airtime. Everything else (timeouts, no-route,
+    # max-retransmit, unknown) is treated as transient and eligible for retry.
+    PERMANENT_NAK_REASONS = frozenset(
+        {
+            "TOO_LARGE",
+            "NO_CHANNEL",
+            "BAD_REQUEST",
+            "NOT_AUTHORIZED",
+            "PKI_FAILED",
+            "PKI_UNKNOWN_PUBKEY",
+            "INVALID_REQUEST",
+        }
+    )
+
     @property
     def message_len_fn(self):
         return lambda text: len(str(text).encode("utf-8"))
@@ -842,6 +857,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """
         del reply_to
         wait_for_ack, ack_timeout = self._ack_wait_config(metadata)
+        retries = self._send_retries(metadata)
+
+        # Retry applies to direct messages only: broadcasts have no per-recipient
+        # ACK, so re-sending them would flood the shared channel.
+        dest = chat_id.split(":", 2)[1] if ":" in chat_id else ""
+        is_dm = dest.startswith("!")
+
+        # Retrying is only meaningful when we can observe delivery, so enabling
+        # retries for a DM implies waiting for its ACK.
+        if retries > 0 and is_dm and not wait_for_ack:
+            wait_for_ack = True
+            if ack_timeout <= 0:
+                ack_timeout = 30.0
+
+        max_attempts = retries + 1 if (retries > 0 and wait_for_ack and is_dm) else 1
+        retry_backoff = float(os.getenv("MESHTASTIC_RETRY_BACKOFF", "5.0"))
+
         chunks = self._chunk_message(content)
         logger.info(
             "Sending message to %s. Splitting into %d chunks (bytes=%d).",
@@ -863,28 +895,56 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 )
                 await asyncio.sleep(delay)
 
-            res = await self._send_chunk(
-                chat_id,
-                chunk,
-                allow_queueing=allow_queueing,
-                wait_for_ack=wait_for_ack,
-                ack_timeout=ack_timeout,
-            )
-            if res.raw_response:
+            # Deliver this chunk, re-sending un-ACKed transient failures up to
+            # ``max_attempts`` times (1 == no retry, the default).
+            attempt = 0
+            while True:
+                attempt += 1
+                res = await self._send_chunk(
+                    chat_id,
+                    chunk,
+                    allow_queueing=allow_queueing,
+                    wait_for_ack=wait_for_ack,
+                    ack_timeout=ack_timeout,
+                )
+                if res.success or attempt >= max_attempts or not self._is_retriable_failure(res):
+                    break
+                logger.warning(
+                    "Meshtastic chunk %d/%d not delivered (attempt %d/%d): %s — retrying in %.1fs",
+                    idx + 1,
+                    len(chunks),
+                    attempt,
+                    max_attempts,
+                    res.error,
+                    retry_backoff,
+                )
+                await asyncio.sleep(retry_backoff)
+
+            if res.raw_response is not None:
+                res.raw_response["attempts"] = attempt
                 raw_chunks.append(res.raw_response)
             if not res.success:
                 logger.error(
-                    "Meshtastic chunk %d/%d failed: %s",
+                    "Meshtastic chunk %d/%d failed after %d attempt(s): %s",
                     idx + 1,
                     len(chunks),
+                    attempt,
                     res.error,
                 )
                 return SendResult(
                     success=False,
                     message_id=last_msg_id,
-                    error=f"chunk {idx + 1}/{len(chunks)} failed: {res.error}",
+                    error=f"chunk {idx + 1}/{len(chunks)} failed after {attempt} attempt(s): {res.error}",
                     raw_response={"chunks": raw_chunks, "ack_waited": wait_for_ack},
                     continuation_message_ids=tuple(sent_ids[1:]) if len(sent_ids) > 1 else (),
+                )
+            if attempt > 1:
+                logger.info(
+                    "Meshtastic chunk %d/%d delivered on attempt %d/%d",
+                    idx + 1,
+                    len(chunks),
+                    attempt,
+                    max_attempts,
                 )
             if res.message_id:
                 sent_ids.append(res.message_id)
@@ -914,6 +974,35 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if wait and timeout <= 0:
                 timeout = 30.0
         return wait, timeout
+
+    def _send_retries(self, metadata: dict[str, Any] | None) -> int:
+        """Number of extra delivery attempts for un-ACKed chunks (0 = no retry)."""
+        raw = os.getenv("MESHTASTIC_SEND_RETRIES", "0")
+        if metadata and "meshtastic_send_retries" in metadata:
+            raw = metadata["meshtastic_send_retries"]
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _is_retriable_failure(self, result: SendResult) -> bool:
+        """Decide whether a failed chunk send is worth re-sending.
+
+        Only ACK-observed failures qualify: a timeout, or a NAK whose reason is
+        not permanent. Pre-send errors (no interface, missing pubkey, bad
+        chat_id) carry no ACK record and are never retried — re-sending can't fix
+        them.
+        """
+        ack = (result.raw_response or {}).get("ack")
+        if not isinstance(ack, dict):
+            return False
+        status = ack.get("status")
+        if status == "timeout":
+            return True
+        if status == "nak":
+            reason = str(ack.get("error_reason") or "").upper()
+            return reason not in self.PERMANENT_NAK_REASONS
+        return False
 
     def _chunk_message(self, content: str) -> list[str]:
         """Split text into LoRa-safe UTF-8 byte chunks with sequence prefixes."""

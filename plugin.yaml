@@ -55,3 +55,11 @@ optional_env:
     description: "Seconds to wait for ACK/NACK per outbound chunk (default: 0, non-blocking; set e.g. 30 to fail on NAK/timeout)"
     prompt: "ACK timeout seconds"
     password: false
+  - name: MESHTASTIC_SEND_RETRIES
+    description: "Extra delivery attempts for un-ACKed direct-message chunks (default: 0). >0 waits for the ACK and re-sends transient failures; permanent NAKs and broadcasts are not retried."
+    prompt: "Send retries"
+    password: false
+  - name: MESHTASTIC_RETRY_BACKOFF
+    description: "Seconds between delivery retries (default: 5.0)"
+    prompt: "Retry backoff seconds"
+    password: false
