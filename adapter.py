@@ -165,6 +165,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         }
     )
 
+    # Upper bound on the per-node "observed" overlay (live last_heard / signal
+    # learned from the packet stream). Stalest entry evicts first on overflow.
+    OBSERVED_NODE_LIMIT = 2048
+
     @property
     def message_len_fn(self):
         return lambda text: len(str(text).encode("utf-8"))
@@ -209,6 +213,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # If they omitted the leading '!', support matching it too
                 if not p.startswith("!"):
                     self.allowed_nodes.add(f"!{p}")
+
+        # Live-observed per-node overlay (last_heard / signal learned from the
+        # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
+        # node and layered over the library's node DB by the mesh_* tools.
+        self._node_observed: dict[str, dict[str, Any]] = {}
 
         # Active hardware connections mapping: devPath -> interface
         self._interfaces: dict[str, Any] = {}
@@ -263,6 +272,56 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return True
         nid = node_id.strip().lower()
         return nid in self.allowed_nodes or nid.lstrip("!") in self.allowed_nodes
+
+    def _update_observed(
+        self,
+        node_id: str,
+        rx_time: Any,
+        snr: Any,
+        rssi: Any,
+        hop_count: int | None,
+    ) -> None:
+        """Record live packet observations for a node, keyed by node id.
+
+        Mirrors the official Meshtastic client: ``last_heard`` is refreshed from
+        the packet's ``rxTime`` on every received packet (clamped to now, so a
+        skewed clock can't push it into the future); ``snr``/``rssi`` are
+        refreshed only from **direct** (0-hop) packets, since a relayed packet's
+        link metrics belong to the last hop, not the origin node.
+
+        Runs on the loop thread (via the incoming-queue consumer), same as the
+        mesh_* tools that read it, so no locking is needed.
+        """
+        now = time.time()
+        try:
+            last_heard = min(float(rx_time), now) if rx_time else now
+        except (TypeError, ValueError):
+            last_heard = now
+
+        obs = self._node_observed.get(node_id)
+        if obs is None:
+            if len(self._node_observed) >= self.OBSERVED_NODE_LIMIT:
+                stalest = min(
+                    self._node_observed,
+                    key=lambda k: self._node_observed[k].get("last_heard", 0.0),
+                )
+                self._node_observed.pop(stalest, None)
+            obs = {}
+            self._node_observed[node_id] = obs
+
+        obs["last_heard"] = max(obs.get("last_heard", 0.0), last_heard)
+        if hop_count is not None:
+            obs["hops_away"] = hop_count
+        if hop_count == 0:  # direct packet: link metrics describe this node
+            if snr is not None:
+                obs["snr"] = snr
+            if rssi is not None:
+                obs["rssi"] = rssi
+
+    def get_observed_node(self, node_id: str) -> dict[str, Any]:
+        """Return the live-observed overlay for a node id ({} if never heard)."""
+        obs = self._node_observed.get(node_id)
+        return dict(obs) if obs else {}
 
     def _get_interface_node_id(self, interface: Any) -> str | None:
         """Return the local Meshtastic node ID for an interface, if known."""
@@ -638,7 +697,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if not from_id:
                 return
 
-            # Restriction check BEFORE any processing
+            # Link metadata from the packet envelope.
+            snr = packet.get("rxSnr") or packet.get("snr")
+            rssi = packet.get("rxRssi") or packet.get("rssi")
+            hop_limit = packet.get("hopLimit")
+            hop_start = packet.get("hopStart")
+            hop_count = None
+            if hop_limit is not None and hop_start is not None:
+                hop_count = max(0, hop_start - hop_limit)
+
+            # Track observed freshness for EVERY heard node — BEFORE the auth
+            # gate, so last_heard/signal stay current even for nodes that aren't
+            # allowed to talk to Hermes (e.g. a node the user just wants to watch).
+            self._update_observed(from_id, packet.get("rxTime"), snr, rssi, hop_count)
+
+            # Restriction check BEFORE any further processing
             if not self._is_authorized_node(from_id):
                 logger.warning(f"Unauthorized node ID {from_id} skipped.")
                 return
@@ -655,14 +728,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
             portnum = decoded.get("portnum")
 
             # Log signal qualities immediately if present
-            snr = packet.get("rxSnr") or packet.get("snr")
-            rssi = packet.get("rxRssi") or packet.get("rssi")
-            hop_limit = packet.get("hopLimit")
-            hop_start = packet.get("hopStart")
-            hop_count = None
-            if hop_limit is not None and hop_start is not None:
-                hop_count = max(0, hop_start - hop_limit)
-
             if snr is not None or rssi is not None:
                 self._run_db_write(lambda: telemetry_db.log_signal(from_id, snr, rssi, hop_count))
 

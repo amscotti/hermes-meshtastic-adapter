@@ -141,6 +141,10 @@ The plugin registers these Hermes tools:
 - `mesh_telemetry`: read recent telemetry from a node.
 - `mesh_telemetry_history`: query persisted telemetry, position, or signal history.
 
+### Node Freshness
+
+The meshtastic library only refreshes a node's `lastHeard` from periodic **NodeInfo** packets, so it lags a node's actual transmissions. The adapter therefore tracks a live overlay from the packet stream: on every received packet it updates the sender's `last_heard` (from the packet's `rxTime`) and, for direct (0-hop) packets, its `snr`/`rssi` — mirroring the official Meshtastic client. This is done for **every** heard node (including ones not on the allowlist, so you can watch a node you don't bridge), and `mesh_list_nodes` / `mesh_node_info` / `mesh_signal_quality` report the freshest of the library value and this overlay. `mesh_node_info` also returns `last_heard` / `last_heard_epoch`.
+
 ## Delivery Semantics
 
 Meshtastic and LoRa delivery are best-effort.
