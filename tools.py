@@ -76,7 +76,7 @@ def resolve_node(
     node_id_or_name: str, adapter_instance: Any
 ) -> tuple[Any | None, dict[str, Any] | None]:
     """
-    Search all active serial and BLE interfaces for a node matching the ID or name.
+    Search all active interfaces (serial or TCP) for a node matching the ID or name.
 
     Returns (interface, node_info_dict).
     """
