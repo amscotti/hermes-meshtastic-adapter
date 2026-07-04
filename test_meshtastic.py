@@ -926,6 +926,15 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         for c in chunks:
             self.assertLessEqual(len(c.encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH)
 
+    def test_chunk_bytes_garbage_falls_back_to_default(self):
+        """A non-numeric MESHTASTIC_CHUNK_BYTES falls back to the default, not crash."""
+        long = "z" * 400  # exceeds the 170 default, so it must still split
+        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "not-a-number"}):
+            chunks = self.adapter._chunk_message(long)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c.encode("utf-8")), self.adapter.DEFAULT_CHUNK_BYTES)
+
     def test_split_utf8_handles_no_whitespace_and_multibyte(self):
         """_split_utf8 splits long runs without spaces and respects UTF-8 boundaries."""
         # No whitespace: must still split by byte budget (char_idx<=0 path never trips).

@@ -97,6 +97,12 @@ def prune(max_age_days: float) -> int:
     Returns the total number of deleted rows. ``max_age_days <= 0`` keeps
     everything (no-op). Bounds long-running-gateway growth: the ACK bookkeeping
     and node overlay are already bounded; this does the same for SQLite.
+
+    Note: this bounds the *row count* (queryable data), not the on-disk file
+    size — SQLite's DELETE leaves free pages for reuse rather than returning them
+    to the filesystem. For this plugin's scale (a few MB) that's an acceptable
+    trade-off vs. the cost of a full VACUUM rewrite on every prune; run
+    `VACUUM` manually if you ever need to reclaim the space.
     """
     if max_age_days <= 0:
         return 0

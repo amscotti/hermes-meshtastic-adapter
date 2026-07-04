@@ -646,8 +646,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if hasattr(stream, "is_open"):
                 return bool(stream.is_open)
             return True
-        # Fallback: meshtastic's threading.Event liveness flag.
-        is_connected = getattr(iface, "isConnected", None)
+        # Fallback: meshtastic's threading.Event liveness flag. Reuses the
+        # is_connected binding from the top of this function (the attribute
+        # hasn't changed); no need to re-read it.
         if hasattr(is_connected, "is_set"):
             return bool(is_connected.is_set())
         # No known liveness handle (e.g. the mock interface) — assume alive.
@@ -1225,11 +1226,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         content = (content or "").strip()
         # Clamp to the protocol hard ceiling — sendData raises above
         # DATA_PAYLOAD_LEN (233), so a misconfigured larger value would NAK
-        # every full chunk with TOO_LARGE.
-        limit = min(
-            int(os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES),
-            self.MAX_MESSAGE_LENGTH,
-        )
+        # every full chunk with TOO_LARGE. Non-numeric values fall back to the
+        # default (same defensive pattern as _retry_backoff / _send_retries).
+        raw = os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES
+        try:
+            limit = min(int(raw), self.MAX_MESSAGE_LENGTH)
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_CHUNK_BYTES
 
         if len(content.encode("utf-8")) <= limit:
             return [content] if content else []
