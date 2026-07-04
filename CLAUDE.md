@@ -70,6 +70,8 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 `_send_immediate` parses these back apart (`split(":", 2)`) to choose `destinationId` vs `channelIndex`.
 
+**Channels are opt-in.** By default `_on_receive` bridges **DMs only** — a broadcast/channel message is logged and dropped so the agent never replies into a shared channel's airtime. `MESHTASTIC_ALLOW_CHANNELS=true` (or `allow_channels` in plugin extra) enables answering channels.
+
 ### Outbound path (Hermes → mesh)
 
 `send()` → `_chunk_message` splits content into UTF-8-byte-bounded chunks with `[i/n]` prefixes (LoRa payload ≈ 237 bytes; `MESHTASTIC_CHUNK_BYTES` overrides), paces them by `MESHTASTIC_CHUNK_DELAY` → `_send_chunk` → `_send_immediate` calls the blocking `iface.sendText(..., wantAck=True)` via `run_in_executor`.

@@ -39,6 +39,10 @@ optional_env:
     description: "Allow all nodes on the mesh to talk to the bot (true/false, default: false)"
     prompt: "Allow all users? (true/false)"
     password: false
+  - name: MESHTASTIC_ALLOW_CHANNELS
+    description: "Answer channel/broadcast messages, not just DMs (true/false, default: false)"
+    prompt: "Answer channels too? (true/false)"
+    password: false
   - name: MESHTASTIC_HOME_CHANNEL
     description: "Default channel or node ID for cron/notification delivery (e.g. meshtastic:channel:0)"
     prompt: "Home channel"

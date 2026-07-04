@@ -205,6 +205,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
             else extra.get("allow_all_users", False)
         )
 
+        # Whether to answer channel/broadcast messages. Default False: the agent
+        # replies to direct messages only and never posts into a shared public
+        # channel (which wastes mesh airtime and is visible to everyone). Set
+        # MESHTASTIC_ALLOW_CHANNELS=true to opt in.
+        self.allow_channels = (
+            os.getenv("MESHTASTIC_ALLOW_CHANNELS", "").lower() in ("1", "true", "yes")
+            if os.getenv("MESHTASTIC_ALLOW_CHANNELS")
+            else extra.get("allow_channels", False)
+        )
+
         self.allowed_nodes: set[str] = set()
         if allowed_nodes_raw:
             parts = [p.strip().lower() for p in str(allowed_nodes_raw).split(",") if p.strip()]
@@ -773,6 +783,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             if isinstance(to_id, int):
                 to_id = "^all" if is_broadcast else f"!{to_id:08x}"
+
+            # By default the agent only answers direct messages — never a shared
+            # channel/broadcast (avoids spamming a public channel's airtime).
+            if is_broadcast and not self.allow_channels:
+                logger.info(
+                    "Ignoring channel/broadcast message from %s "
+                    "(set MESHTASTIC_ALLOW_CHANNELS=true to answer channels)",
+                    from_id,
+                )
+                return
 
             channel_index = packet.get("channel", 0)
 

@@ -96,6 +96,7 @@ Environment variables:
 | `MESHTASTIC_ALLOWED_NODES` | No | Empty | Preferred allowlist. Comma-separated node IDs that may talk to Hermes. |
 | `MESHTASTIC_ALLOWED_USERS` | No | Empty | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. |
 | `MESHTASTIC_ALLOW_ALL_USERS` | No | `false` | If true, any mesh node may talk to Hermes. Use with caution. |
+| `MESHTASTIC_ALLOW_CHANNELS` | No | `false` | If true, the agent also answers **channel/broadcast** messages (replying into the shared channel). Off by default so the agent only responds to direct messages and never spams a public channel's airtime. |
 | `MESHTASTIC_HOME_CHANNEL` | No | Empty | Cron/default delivery target, such as `meshtastic:!da1b1613` or `meshtastic:channel:0`. |
 | `MESHTASTIC_CHUNK_BYTES` | No | `170` | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and leaves headroom for encrypted-DM (PKI) overhead; the raw protocol ceiling is `237`. |
 | `MESHTASTIC_CHUNK_DELAY` | No | `4.0` | Delay in seconds between chunk sends. |
