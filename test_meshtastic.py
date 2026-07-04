@@ -189,6 +189,21 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         event = self.adapter.handle_message.call_args[0][0]
         self.assertGreaterEqual(event.timestamp.timestamp(), before - 1)  # fallback: now()
 
+    async def test_inbound_packet_id_zero_not_treated_as_missing(self):
+        """A valid (if unusual) packet id of 0 must not fall through to rxTime."""
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "rxTime": 1_700_000_000,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"id zero"},
+            "id": 0,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertEqual(event.message_id, "0")  # not "1700000000"
+
     async def test_inbound_channel_scoping(self):
         """Test broadcasts create shared channel sessions."""
         # Simulated Broadcast Packet

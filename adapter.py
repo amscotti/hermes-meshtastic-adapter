@@ -956,12 +956,17 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # id so the agent/gateway has reply context.
             reply_id = decoded.get("replyId")
 
+            # Resolve a packet id; explicitly distinguish "absent" (None) from a
+            # falsy-but-valid 0, since `or` would skip an id of 0.
+            pkt_id = packet.get("id")
+            if pkt_id is None:
+                pkt_id = packet.get("rxTime") or time.time()
             event = MessageEvent(
                 text=text,
                 message_type=MessageType.TEXT,
                 source=source,
                 raw_message=packet,
-                message_id=str(packet.get("id") or packet.get("rxTime") or time.time()),
+                message_id=str(pkt_id),
                 channel_context=packet_context,
                 timestamp=event_ts,
                 reply_to_message_id=str(reply_id) if reply_id is not None else None,
