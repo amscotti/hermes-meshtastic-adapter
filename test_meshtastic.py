@@ -205,7 +205,8 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.message_id, "0")  # not "1700000000"
 
     async def test_inbound_channel_scoping(self):
-        """Test broadcasts create shared channel sessions."""
+        """Test broadcasts create shared channel sessions (when channels enabled)."""
+        self.adapter.allow_channels = True  # channels are opt-in
         # Simulated Broadcast Packet
         packet = {
             "fromId": "!ab12cd34",
@@ -252,6 +253,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         The old ch.get() raised AttributeError on protobuf Channel objects, so
         channel messages crashed and never reached Hermes.
         """
+        self.adapter.allow_channels = True  # channels are opt-in
         iface = self.adapter.get_interfaces()[0]
         iface.localNode.channels = [
             SimpleNamespace(index=0, settings=SimpleNamespace(name="Primary")),
@@ -269,6 +271,36 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.adapter.handle_message.assert_called_once()  # no crash, message bridged
         event = self.adapter.handle_message.call_args[0][0]
         self.assertEqual(event.source.chat_id, "meshtastic:channel:Primary")
+
+    async def test_channel_message_ignored_by_default(self):
+        """By default the agent answers DMs only — channel messages are dropped."""
+        self.assertFalse(self.adapter.allow_channels)  # default
+        packet = {
+            "fromId": "!ab12cd34",  # authorized node, but posting to the channel
+            "toId": "^all",
+            "channel": 0,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"hi channel"},
+            "id": 5150,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_not_called()  # not bridged -> no public reply
+
+    async def test_dm_still_answered_with_channels_off(self):
+        """A DM is still handled when channels are disabled (the default)."""
+        self.assertFalse(self.adapter.allow_channels)
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",  # DM to the gateway node
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"direct hi"},
+            "id": 5151,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_called_once()
+        self.assertEqual(
+            self.adapter.handle_message.call_args[0][0].source.chat_id, "meshtastic:!ab12cd34"
+        )
 
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
