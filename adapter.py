@@ -597,6 +597,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"Error in handle_message task: {e}", exc_info=True)
 
+    @staticmethod
+    def _channel_field(ch: Any, key: str) -> Any:
+        """Read a channel field from a dict (mock) or a protobuf Channel (hardware).
+
+        ``localNode.channels`` is a list of dicts under the mock interface but a
+        list of protobuf ``Channel`` objects on real hardware — those have no
+        ``.get()``, and their name lives under ``settings`` (``ch.settings.name``).
+        """
+        if isinstance(ch, dict):
+            return ch.get(key)
+        if key == "name":
+            settings = getattr(ch, "settings", None)
+            return getattr(settings, "name", None) if settings is not None else None
+        return getattr(ch, key, None)
+
     def _on_receive(self, packet: dict, interface: Any = None):
         """Processes incoming packet in the main loop thread."""
         try:
@@ -690,8 +705,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     and hasattr(interface.localNode, "channels")
                 ):
                     for ch in interface.localNode.channels:
-                        if ch.get("index") == channel_index and ch.get("name"):
-                            channel_name = ch.get("name")
+                        if self._channel_field(
+                            ch, "index"
+                        ) == channel_index and self._channel_field(ch, "name"):
+                            channel_name = self._channel_field(ch, "name")
                             break
                 chat_id = f"meshtastic:channel:{channel_name}"
                 chat_type = "group"
@@ -1212,9 +1229,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                             current_iface.localNode, "channels"
                         ):
                             for ch in current_iface.localNode.channels:
-                                if str(ch.get("name")).lower() == channel_name_or_index.lower():
+                                ch_name = self._channel_field(ch, "name")
+                                if ch_name and ch_name.lower() == channel_name_or_index.lower():
                                     iface = current_iface
-                                    channel_index = ch.get("index", 0)
+                                    channel_index = self._channel_field(ch, "index") or 0
                                     break
                 pkt = await loop.run_in_executor(
                     None,

@@ -184,6 +184,40 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.chat_id, "meshtastic:channel:Primary")
         self.assertEqual(event.source.chat_type, "group")
 
+    def test_channel_field_dict_and_protobuf(self):
+        """_channel_field reads both dict channels (mock) and protobuf ones (hw)."""
+        d = {"index": 2, "name": "Alpha"}
+        self.assertEqual(self.adapter._channel_field(d, "index"), 2)
+        self.assertEqual(self.adapter._channel_field(d, "name"), "Alpha")
+        # Protobuf Channel: no .get(), name nested under .settings.
+        pb = SimpleNamespace(index=3, settings=SimpleNamespace(name="Beta"))
+        self.assertEqual(self.adapter._channel_field(pb, "index"), 3)
+        self.assertEqual(self.adapter._channel_field(pb, "name"), "Beta")
+
+    async def test_broadcast_scoping_with_protobuf_channels(self):
+        """Broadcast scoping must not crash on protobuf channels (real hardware).
+
+        The old ch.get() raised AttributeError on protobuf Channel objects, so
+        channel messages crashed and never reached Hermes.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        iface.localNode.channels = [
+            SimpleNamespace(index=0, settings=SimpleNamespace(name="Primary")),
+        ]
+        packet = {
+            "fromId": "!ab12cd34",  # authorized
+            "toId": "^all",
+            "channel": 0,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"channel hello"},
+            "id": 4242,
+        }
+        self.adapter._on_receive(packet, iface)
+        await asyncio.sleep(0.05)
+
+        self.adapter.handle_message.assert_called_once()  # no crash, message bridged
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertEqual(event.source.chat_id, "meshtastic:channel:Primary")
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node
