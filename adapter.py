@@ -1422,7 +1422,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         if error_reason not in (None, "", "NONE"):
             status = "nak"
-        elif dest.startswith("!") and ack_from and str(ack_from).lower() != str(dest).lower():
+        elif dest.startswith("!") and ack_from and str(ack_from).lower() != dest.lower():
             status = "implicit_ack"
         else:
             status = "ack"
