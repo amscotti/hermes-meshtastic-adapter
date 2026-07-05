@@ -8,7 +8,7 @@ The `meshtastic-platform` plugin integrates Meshtastic LoRa radios as a messagin
 
 LoRa mesh radios operate over unlicensed sub-GHz bands (such as 915 MHz in the US or 868 MHz in Europe) with highly constrained bandwidth. Please observe the following constraints:
 
-1. **Length Limits**: The raw payload ceiling is approximately **237 UTF-8 bytes**, but encrypted direct messages (PKI) leave less usable room, so outbound replies are chunked at a conservative **~170 UTF-8 bytes** by default (override via `MESHTASTIC_CHUNK_BYTES`). Longer messages are automatically split into numbered chunks and delivered sequentially.
+1. **Length Limits**: The raw payload ceiling is **233 UTF-8 bytes** (`mesh_pb2.Constants.DATA_PAYLOAD_LEN`), but encrypted direct messages (PKI) leave less usable room, so outbound replies are chunked at a conservative **~170 UTF-8 bytes** by default (override via `MESHTASTIC_CHUNK_BYTES`, clamped to 233). Longer messages are automatically split into numbered chunks and delivered sequentially.
 2. **Delivery Speed**: Message propagation is slow, averaging 1–3 seconds per hop. Responses may have noticeable latency.
 3. **No Rich Media**: Images, voice, or files are **not supported**. The channel relies strictly on plain-text messaging.
 4. **Duty Cycle Limits**: European operators must adhere to standard 10% duty-cycle limits to manage shared channel airtime.
@@ -29,7 +29,12 @@ Configure the adapter via your `config.yaml` or directly using these environment
 | `MESHTASTIC_ALLOWED_USERS` | List | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. | None |
 | `MESHTASTIC_ALLOW_ALL_USERS`| Boolean| If set to `true`, permits any node in the mesh to interact with Hermes. | `false` |
 | `MESHTASTIC_HOME_CHANNEL` | String | Default delivery channel target for automated cron jobs. | `meshtastic:channel:0` |
+| `MESHTASTIC_CHUNK_BYTES` | Integer | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and PKI overhead; the raw protocol payload ceiling (and clamp for this value) is `233`. | `170` |
+| `MESHTASTIC_CHUNK_DELAY` | Float | Delay in seconds between chunk sends. | `4.0` |
 | `MESHTASTIC_ACK_TIMEOUT` | Float | Seconds to wait for ACK/NACK per outbound chunk. `0` means non-blocking logging only. | `0` |
+| `MESHTASTIC_SEND_RETRIES` | Integer | Extra delivery attempts for un-ACKed **direct-message** chunks. `> 0` implies waiting for the ACK; transient failures (timeout, no-route) are re-sent, permanent ones (e.g. `TOO_LARGE`) are not. Broadcasts are never retried. | `0` |
+| `MESHTASTIC_RETRY_BACKOFF` | Float | Seconds to wait between delivery retries. | `5.0` |
+| `MESHTASTIC_TELEMETRY_RETENTION_DAYS` | Integer | Age (days) at which persisted telemetry/position/signal rows are pruned from SQLite. `0` disables pruning. | `30` |
 
 ---
 

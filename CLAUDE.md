@@ -19,24 +19,32 @@ When working in this repo without Hermes installed, the `gateway.*` imports will
 
 ## Commands
 
-All commands run through the Hermes venv (substitute `python` if Hermes is on your path):
+All commands run via the repo's **`.venv`** (uv-managed), which holds the dev
+tooling (`ruff`/`pyrefly`/`coverage`) and resolves `gateway.*`. The Hermes venv
+(`~/.hermes/hermes-agent/venv`) does **not** have ruff/pyrefly — don't use it for
+these gates. Set `HERMES_AGENT_PATH` if Hermes isn't at `~/.hermes/hermes-agent`.
 
 ```bash
-# Tests (mock serial + temp SQLite; set HERMES_AGENT_PATH if Hermes isn't at ~/.hermes/hermes-agent)
-~/.hermes/hermes-agent/venv/bin/python -m unittest test_meshtastic.py
+# Tests (mock serial + temp SQLite):
+.venv/bin/python -m unittest test_meshtastic.py
+# Run a single test:
+.venv/bin/python -m unittest test_meshtastic.TestMeshtasticPlatform.<method_name>
 
-# Run a single test
-~/.hermes/hermes-agent/venv/bin/python -m unittest test_meshtastic.TestMeshtasticPlatform.<method_name>
+# Format, lint, type-check (the exact gates CI enforces):
+.venv/bin/python -m ruff format .            # CI runs: ruff format --check .
+.venv/bin/python -m ruff check .
+.venv/bin/python -m pyrefly check \
+  --python-interpreter-path .venv/bin/python \
+  --search-path ~/.hermes/hermes-agent --min-severity warn
 
-# Format, lint, type-check (the exact gates CI enforces)
-~/.hermes/hermes-agent/venv/bin/python -m ruff format .
-~/.hermes/hermes-agent/venv/bin/python -m ruff check .
-~/.hermes/hermes-agent/venv/bin/python -m pyrefly check \
-  --python-interpreter-path ~/.hermes/hermes-agent/venv/bin/python \
-  --search-path ~/.hermes/hermes-agent
+# Coverage (also a CI gate, --fail-under=80):
+.venv/bin/python -m coverage run -m unittest test_meshtastic.py \
+  && .venv/bin/python -m coverage report -m
 ```
 
-CI runs `ruff format --check`, `ruff check`, `pyrefly check`, and `unittest` — all four must pass.
+CI runs `ruff format --check`, `ruff check`, `pyrefly check --min-severity warn`,
+and `coverage`+`unittest` — all four must pass. Pyrefly hides warnings unless
+`--min-severity warn` is passed; CI uses it, so do the same locally.
 
 ## Architecture
 
@@ -70,9 +78,11 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 `_send_immediate` parses these back apart (`split(":", 2)`) to choose `destinationId` vs `channelIndex`.
 
+**Channels are opt-in.** By default `_on_receive` bridges **DMs only** — a broadcast/channel message is logged and dropped so the agent never replies into a shared channel's airtime. `MESHTASTIC_ALLOW_CHANNELS=true` (or `allow_channels` in plugin extra) enables answering channels.
+
 ### Outbound path (Hermes → mesh)
 
-`send()` → `_chunk_message` splits content into UTF-8-byte-bounded chunks with `[i/n]` prefixes (LoRa payload ≈ 237 bytes; `MESHTASTIC_CHUNK_BYTES` overrides), paces them by `MESHTASTIC_CHUNK_DELAY` → `_send_chunk` → `_send_immediate` calls the blocking `iface.sendText(..., wantAck=True)` via `run_in_executor`.
+`send()` → `_chunk_message` splits content into UTF-8-byte-bounded chunks with `[i/n]` prefixes (the protocol app-payload ceiling is 233 bytes — `mesh_pb2.Constants.DATA_PAYLOAD_LEN`; `MESHTASTIC_CHUNK_BYTES` overrides, clamped to 233), paces them by `MESHTASTIC_CHUNK_DELAY` → `_send_chunk` → `_send_immediate` calls the blocking `iface.sendText(..., wantAck=True)` via `run_in_executor`.
 
 **ACK/NACK is observability-first.** By default sends are non-blocking; `onAckNak` callbacks just record status into `_pending_acks` / `_ack_responses` (bounded at `ACK_RECORD_LIMIT`). Only when `MESHTASTIC_ACK_TIMEOUT > 0` (or send metadata requests it) does `_wait_for_ack` block and let a NAK/timeout make `SendResult.success` false.
 

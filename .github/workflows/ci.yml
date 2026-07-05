@@ -45,9 +45,23 @@ jobs:
         run: ruff check .
 
       - name: Type check
-        run: python -m pyrefly check --python-interpreter-path "$(which python)" --search-path _deps/hermes-agent --output-format=github
+        run: python -m pyrefly check --python-interpreter-path "$(which python)" --search-path _deps/hermes-agent --min-severity warn --output-format=github
 
       - name: Unit tests
         env:
           HERMES_AGENT_PATH: ${{ github.workspace }}/_deps/hermes-agent
-        run: python -m unittest test_meshtastic.py
+        run: |
+          coverage run -m unittest test_meshtastic.py
+          coverage report -m
+          coverage html
+
+      - name: Enforce coverage floor
+        run: coverage report --fail-under=80
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 14
