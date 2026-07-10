@@ -90,7 +90,7 @@ Environment variables:
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `MESHTASTIC_SERIAL_PORT` | No* | `auto` | Serial path such as `/dev/cu.usbserial-0001`, or `auto` for discovery. *Configure either this or `MESHTASTIC_TCP_HOST`. |
-| `MESHTASTIC_BAUD_RATE` | No | `115200` | Serial baud rate. |
+| `MESHTASTIC_BAUD_RATE` | No | `115200` | Informational only — the meshtastic library always opens serial at 115200. |
 | `MESHTASTIC_TCP_HOST` | No | None | Hostname or IP of a WiFi/Ethernet node. When set, the adapter connects over TCP instead of serial. |
 | `MESHTASTIC_TCP_PORT` | No | `4403` | TCP API port of the Meshtastic node. |
 | `MESHTASTIC_ALLOWED_NODES` | No | Empty | Preferred allowlist. Comma-separated node IDs that may talk to Hermes. |
@@ -153,6 +153,7 @@ Meshtastic and LoRa delivery are best-effort.
 
 - The adapter requests ACKs with `wantAck=True` for outbound packets.
 - The adapter registers an `onAckNak` callback and records/logs ACK/NACK responses by packet ID when Meshtastic surfaces them.
+- The adapter distinguishes a **real** end-to-end ACK (sent by the destination itself) from an **implicit** ACK relayed by another node (the packet reached the mesh but the destination did not confirm receipt) — mirroring the official client's RECEIVED vs DELIVERED. Only a real ACK counts as delivered; an implicit-only ACK is treated as un-confirmed (and, with retries enabled, re-sent).
 - By default, sends are non-blocking: `sendText()` returning success means the local radio accepted the packet, and later ACK/NACK callbacks are logged if they arrive.
 - Set `MESHTASTIC_ACK_TIMEOUT=30` or pass send metadata `meshtastic_ack_timeout` to wait for ACK/NACK per chunk. In this mode, NAKs and timeouts make `SendResult.success` false.
 - ACK results are exposed in `SendResult.raw_response["chunks"][i]["ack"]` for waited sends, and can be inspected later in code with `adapter.get_ack_status(packet_id)`.
