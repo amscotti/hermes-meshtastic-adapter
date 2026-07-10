@@ -1484,6 +1484,134 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(norm(""))
         # Non-hex labels are lowercased as-is (not forced into !hex form).
         self.assertEqual(norm("PARK"), "park")
+        # bool is a subclass of int — must not become !00000001 / !00000000.
+        self.assertEqual(norm(True), "true")
+        self.assertEqual(norm(False), "false")
+
+    async def test_wait_for_ack_timeout_does_not_overwrite_concurrent_ack(self):
+        """Timeout must not stamp TIMEOUT over a real ACK that landed in the race window."""
+        loop = asyncio.get_running_loop()
+        self.adapter.loop = loop
+        pkt_id = "race-ack-1"
+        fut = loop.create_future()
+        with self.adapter._ack_lock:
+            self.adapter._pending_acks[pkt_id] = {
+                "status": AckStatus.PENDING,
+                "dest": "!ab12cd34",
+            }
+            self.adapter._ack_futures[pkt_id] = fut
+
+        async def inject_ack_while_waiting():
+            # Land a real ACK under the lock without resolving the future, so
+            # wait_for still times out and the except path must preserve ACK.
+            await asyncio.sleep(0.05)
+            with self.adapter._ack_lock:
+                rec = self.adapter._pending_acks[pkt_id]
+                rec["status"] = AckStatus.ACK
+                rec["error_reason"] = None
+
+        injector = asyncio.create_task(inject_ack_while_waiting())
+        record = await self.adapter._wait_for_ack(pkt_id, fut, 0.15)
+        await injector
+
+        self.assertEqual(record["status"], AckStatus.ACK)
+        self.assertNotEqual(record.get("error_reason"), "ACK_TIMEOUT")
+
+    async def test_wait_for_ack_timeout_stamps_pending_only(self):
+        """A still-pending wait correctly becomes TIMEOUT."""
+        loop = asyncio.get_running_loop()
+        self.adapter.loop = loop
+        pkt_id = "race-timeout-1"
+        fut = loop.create_future()
+        with self.adapter._ack_lock:
+            self.adapter._pending_acks[pkt_id] = {
+                "status": AckStatus.PENDING,
+                "dest": "!ab12cd34",
+            }
+            self.adapter._ack_futures[pkt_id] = fut
+
+        record = await self.adapter._wait_for_ack(pkt_id, fut, 0.05)
+        self.assertEqual(record["status"], AckStatus.TIMEOUT)
+        self.assertEqual(record["error_reason"], "ACK_TIMEOUT")
+
+    def test_record_ack_does_not_downgrade_real_ack_to_implicit(self):
+        """A later relay implicit ACK must not overwrite a real destination ACK."""
+        dest = "!ab12cd34"
+        # Real ACK from destination first.
+        self.adapter._record_ack_response(
+            {
+                "fromId": dest,
+                "decoded": {"requestId": 81001, "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertEqual(self.adapter.get_ack_status("81001")["status"], AckStatus.ACK)
+
+        # Later implicit from a relay — keep the definitive result.
+        self.adapter._record_ack_response(
+            {
+                "fromId": "!9e77edec",
+                "decoded": {"requestId": 81001, "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertEqual(self.adapter.get_ack_status("81001")["status"], AckStatus.ACK)
+
+    def test_record_ack_upgrades_implicit_to_real(self):
+        """A real destination ACK after an implicit relay ACK upgrades status."""
+        dest = "!ab12cd34"
+        self.adapter._record_ack_response(
+            {
+                "fromId": "!9e77edec",
+                "decoded": {"requestId": 81002, "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertEqual(self.adapter.get_ack_status("81002")["status"], AckStatus.IMPLICIT_ACK)
+
+        self.adapter._record_ack_response(
+            {
+                "fromId": dest,
+                "decoded": {"requestId": 81002, "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertEqual(self.adapter.get_ack_status("81002")["status"], AckStatus.ACK)
+
+    async def test_record_ack_snapshot_isolates_waiter_from_later_mutation(self):
+        """The future is resolved with a snapshot, not the live shared record dict."""
+        loop = asyncio.get_running_loop()
+        self.adapter.loop = loop
+        dest = "!ab12cd34"
+        pkt_id = "81003"
+        fut = loop.create_future()
+        with self.adapter._ack_lock:
+            self.adapter._ack_futures[pkt_id] = fut
+
+        self.adapter._record_ack_response(
+            {
+                "fromId": dest,
+                "decoded": {"requestId": int(pkt_id), "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        # Mutate the live store after schedule (simulates a concurrent writer).
+        with self.adapter._ack_lock:
+            live = self.adapter._pending_acks[pkt_id]
+            live["status"] = AckStatus.NAK
+            live["error_reason"] = "NO_ROUTE"
+
+        result = await asyncio.wait_for(fut, timeout=1.0)
+        # Snapshot frozen at real-ACK time must still report ACK.
+        self.assertEqual(result["status"], AckStatus.ACK)
+        self.assertNotEqual(result.get("error_reason"), "NO_ROUTE")
+        # Live store can still show the later mutation.
+        self.assertEqual(self.adapter.get_ack_status(pkt_id)["status"], AckStatus.NAK)
 
     async def test_inbound_uppercase_from_id_normalized(self):
         """Uppercase fromId is lowercased so Hermes allowlist exact-match works."""
