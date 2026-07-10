@@ -22,12 +22,13 @@ Configure the adapter via your `config.yaml` or directly using these environment
 | Env Variable | Type | Description | Default |
 |---|---|---|---|
 | `MESHTASTIC_SERIAL_PORT` | String | Path to serial device (e.g. `/dev/cu.usbserial-110`) or `auto` for discovery. | `auto` |
-| `MESHTASTIC_BAUD_RATE` | Integer | Connection speed of the serial interface. | `115200` |
+| `MESHTASTIC_BAUD_RATE` | Integer | Informational only — meshtastic library always opens serial at 115200. | `115200` |
 | `MESHTASTIC_TCP_HOST` | String | Hostname/IP of a WiFi/Ethernet node. When set, connects over TCP instead of serial. | None |
 | `MESHTASTIC_TCP_PORT` | Integer | TCP API port of the Meshtastic node. | `4403` |
 | `MESHTASTIC_ALLOWED_NODES` | List | Comma-separated list of permitted node IDs (e.g., `!da1b1613`). | None |
 | `MESHTASTIC_ALLOWED_USERS` | List | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. | None |
 | `MESHTASTIC_ALLOW_ALL_USERS`| Boolean| If set to `true`, permits any node in the mesh to interact with Hermes. | `false` |
+| `MESHTASTIC_ALLOW_CHANNELS` | Boolean| If `true`, the agent also answers channel/broadcast messages (replies into the shared channel). Off by default so only DMs are answered. | `false` |
 | `MESHTASTIC_HOME_CHANNEL` | String | Default delivery channel target for automated cron jobs. | `meshtastic:channel:0` |
 | `MESHTASTIC_CHUNK_BYTES` | Integer | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and PKI overhead; the raw protocol payload ceiling (and clamp for this value) is `233`. | `170` |
 | `MESHTASTIC_CHUNK_DELAY` | Float | Delay in seconds between chunk sends. | `4.0` |

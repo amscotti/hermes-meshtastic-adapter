@@ -16,7 +16,7 @@ optional_env:
     prompt: "Meshtastic serial port"
     password: false
   - name: MESHTASTIC_BAUD_RATE
-    description: "Baud rate for serial connection (default: 115200)"
+    description: "Informational only — the meshtastic Python library always opens serial at 115200 (default: 115200)"
     prompt: "Baud rate"
     password: false
   - name: MESHTASTIC_TCP_HOST

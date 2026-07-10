@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
+from enum import StrEnum
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
@@ -52,6 +53,25 @@ except ImportError:
 DEFAULT_TCP_PORT = 4403
 
 
+class AckStatus(StrEnum):
+    """Lifecycle of an outbound chunk's ACK bookkeeping.
+
+    Stored on ACK records as these string values (``StrEnum`` serializes to the
+    value), so ``SendResult.raw_response`` / ``get_ack_status`` stay JSON-friendly
+    and backward-compatible with plain-string consumers.
+
+    ``ACK`` is a real end-to-end confirmation (routing ACK sender == destination).
+    ``IMPLICIT_ACK`` is a relay-only confirmation (official client DELIVERED vs
+    RECEIVED) — not delivery for our purposes.
+    """
+
+    PENDING = "pending"
+    ACK = "ack"
+    IMPLICIT_ACK = "implicit_ack"
+    NAK = "nak"
+    TIMEOUT = "timeout"
+
+
 # --- Mock Implementation for Testing / Dry Run ---
 class MockLocalNode:
     def __init__(self, interface):
@@ -79,7 +99,11 @@ class MockSerialInterface:
                     "role": "CLIENT_BASE",
                     "publicKey": "mock_pub_key_hq",
                 },
-                "deviceMetrics": {"batteryLevel": 85, "voltage": 4.12, "uptime": 1200},
+                "deviceMetrics": {
+                    "batteryLevel": 85,
+                    "voltage": 4.12,
+                    "uptimeSeconds": 1200,
+                },
                 "position": {
                     "latitude": 42.6983,
                     "longitude": -71.1234,
@@ -99,7 +123,11 @@ class MockSerialInterface:
                     "role": "SENSOR",
                     "publicKey": "mock_pub_key_sensor",
                 },
-                "deviceMetrics": {"batteryLevel": 92, "voltage": 4.15, "uptime": 5000},
+                "deviceMetrics": {
+                    "batteryLevel": 92,
+                    "voltage": 4.15,
+                    "uptimeSeconds": 5000,
+                },
                 "environmentMetrics": {
                     "temperature": 22.4,
                     "relativeHumidity": 54.2,
@@ -242,6 +270,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         self.serial_port = os.getenv("MESHTASTIC_SERIAL_PORT") or extra.get("serial_port") or "auto"
         self.baud_rate = int(os.getenv("MESHTASTIC_BAUD_RATE") or extra.get("baud_rate", 115200))
+        # meshtastic.serial_interface hardcodes 115200 on the pyserial open —
+        # MESHTASTIC_BAUD_RATE is accepted for setup-UI parity / future use but
+        # is not applied to the library constructor today.
+        if self.baud_rate != 115200:
+            logger.warning(
+                "MESHTASTIC_BAUD_RATE=%s is ignored: the meshtastic library always "
+                "opens serial at 115200.",
+                self.baud_rate,
+            )
 
         # Optional TCP/IP transport for WiFi/Ethernet-capable nodes. When a host
         # is configured the adapter connects over TCP instead of serial; the two
@@ -283,6 +320,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # If they omitted the leading '!', support matching it too
                 if not p.startswith("!"):
                     self.allowed_nodes.add(f"!{p}")
+                else:
+                    self.allowed_nodes.add(p.lstrip("!"))
+
+        # Hermes gateway re-checks the allowlist env with exact string equality
+        # (no case fold, no bang-normalization). Expand the env so its second
+        # gate accepts the same forms we accept at intake. See authz_mixin.
+        self._expand_allowlist_env_for_gateway()
 
         # Live-observed per-node overlay (last_heard / signal learned from the
         # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
@@ -343,6 +387,56 @@ class MeshtasticAdapter(BasePlatformAdapter):
         nid = node_id.strip().lower()
         return nid in self.allowed_nodes or nid.lstrip("!") in self.allowed_nodes
 
+    @staticmethod
+    def _normalize_node_id(node_id: Any) -> str | None:
+        """Canonicalize a Meshtastic node id to ``!`` + lowercase 8-hex when possible.
+
+        Hermes gateway allowlist matching is exact (no case fold / bang
+        normalization), so inbound ``user_id`` / DM chat_ids must be stable and
+        match the ``!aabbccdd`` form operators put in MESHTASTIC_ALLOWED_NODES.
+        Numeric node numbers and ``!``-prefixed hex (any case) are normalized;
+        other string forms are lowercased as-is.
+        """
+        if node_id is None:
+            return None
+        if isinstance(node_id, int):
+            return f"!{node_id:08x}"
+        text = str(node_id).strip()
+        if not text:
+            return None
+        low = text.lower()
+        bare = low[1:] if low.startswith("!") else low
+        if len(bare) == 8 and all(c in "0123456789abcdef" for c in bare):
+            return f"!{bare}"
+        return low
+
+    @staticmethod
+    def _expand_allowlist_env_for_gateway() -> None:
+        """Expand allowlist env vars so Hermes' exact-match gate accepts our forms.
+
+        The adapter accepts node ids with/without ``!`` and any case. Hermes
+        ``_is_user_authorized`` does ``user_id in allowed_ids`` with no
+        normalization. Expanding the env keeps the gateway double-check aligned
+        with adapter intake without forking Hermes.
+        """
+        for env_key in ("MESHTASTIC_ALLOWED_NODES", "MESHTASTIC_ALLOWED_USERS"):
+            raw = os.getenv(env_key, "").strip()
+            if not raw:
+                continue
+            expanded: set[str] = set()
+            for part in raw.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                expanded.add(p)
+                low = p.lower()
+                expanded.add(low)
+                bare = low.lstrip("!")
+                if bare:
+                    expanded.add(bare)
+                    expanded.add(f"!{bare}")
+            os.environ[env_key] = ",".join(sorted(expanded))
+
     def _update_observed(
         self,
         node_id: str,
@@ -394,20 +488,45 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return dict(obs) if obs else {}
 
     def _get_interface_node_id(self, interface: Any) -> str | None:
-        """Return the local Meshtastic node ID for an interface, if known."""
+        """Return the local Meshtastic node ID for an interface, if known.
+
+        Prefers the library's ``getMyNodeInfo()`` (real MeshInterface) which
+        returns the node-DB entry including ``user.id``. Falls back to
+        ``myInfo.my_node_num`` (protobuf) and the mock's ``getMyNodeId()``.
+        """
+        if hasattr(interface, "getMyNodeInfo") and callable(interface.getMyNodeInfo):
+            try:
+                info = interface.getMyNodeInfo()
+            except Exception:
+                info = None
+            if isinstance(info, dict):
+                user = info.get("user") or {}
+                user_id = user.get("id") if isinstance(user, dict) else None
+                if isinstance(user_id, str) and user_id:
+                    return self._normalize_node_id(user_id) or user_id
+                num = info.get("num")
+                if isinstance(num, int):
+                    return f"!{num:08x}"
+
         my_info = getattr(interface, "myInfo", None)
         my_node_num = None
         if isinstance(my_info, dict):
             my_node_num = my_info.get("my_node_num")
-        elif my_info:
+        elif my_info is not None and not isinstance(my_info, type(None)):
             my_node_num = getattr(my_info, "my_node_num", None)
 
+        if isinstance(my_node_num, int):
+            return f"!{my_node_num:08x}"
         if my_node_num is not None:
-            return f"!{int(my_node_num):08x}"
-
-        if hasattr(interface, "getMyNodeId"):
             try:
-                return interface.getMyNodeId()
+                return f"!{int(my_node_num):08x}"
+            except (TypeError, ValueError):
+                pass
+
+        get_my = getattr(interface, "getMyNodeId", None)
+        if callable(get_my):
+            try:
+                return self._normalize_node_id(get_my())
             except Exception:
                 return None
         return None
@@ -532,7 +651,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return meshtastic.serial_interface.SerialInterface(devPath=target)
 
     def _discover_serial_ports(self) -> list[str]:
-        """Discover active serial connections cross-platform."""
+        """Discover likely Meshtastic serial devices cross-platform.
+
+        Prefer ``meshtastic.util.findPorts`` (VID whitelist for known radios,
+        then non-blacklisted ports) so ``auto`` does not open every USB-serial
+        gadget on the host. Fall back to pyserial / glob when the library is
+        unavailable.
+        """
+        if HAS_MESHTASTIC:
+            try:
+                import meshtastic.util as meshtastic_util
+
+                ports = list(meshtastic_util.findPorts(True) or [])
+                if ports:
+                    return ports
+            except Exception as e:
+                logger.debug("meshtastic.util.findPorts discovery failed: %s", e)
         try:
             if serial is not None:
                 ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -794,17 +928,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _on_receive(self, packet: dict, interface: Any = None):
         """Processes incoming packet in the main loop thread."""
         try:
-            # Normalise Sender Node ID
-            from_id = packet.get("fromId") or packet.get("from")
-            if isinstance(from_id, int):
-                from_id = f"!{from_id:08x}"
-
+            # Canonical node id (! + lowercase 8-hex) so Hermes gateway
+            # allowlist exact-match and session keys stay consistent.
+            from_id = self._normalize_node_id(packet.get("fromId") or packet.get("from"))
             if not from_id:
                 return
 
             # Link metadata from the packet envelope.
-            snr = packet.get("rxSnr") or packet.get("snr")
-            rssi = packet.get("rxRssi") or packet.get("rssi")
+            # Prefer rx* keys from the radio envelope; use is-not-None so a
+            # legitimate 0.0 SNR (or 0 RSSI) is not treated as missing.
+            snr = packet.get("rxSnr")
+            if snr is None:
+                snr = packet.get("snr")
+            rssi = packet.get("rxRssi")
+            if rssi is None:
+                rssi = packet.get("rssi")
             hop_limit = packet.get("hopLimit")
             hop_start = packet.get("hopStart")
             hop_count = None
@@ -836,28 +974,34 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if snr is not None or rssi is not None:
                 self._run_db_write(lambda: telemetry_db.log_signal(from_id, snr, rssi, hop_count))
 
-            # Handle Telemetry packets (TELEMETRY_APP = 4, ENVIRONMENTAL_APP = 33)
-            if portnum in ("TELEMETRY_APP", 4, "ENVIRONMENTAL_APP", 33):
+            # Telemetry: portnums_pb2.PortNum.TELEMETRY_APP == 67 (MessageToDict
+            # usually emits the string name). Older code treated 4/33 as
+            # telemetry/env — those are NODEINFO_APP and IP_TUNNEL_APP.
+            if portnum in ("TELEMETRY_APP", 67):
                 self._run_db_write(lambda: self._handle_telemetry_packet(from_id, decoded))
                 return
 
-            # Handle Position packets (POSITION_APP = 3)
+            # Position: portnums_pb2.PortNum.POSITION_APP == 3
             if portnum in ("POSITION_APP", 3):
                 self._run_db_write(lambda: self._handle_position_packet(from_id, decoded))
                 return
 
-            # We only bridge TEXT messages
+            # We only bridge TEXT messages (TEXT_MESSAGE_APP == 1)
             if portnum not in ("TEXT_MESSAGE_APP", 1, "TEXT_MESSAGE"):
                 return
 
+            # Library may expose decoded text and/or raw payload bytes.
             payload = decoded.get("payload")
-            if not payload:
+            text_field = decoded.get("text")
+            if payload is None and text_field is None:
                 return
 
             if isinstance(payload, bytes):
                 text = payload.decode("utf-8", errors="replace")
-            else:
+            elif payload is not None:
                 text = str(payload)
+            else:
+                text = str(text_field)
 
             # Determine scopes (DM vs Channel)
             to_id = packet.get("toId") or packet.get("to")
@@ -1001,6 +1145,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"Error handling inbound Meshtastic packet: {e}", exc_info=True)
 
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        """Return the first value that is not None (0 / 0.0 / False are kept)."""
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
     def _handle_telemetry_packet(self, node_id: str, decoded: dict):
         """Helper to process and log sensor/metrics telemetry."""
         try:
@@ -1010,20 +1162,34 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # If parsed differently by protobufs
                 telemetry = decoded
 
-            metrics = telemetry.get("deviceMetrics", {})
-            env = telemetry.get("environmentMetrics", {})
+            metrics = telemetry.get("deviceMetrics", {}) or {}
+            env = telemetry.get("environmentMetrics", {}) or {}
 
-            battery = metrics.get("batteryLevel") or telemetry.get("batteryLevel")
-            voltage = metrics.get("voltage") or telemetry.get("voltage")
-            uptime = metrics.get("uptime") or telemetry.get("uptime")
-
-            temp = (
-                env.get("temperature")
-                or env.get("barometric_temperature")
-                or telemetry.get("temperature")
+            # batteryLevel 0 means external power on many devices — must not use
+            # truthiness. Real mesh dicts use uptimeSeconds (MessageToDict);
+            # accept legacy "uptime" too (mock / older payloads).
+            battery = self._first_not_none(
+                metrics.get("batteryLevel"), telemetry.get("batteryLevel")
             )
-            humidity = env.get("relativeHumidity") or telemetry.get("relativeHumidity")
-            pressure = env.get("barometricPressure") or telemetry.get("barometricPressure")
+            voltage = self._first_not_none(metrics.get("voltage"), telemetry.get("voltage"))
+            uptime = self._first_not_none(
+                metrics.get("uptimeSeconds"),
+                metrics.get("uptime"),
+                telemetry.get("uptimeSeconds"),
+                telemetry.get("uptime"),
+            )
+
+            temp = self._first_not_none(
+                env.get("temperature"),
+                env.get("barometric_temperature"),
+                telemetry.get("temperature"),
+            )
+            humidity = self._first_not_none(
+                env.get("relativeHumidity"), telemetry.get("relativeHumidity")
+            )
+            pressure = self._first_not_none(
+                env.get("barometricPressure"), telemetry.get("barometricPressure")
+            )
 
             if any(val is not None for val in (battery, voltage, temp, humidity, pressure, uptime)):
                 telemetry_db.log_telemetry(
@@ -1225,18 +1391,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _is_retriable_failure(self, result: SendResult) -> bool:
         """Decide whether a failed chunk send is worth re-sending.
 
-        Only ACK-observed failures qualify: a timeout, or a NAK whose reason is
-        not permanent. Pre-send errors (no interface, missing pubkey, bad
-        chat_id) carry no ACK record and are never retried — re-sending can't fix
-        them.
+        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
+        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
+        interface, missing pubkey, bad chat_id) carry no ACK record and are
+        never retried — re-sending can't fix them.
         """
         ack = (result.raw_response or {}).get("ack")
         if not isinstance(ack, dict):
             return False
         status = ack.get("status")
-        if status == "timeout":
+        # No confirmation, or only a relay confirmed — both warrant a retry.
+        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
             return True
-        if status == "nak":
+        if status == AckStatus.NAK:
             reason = str(ack.get("error_reason") or "").upper()
             return reason not in self.PERMANENT_NAK_REASONS
         return False
@@ -1352,14 +1519,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 "dest": dest,
                 "bytes": len(content.encode("utf-8")),
                 "sent_at": time.time(),
-                "status": "pending",
+                "status": AckStatus.PENDING,
             }
             self._pending_acks[pkt_id] = record
             if future:
                 self._ack_futures[pkt_id] = future
             self._prune_ack_history_locked()
 
-        if future and existing_response and not future.done():
+        # If a definitive response (real ACK / NAK) already arrived before the
+        # waiter was created, resolve immediately. An early *implicit* ACK is not
+        # definitive — leave the waiter open so a real ACK (or timeout) decides.
+        if (
+            future
+            and existing_response
+            and not future.done()
+            and existing_response.get("status") != AckStatus.IMPLICIT_ACK
+        ):
             future.set_result(existing_response)
         return future
 
@@ -1392,13 +1567,35 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return onAckNak
 
     def _record_ack_response(self, packet: dict, dest: str, content: str) -> None:
-        """Log and store Meshtastic ACK/NACK responses without blocking send()."""
+        """Log and store Meshtastic ACK/NACK responses without blocking send().
+
+        Distinguishes a **real** end-to-end ACK (routing ACK sender IS the
+        destination → :attr:`AckStatus.ACK`) from an **implicit** ACK relayed by
+        another node (sender ≠ destination → :attr:`AckStatus.IMPLICIT_ACK`).
+        Mirrors the official client's RECEIVED vs DELIVERED. Only real ACK /
+        NAK resolve a waiter; implicit ACKs leave it open for a real ACK or
+        timeout.
+        """
         decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
         routing = decoded.get("routing", {}) or {}
         request_id = decoded.get("requestId") or decoded.get("request_id")
         error_reason = routing.get("errorReason") or routing.get("error_reason")
-        status = "ack" if error_reason in (None, "", "NONE") else "nak"
         pkt_id = str(request_id) if request_id is not None else "unknown"
+
+        # Who sent this ACK. Applied to DMs only (dest is a "!node" id).
+        # Missing sender still counts as a real ACK (backward compatible).
+        ack_from_raw = None
+        if isinstance(packet, dict):
+            ack_from_raw = packet.get("fromId") or packet.get("from")
+        ack_from = self._normalize_node_id(ack_from_raw)
+        dest_norm = self._normalize_node_id(dest) if dest.startswith("!") else None
+
+        if error_reason not in (None, "", "NONE"):
+            status = AckStatus.NAK
+        elif dest_norm and ack_from and ack_from != dest_norm:
+            status = AckStatus.IMPLICIT_ACK
+        else:
+            status = AckStatus.ACK
 
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id, {})
@@ -1408,11 +1605,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     "bytes": record.get("bytes", len(content.encode("utf-8"))),
                     "status": status,
                     "error_reason": error_reason,
+                    "ack_from": ack_from,
                     "response_at": time.time(),
                     "response": {
                         "packet_id": packet.get("id") if isinstance(packet, dict) else None,
                         "request_id": request_id,
-                        "from_id": packet.get("fromId") if isinstance(packet, dict) else None,
+                        "from_id": ack_from,
                         "to_id": packet.get("toId") if isinstance(packet, dict) else None,
                         "routing": routing,
                     },
@@ -1422,11 +1620,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._ack_responses[pkt_id] = record
             future = self._ack_futures.get(pkt_id)
 
-        if future and not future.done() and self.loop and self.loop.is_running():
+        # Resolve the waiter only on a DEFINITIVE outcome (real ACK or NAK). An
+        # implicit ACK updates the record but keeps the wait open, so a real ACK
+        # can still arrive — and if it doesn't, the timeout drives a retry.
+        if (
+            status in (AckStatus.ACK, AckStatus.NAK)
+            and future
+            and not future.done()
+            and self.loop
+            and self.loop.is_running()
+        ):
             self.loop.call_soon_threadsafe(self._set_ack_future_result, future, record)
 
-        if status == "ack":
-            logger.info("Meshtastic ACK received: packet_id=%s dest=%s", pkt_id, dest)
+        if status == AckStatus.ACK:
+            logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
+        elif status == AckStatus.IMPLICIT_ACK:
+            logger.info(
+                "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
+                pkt_id,
+                dest,
+                ack_from,
+            )
         else:
             logger.warning(
                 "Meshtastic NAK received: packet_id=%s dest=%s reason=%s",
@@ -1451,16 +1665,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except TimeoutError:
             with self._ack_lock:
                 record = self._pending_acks.get(pkt_id, {})
-                record.update(
-                    {
-                        "status": "timeout",
-                        "error_reason": "ACK_TIMEOUT",
-                        "response_at": time.time(),
-                    }
-                )
+                # Preserve an implicit ACK if that's all we got — it's more
+                # informative than a bare timeout (and still "not confirmed").
+                if record.get("status") != AckStatus.IMPLICIT_ACK:
+                    record["status"] = AckStatus.TIMEOUT
+                    record["error_reason"] = "ACK_TIMEOUT"
+                record["response_at"] = time.time()
                 self._pending_acks[pkt_id] = record
                 self._ack_responses[pkt_id] = record
-            logger.warning("Meshtastic ACK timeout: packet_id=%s timeout=%.1fs", pkt_id, timeout)
+            logger.warning(
+                "Meshtastic ACK timeout: packet_id=%s timeout=%.1fs final_status=%s",
+                pkt_id,
+                timeout,
+                record.get("status"),
+            )
             return record
         finally:
             with self._ack_lock:
@@ -1521,6 +1739,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="Invalid chat_id format")
 
             dest = parts[1]
+            # DM destinations are ``!``-prefixed node ids — canonicalize case so
+            # node-DB lookup matches the library's lowercase keys.
+            if dest.startswith("!"):
+                dest = self._normalize_node_id(dest) or dest
             ifaces = self.get_interfaces()
             if not ifaces:
                 return SendResult(success=False, error="No active interfaces connected")
@@ -1532,9 +1754,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if dest.startswith("!"):
                 node_info = None
                 for current_iface in ifaces:
-                    if hasattr(current_iface, "nodes") and dest in current_iface.nodes:
+                    nodes = getattr(current_iface, "nodes", None) or {}
+                    # Exact key first, then case-insensitive scan of the node DB.
+                    if dest in nodes:
                         iface = current_iface
-                        node_info = current_iface.nodes[dest]
+                        node_info = nodes[dest]
+                        break
+                    dest_bare = dest.lstrip("!")
+                    for nid, ninfo in nodes.items():
+                        if str(nid).lower().lstrip("!") == dest_bare:
+                            iface = current_iface
+                            node_info = ninfo
+                            dest = str(nid)  # use the library's key form for sendText
+                            break
+                    if node_info is not None:
                         break
                 if node_info is not None and not node_info.get("user", {}).get("publicKey"):
                     return SendResult(
@@ -1610,14 +1843,25 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     )
                 ack_record = await self._wait_for_ack(pkt_id, ack_future, ack_timeout)
                 raw_response["ack"] = ack_record
-                if ack_record.get("status") == "ack":
+                status = ack_record.get("status")
+                if status == AckStatus.ACK:
                     return SendResult(success=True, message_id=pkt_id, raw_response=raw_response)
-                if ack_record.get("status") == "nak":
+                if status == AckStatus.NAK:
                     reason = ack_record.get("error_reason") or "unknown"
                     return SendResult(
                         success=False,
                         message_id=pkt_id,
                         error=f"Meshtastic NAK for packet {pkt_id}: {reason}",
+                        raw_response=raw_response,
+                    )
+                if status == AckStatus.IMPLICIT_ACK:
+                    return SendResult(
+                        success=False,
+                        message_id=pkt_id,
+                        error=(
+                            f"Meshtastic implicit ACK only for packet {pkt_id} "
+                            f"(relayed by {ack_record.get('ack_from')}; destination not confirmed)"
+                        ),
                         raw_response=raw_response,
                     )
                 return SendResult(

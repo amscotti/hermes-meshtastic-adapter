@@ -130,6 +130,20 @@ def assess_signal_quality(snr: float | None) -> str:
         return "No signal"
 
 
+def _first_not_none(*values: Any) -> Any:
+    """Return the first value that is not None (0 / 0.0 are kept)."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _device_uptime(metrics: dict[str, Any] | None) -> Any:
+    """Read uptime from node metrics (real mesh uses uptimeSeconds)."""
+    metrics = metrics or {}
+    return _first_not_none(metrics.get("uptimeSeconds"), metrics.get("uptime"))
+
+
 # --- Tool Handlers ---
 
 
@@ -228,7 +242,7 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         else "Unknown",
         "battery_level": metrics.get("batteryLevel"),
         "voltage": metrics.get("voltage"),
-        "uptime": metrics.get("uptime"),
+        "uptime": _device_uptime(metrics),
         "latitude": pos.get("latitude"),
         "longitude": pos.get("longitude"),
         "altitude": pos.get("altitude"),
@@ -396,21 +410,24 @@ async def handle_mesh_telemetry(args: dict, **kwargs) -> str:
     # Fall back to SQLite database if memory is empty
     history = telemetry_db.get_telemetry_history(node_id, limit=1)
 
-    temperature = env_metrics.get("temperature") or env_metrics.get("barometric_temperature")
+    # Prefer live fields; keep 0 / 0.0 (battery 0 = external power on many nodes).
+    temperature = _first_not_none(
+        env_metrics.get("temperature"), env_metrics.get("barometric_temperature")
+    )
     humidity = env_metrics.get("relativeHumidity")
     pressure = env_metrics.get("barometricPressure")
     battery_level = dev_metrics.get("batteryLevel")
     voltage = dev_metrics.get("voltage")
-    uptime = dev_metrics.get("uptime")
+    uptime = _device_uptime(dev_metrics)
 
     if history and (temperature is None or battery_level is None):
         h = history[0]
-        temperature = temperature if temperature is not None else h.get("temperature")
-        humidity = humidity if humidity is not None else h.get("humidity")
-        pressure = pressure if pressure is not None else h.get("pressure")
-        battery_level = battery_level if battery_level is not None else h.get("battery_level")
-        voltage = voltage if voltage is not None else h.get("voltage")
-        uptime = uptime if uptime is not None else h.get("uptime")
+        temperature = _first_not_none(temperature, h.get("temperature"))
+        humidity = _first_not_none(humidity, h.get("humidity"))
+        pressure = _first_not_none(pressure, h.get("pressure"))
+        battery_level = _first_not_none(battery_level, h.get("battery_level"))
+        voltage = _first_not_none(voltage, h.get("voltage"))
+        uptime = _first_not_none(uptime, h.get("uptime"))
 
     if temperature is None and battery_level is None:
         return json.dumps(

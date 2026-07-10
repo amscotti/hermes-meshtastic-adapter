@@ -44,6 +44,7 @@ tools_spec.loader.exec_module(meshtastic_tools)
 import telemetry_db
 from adapter import (
     HAS_MESHTASTIC,
+    AckStatus,
     MeshtasticAdapter,
     MockSerialInterface,
     _env_enablement,
@@ -400,7 +401,9 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(iface.sendText.call_count, 1)
         calls = iface.sendText.call_args_list
         for call in calls:
-            self.assertLessEqual(len(call[1]["text"].encode("utf-8")), 237)
+            self.assertLessEqual(
+                len(call[1]["text"].encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH
+            )
         self.assertTrue(calls[0][1]["text"].startswith("[1/"))
 
     async def test_telemetry_persistence(self):
@@ -410,7 +413,11 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             "decoded": {
                 "portnum": "TELEMETRY_APP",
                 "telemetry": {
-                    "deviceMetrics": {"batteryLevel": 88, "voltage": 4.05, "uptime": 3600},
+                    "deviceMetrics": {
+                        "batteryLevel": 88,
+                        "voltage": 4.05,
+                        "uptimeSeconds": 3600,
+                    },
                     "environmentMetrics": {
                         "temperature": 18.5,
                         "relativeHumidity": 60.1,
@@ -429,6 +436,83 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[0]["battery_level"], 88)
         self.assertEqual(history[0]["temperature"], 18.5)
         self.assertEqual(history[0]["humidity"], 60.1)
+        self.assertEqual(history[0]["uptime"], 3600)
+
+    async def test_telemetry_numeric_portnum_and_zero_metrics(self):
+        """Numeric TELEMETRY_APP (67) and falsy metrics (0 / 0.0) must still log.
+
+        Port 4 is NODEINFO_APP — must not be treated as telemetry. batteryLevel 0
+        means external power on many devices and must not be dropped by `or`.
+        """
+        packet = {
+            "fromId": "!ab12cd34",
+            "decoded": {
+                "portnum": 67,  # portnums_pb2.PortNum.TELEMETRY_APP
+                "telemetry": {
+                    "deviceMetrics": {
+                        "batteryLevel": 0,
+                        "voltage": 0.0,
+                        "uptimeSeconds": 0,
+                    },
+                },
+            },
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.1)
+
+        history = get_telemetry_history("!ab12cd34", limit=1)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["battery_level"], 0)
+        self.assertEqual(history[0]["voltage"], 0.0)
+        self.assertEqual(history[0]["uptime"], 0)
+
+        # NODEINFO_APP (4) must not be mis-classified as telemetry.
+        before = len(get_telemetry_history("!ab12cd34", limit=10))
+        self.adapter._on_receive(
+            {
+                "fromId": "!ab12cd34",
+                "decoded": {
+                    "portnum": 4,
+                    "user": {"id": "!ab12cd34", "longName": "x"},
+                },
+            },
+            self.adapter.get_interfaces()[0],
+        )
+        await asyncio.sleep(0.1)
+        self.assertEqual(len(get_telemetry_history("!ab12cd34", limit=10)), before)
+
+    async def test_zero_snr_is_preserved(self):
+        """A direct packet with SNR 0.0 must not be treated as missing signal."""
+        # Exercise the packet-path extraction (rxSnr=0 must not fall through to None).
+        self.adapter.allow_all = True
+        packet = {
+            "fromId": "!dddd4444",
+            "toId": "!da1b1613",
+            "rxSnr": 0.0,
+            "rxRssi": -100,
+            "hopStart": 3,
+            "hopLimit": 3,  # 0 hops away
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"snr zero"},
+            "id": 9001,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        obs = self.adapter.get_observed_node("!dddd4444")
+        self.assertEqual(obs.get("snr"), 0.0)
+        self.assertEqual(obs.get("rssi"), -100)
+
+    async def test_inbound_text_field_without_payload(self):
+        """decoded.text alone is enough when payload bytes are absent."""
+        packet = {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "hello via text field"},
+            "id": 9002,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_called_once()
+        self.assertEqual(self.adapter.handle_message.call_args[0][0].text, "hello via text field")
 
     async def test_position_persistence(self):
         """Test position logging and coordinates scaling."""
@@ -495,7 +579,8 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
     async def test_utf8_chunking(self):
         """Verify that chunking measures UTF-8 bytes and safely splits multi-byte characters."""
-        # The emoji is four UTF-8 bytes, so this exceeds the 237 byte limit.
+        # The emoji is four UTF-8 bytes; 60 of them (240 bytes) exceed the default
+        # 170-byte budget and the 233-byte protocol ceiling.
         long_emoji_msg = "💩" * 60
 
         iface = self.adapter.get_interfaces()[0]
@@ -508,7 +593,9 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(iface.sendText.call_count, 1)
         calls = iface.sendText.call_args_list
         for call in calls:
-            self.assertLessEqual(len(call[1]["text"].encode("utf-8")), 237)
+            self.assertLessEqual(
+                len(call[1]["text"].encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH
+            )
         reconstructed = "".join(call[1]["text"].split("] ", 1)[1] for call in calls)
         self.assertEqual(reconstructed, long_emoji_msg)
 
@@ -519,7 +606,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(len(chunks), 1)
         for chunk in chunks:
-            self.assertLessEqual(len(chunk.encode("utf-8")), 237)
+            self.assertLessEqual(len(chunk.encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH)
 
         reconstructed = "".join(chunk.split("] ", 1)[1] for chunk in chunks)
         self.assertEqual(reconstructed, message)
@@ -527,10 +614,12 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
     def test_default_chunk_budget_is_conservative(self):
         """With no override, chunks stay within the conservative default budget.
 
-        237 leaves no room for encrypted-DM (PKI) overhead — the radio NAKs
-        oversized DM chunks with TOO_LARGE — so the default must be lower.
+        The raw protocol ceiling is 233 bytes, but that leaves no room for
+        encrypted-DM (PKI) overhead — the radio NAKs oversized DM chunks with
+        TOO_LARGE — so the default must be lower.
         """
         self.assertEqual(self.adapter.DEFAULT_CHUNK_BYTES, 170)
+        self.assertEqual(self.adapter.MAX_MESSAGE_LENGTH, 233)
         # setUp leaves MESHTASTIC_CHUNK_BYTES blank → default budget applies.
         chunks = self.adapter._chunk_message("A" * 400)
         self.assertGreater(len(chunks), 1)
@@ -691,8 +780,8 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(res.success)
         self.assertEqual(res.message_id, "123456")
-        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "ack")
-        self.assertEqual(self.adapter.get_ack_status("123456")["status"], "ack")
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.ACK)
+        self.assertEqual(self.adapter.get_ack_status("123456")["status"], AckStatus.ACK)
 
     async def test_wait_for_nak_fails_send(self):
         """Verify NAK callbacks fail the send when ACK waiting is enabled."""
@@ -709,7 +798,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(res.success)
         self.assertIn("Meshtastic NAK", res.error)
-        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "nak")
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.NAK)
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["error_reason"], "NO_ROUTE")
 
     async def test_wait_for_ack_timeout_fails_send(self):
@@ -722,7 +811,75 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(res.success)
         self.assertIn("ACK timeout", res.error)
-        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], "timeout")
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.TIMEOUT)
+
+    async def test_ack_arrives_while_waiting_uses_call_soon_threadsafe(self):
+        """A real ACK that arrives after the waiter is pending resolves via the loop.
+
+        Existing tests fire onResponse inside sendText (before the future exists),
+        so the early-response path in _track_pending_ack resolves the future
+        immediately. This test deliberately delays the ACK until _wait_for_ack is
+        already waiting, covering call_soon_threadsafe → _set_ack_future_result.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        captured: dict = {}
+        pkt_id = 94001
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            # Do NOT call onResponse here — leave the waiter open.
+            captured["onResponse"] = onResponse
+            return SimpleNamespace(id=pkt_id)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+
+        async def deliver_ack_after_waiter_registered():
+            # Poll until _track_pending_ack has registered the future.
+            for _ in range(200):
+                with self.adapter._ack_lock:
+                    fut = self.adapter._ack_futures.get(str(pkt_id))
+                if fut is not None and not fut.done():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("ACK future was never registered for the waiting send")
+
+            def fire_from_background_thread():
+                cb = captured.get("onResponse")
+                self.assertIsNotNone(cb)
+                cb(
+                    {
+                        "fromId": "!ab12cd34",  # real ACK from destination
+                        "decoded": {
+                            "requestId": pkt_id,
+                            "routing": {"errorReason": "NONE"},
+                        },
+                    }
+                )
+
+            # Fire from a non-loop thread so call_soon_threadsafe is the real path
+            # (same as meshtastic pubsub / radio callbacks).
+            await asyncio.to_thread(fire_from_background_thread)
+
+        loop = asyncio.get_running_loop()
+        with (
+            patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "2"}),
+            patch.object(
+                loop, "call_soon_threadsafe", wraps=loop.call_soon_threadsafe
+            ) as threadsafe,
+        ):
+            # Keep the adapter's stored loop identity in sync with the patched one.
+            self.adapter.loop = loop
+            deliver_task = asyncio.create_task(deliver_ack_after_waiter_registered())
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="late real ack")
+            await deliver_task
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.message_id, str(pkt_id))
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.ACK)
+        # asyncio.wait_for may also use call_soon_threadsafe; require our
+        # _set_ack_future_result schedule specifically (the L1633 path).
+        scheduled = [c.args[0] for c in threadsafe.call_args_list if c.args]
+        self.assertIn(self.adapter._set_ack_future_result, scheduled)
 
     async def test_retry_resends_transient_nak_until_ack(self):
         """A transient NAK is re-sent; delivery succeeds on a later attempt."""
@@ -801,12 +958,16 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         def r(ack):
             return SendResult(success=False, raw_response={"ack": ack} if ack else None)
 
-        self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
+        self.assertTrue(self.adapter._is_retriable_failure(r({"status": AckStatus.TIMEOUT})))
         self.assertTrue(
-            self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "NO_ROUTE"}))
+            self.adapter._is_retriable_failure(
+                r({"status": AckStatus.NAK, "error_reason": "NO_ROUTE"})
+            )
         )
         self.assertFalse(
-            self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": "TOO_LARGE"}))
+            self.adapter._is_retriable_failure(
+                r({"status": AckStatus.NAK, "error_reason": "TOO_LARGE"})
+            )
         )
         # PKI / auth failures are permanent — re-sending can't fix a key problem.
         for reason in (
@@ -819,11 +980,89 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             "RATE_LIMIT_EXCEEDED",
         ):
             self.assertFalse(
-                self.adapter._is_retriable_failure(r({"status": "nak", "error_reason": reason})),
+                self.adapter._is_retriable_failure(
+                    r({"status": AckStatus.NAK, "error_reason": reason})
+                ),
                 f"{reason} should be permanent",
             )
-        self.assertFalse(self.adapter._is_retriable_failure(r({"status": "ack"})))
+        self.assertFalse(self.adapter._is_retriable_failure(r({"status": AckStatus.ACK})))
+        self.assertTrue(self.adapter._is_retriable_failure(r({"status": AckStatus.IMPLICIT_ACK})))
+        # Plain strings still match (StrEnum + public JSON surface).
+        self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
         self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
+
+    async def test_real_ack_from_destination_is_delivery(self):
+        """A routing ACK whose sender IS the destination confirms real delivery."""
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse(
+                {
+                    "fromId": "!ab12cd34",  # ACK came from the destination itself
+                    "decoded": {"requestId": 91001, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=91001)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "1"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="real ack")
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.ACK)
+        # Wire/JSON surface stays the plain string value.
+        self.assertEqual(str(res.raw_response["chunks"][0]["ack"]["status"]), "ack")
+
+    async def test_implicit_ack_from_relay_is_not_delivery(self):
+        """A routing ACK relayed by another node is implicit — not confirmed delivery."""
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse(
+                {
+                    "fromId": "!9e77edec",  # a RELAY, not the destination !ab12cd34
+                    "decoded": {"requestId": 91002, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=91002)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "0.3"}):
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="implicit ack")
+
+        self.assertFalse(res.success)  # relay heard it, destination did not confirm
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
+        self.assertIn("implicit ACK only", res.error or "")
+
+    async def test_implicit_ack_retries_until_real_ack(self):
+        """With retries on, an implicit-only ACK is re-sent; a later real ACK delivers."""
+        iface = self.adapter.get_interfaces()[0]
+        calls = {"n": 0}
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            calls["n"] += 1
+            pid = 92000 + calls["n"]
+            # Attempt 1 gets only a relay (implicit) ACK; attempt 2 the real one.
+            ack_from = "!9e77edec" if calls["n"] == 1 else "!ab12cd34"
+            onResponse(
+                {
+                    "fromId": ack_from,
+                    "decoded": {"requestId": pid, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=pid)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with patch.dict(
+            os.environ, {"MESHTASTIC_SEND_RETRIES": "2", "MESHTASTIC_ACK_TIMEOUT": "0.3"}
+        ):
+            res = await self.adapter.send(
+                chat_id="meshtastic:!ab12cd34", content="retry on implicit"
+            )
+
+        self.assertTrue(res.success)
+        self.assertEqual(iface.sendText.call_count, 2)  # implicit -> retry -> real ack
+        self.assertEqual(res.raw_response["chunks"][0]["attempts"], 2)
 
     def test_retry_backoff_defensive_parsing(self):
         """_retry_backoff falls back to the default on non-numeric input."""
@@ -1214,10 +1453,18 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 "MESHTASTIC_HOME_CHANNEL": "meshtastic:channel:0",
             },
         ):
+            # Seed-from-env before the adapter expands the allowlist env for Hermes.
+            env_config = _env_enablement()
+            self.assertEqual(env_config["allowed_nodes"], "ab12cd34")
+
             config = MagicMock()
             config.extra = {}
             adapter = MeshtasticAdapter(config)
-            env_config = _env_enablement()
+            # Hermes gateway exact-matches the env allowlist — expansion must
+            # include both bang and bare forms so intake and gateway agree.
+            expanded = os.environ["MESHTASTIC_ALLOWED_NODES"]
+            self.assertIn("ab12cd34", expanded)
+            self.assertIn("!ab12cd34", expanded)
 
         self.assertEqual(adapter.serial_port, "mock_port")
         self.assertEqual(adapter.baud_rate, 57600)
@@ -1225,7 +1472,54 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ab12cd34", adapter.allowed_nodes)
         self.assertIn("!ab12cd34", adapter.allowed_nodes)
         self.assertNotIn("bad55555", adapter.allowed_nodes)
-        self.assertEqual(env_config["allowed_nodes"], "ab12cd34")
+
+    def test_normalize_node_id_forms(self):
+        """_normalize_node_id produces stable ! + lowercase 8-hex ids."""
+        norm = MeshtasticAdapter._normalize_node_id
+        self.assertEqual(norm(0xAB12CD34), "!ab12cd34")
+        self.assertEqual(norm("!AB12CD34"), "!ab12cd34")
+        self.assertEqual(norm("ab12cd34"), "!ab12cd34")
+        self.assertEqual(norm("  !Da1b1613  "), "!da1b1613")
+        self.assertIsNone(norm(None))
+        self.assertIsNone(norm(""))
+        # Non-hex labels are lowercased as-is (not forced into !hex form).
+        self.assertEqual(norm("PARK"), "park")
+
+    async def test_inbound_uppercase_from_id_normalized(self):
+        """Uppercase fromId is lowercased so Hermes allowlist exact-match works."""
+        packet = {
+            "fromId": "!AB12CD34",  # same node as allowlist !ab12cd34
+            "toId": "!da1b1613",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"case fold"},
+            "id": 9100,
+        }
+        self.adapter._on_receive(packet, self.adapter.get_interfaces()[0])
+        await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_called_once()
+        event = self.adapter.handle_message.call_args[0][0]
+        self.assertEqual(event.source.user_id, "!ab12cd34")
+        self.assertEqual(event.source.chat_id, "meshtastic:!ab12cd34")
+
+    def test_get_interface_node_id_prefers_getMyNodeInfo(self):
+        """Real MeshInterface exposes getMyNodeInfo, not getMyNodeId."""
+        iface = MagicMock()
+        # Simulate library shape: no getMyNodeId, yes getMyNodeInfo.
+        del iface.getMyNodeId
+        iface.getMyNodeInfo.return_value = {
+            "num": 0xDA1B1613,
+            "user": {"id": "!DA1B1613"},
+        }
+        self.assertEqual(self.adapter._get_interface_node_id(iface), "!da1b1613")
+
+    def test_discover_serial_ports_prefers_meshtastic_findPorts(self):
+        """auto discovery should use meshtastic.util.findPorts when available."""
+        with patch("adapter.HAS_MESHTASTIC", True):
+            with patch(
+                "meshtastic.util.findPorts", return_value=["/dev/cu.usbserial-mesh"]
+            ) as find_ports:
+                ports = self.adapter._discover_serial_ports()
+        self.assertEqual(ports, ["/dev/cu.usbserial-mesh"])
+        find_ports.assert_called_once_with(True)
 
     def test_register_declares_gateway_authz_env(self):
         """register() wires the allowlist env vars onto the PlatformEntry."""
