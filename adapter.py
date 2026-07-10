@@ -399,6 +399,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """
         if node_id is None:
             return None
+        # bool is a subclass of int — don't treat True/False as node numbers.
+        if isinstance(node_id, bool):
+            return str(node_id).lower()
         if isinstance(node_id, int):
             return f"!{node_id:08x}"
         text = str(node_id).strip()
@@ -412,30 +415,31 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _expand_allowlist_env_for_gateway() -> None:
-        """Expand allowlist env vars so Hermes' exact-match gate accepts our forms.
+        """Expand MESHTASTIC_ALLOWED_NODES so Hermes' exact-match gate accepts our forms.
 
         The adapter accepts node ids with/without ``!`` and any case. Hermes
-        ``_is_user_authorized`` does ``user_id in allowed_ids`` with no
-        normalization. Expanding the env keeps the gateway double-check aligned
-        with adapter intake without forking Hermes.
+        ``_is_user_authorized`` reads ``allowed_users_env`` (MESHTASTIC_ALLOWED_NODES)
+        with exact equality and no normalization. Expanding that env keeps the
+        gateway double-check aligned with adapter intake. Legacy
+        MESHTASTIC_ALLOWED_USERS is still read for adapter-local allowlisting but
+        is not the gateway's auth env, so it is left untouched here.
         """
-        for env_key in ("MESHTASTIC_ALLOWED_NODES", "MESHTASTIC_ALLOWED_USERS"):
-            raw = os.getenv(env_key, "").strip()
-            if not raw:
+        raw = os.getenv("MESHTASTIC_ALLOWED_NODES", "").strip()
+        if not raw:
+            return
+        expanded: set[str] = set()
+        for part in raw.split(","):
+            p = part.strip()
+            if not p:
                 continue
-            expanded: set[str] = set()
-            for part in raw.split(","):
-                p = part.strip()
-                if not p:
-                    continue
-                expanded.add(p)
-                low = p.lower()
-                expanded.add(low)
-                bare = low.lstrip("!")
-                if bare:
-                    expanded.add(bare)
-                    expanded.add(f"!{bare}")
-            os.environ[env_key] = ",".join(sorted(expanded))
+            expanded.add(p)
+            low = p.lower()
+            expanded.add(low)
+            bare = low.lstrip("!")
+            if bare:
+                expanded.add(bare)
+                expanded.add(f"!{bare}")
+        os.environ["MESHTASTIC_ALLOWED_NODES"] = ",".join(sorted(expanded))
 
     def _update_observed(
         self,
@@ -512,7 +516,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         my_node_num = None
         if isinstance(my_info, dict):
             my_node_num = my_info.get("my_node_num")
-        elif my_info is not None and not isinstance(my_info, type(None)):
+        elif my_info is not None:
             my_node_num = getattr(my_info, "my_node_num", None)
 
         if isinstance(my_node_num, int):
@@ -1147,7 +1151,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _first_not_none(*values: Any) -> Any:
-        """Return the first value that is not None (0 / 0.0 / False are kept)."""
+        """Return the first value that is not None (0 / 0.0 / False are kept).
+
+        Mirrored as ``tools._first_not_none`` (loaded as ``meshtastic_tools``);
+        keep both in sync — tools cannot import adapter at module load without
+        risking a cycle through the gateway stack.
+        """
         for value in values:
             if value is not None:
                 return value
@@ -1575,6 +1584,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         Mirrors the official client's RECEIVED vs DELIVERED. Only real ACK /
         NAK resolve a waiter; implicit ACKs leave it open for a real ACK or
         timeout.
+
+        Definitive results (ACK/NAK) are never downgraded by a later implicit
+        ACK. When scheduling the waiter, a **snapshot** of the record is passed
+        so concurrent updates cannot mutate the dict the future will resolve to.
         """
         decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
         routing = decoded.get("routing", {}) or {}
@@ -1599,23 +1612,37 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id, {})
-            record.update(
-                {
-                    "dest": record.get("dest", dest),
-                    "bytes": record.get("bytes", len(content.encode("utf-8"))),
-                    "status": status,
-                    "error_reason": error_reason,
-                    "ack_from": ack_from,
-                    "response_at": time.time(),
-                    "response": {
-                        "packet_id": packet.get("id") if isinstance(packet, dict) else None,
-                        "request_id": request_id,
-                        "from_id": ack_from,
-                        "to_id": packet.get("toId") if isinstance(packet, dict) else None,
-                        "routing": routing,
-                    },
-                }
-            )
+            prior = record.get("status")
+            # Never let a weaker/later relay confirmation overwrite a definitive
+            # real ACK or NAK already stored on the shared record.
+            if status == AckStatus.IMPLICIT_ACK and prior in (
+                AckStatus.ACK,
+                AckStatus.NAK,
+            ):
+                record["response_at"] = time.time()
+                applied_status = prior
+                snapshot = None  # no waiter resolution for a discarded implicit
+            else:
+                record.update(
+                    {
+                        "dest": record.get("dest", dest),
+                        "bytes": record.get("bytes", len(content.encode("utf-8"))),
+                        "status": status,
+                        "error_reason": error_reason,
+                        "ack_from": ack_from,
+                        "response_at": time.time(),
+                        "response": {
+                            "packet_id": (packet.get("id") if isinstance(packet, dict) else None),
+                            "request_id": request_id,
+                            "from_id": ack_from,
+                            "to_id": packet.get("toId") if isinstance(packet, dict) else None,
+                            "routing": routing,
+                        },
+                    }
+                )
+                applied_status = status
+                # Snapshot so a concurrent update cannot mutate the future result.
+                snapshot = dict(record)
             self._pending_acks[pkt_id] = record
             self._ack_responses[pkt_id] = record
             future = self._ack_futures.get(pkt_id)
@@ -1624,29 +1651,36 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # implicit ACK updates the record but keeps the wait open, so a real ACK
         # can still arrive — and if it doesn't, the timeout drives a retry.
         if (
-            status in (AckStatus.ACK, AckStatus.NAK)
+            snapshot is not None
+            and applied_status in (AckStatus.ACK, AckStatus.NAK)
             and future
             and not future.done()
             and self.loop
             and self.loop.is_running()
         ):
-            self.loop.call_soon_threadsafe(self._set_ack_future_result, future, record)
+            self.loop.call_soon_threadsafe(self._set_ack_future_result, future, snapshot)
 
-        if status == AckStatus.ACK:
+        if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
-        elif status == AckStatus.IMPLICIT_ACK:
+        elif status == AckStatus.IMPLICIT_ACK and applied_status == AckStatus.IMPLICIT_ACK:
             logger.info(
                 "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
                 pkt_id,
                 dest,
                 ack_from,
             )
-        else:
+        elif applied_status == AckStatus.NAK and status == AckStatus.NAK:
             logger.warning(
                 "Meshtastic NAK received: packet_id=%s dest=%s reason=%s",
                 pkt_id,
                 dest,
                 error_reason,
+            )
+        elif status == AckStatus.IMPLICIT_ACK:
+            logger.debug(
+                "Meshtastic implicit ACK ignored after definitive status=%s: packet_id=%s",
+                applied_status,
+                pkt_id,
             )
 
     def _set_ack_future_result(self, future: asyncio.Future, record: dict[str, Any]) -> None:
@@ -1665,9 +1699,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except TimeoutError:
             with self._ack_lock:
                 record = self._pending_acks.get(pkt_id, {})
-                # Preserve an implicit ACK if that's all we got — it's more
-                # informative than a bare timeout (and still "not confirmed").
-                if record.get("status") != AckStatus.IMPLICIT_ACK:
+                # Only stamp TIMEOUT while still pending. A concurrent real ACK,
+                # NAK, or implicit ACK that landed between wait_for timing out
+                # and this lock acquisition must not be overwritten.
+                if record.get("status", AckStatus.PENDING) == AckStatus.PENDING:
                     record["status"] = AckStatus.TIMEOUT
                     record["error_reason"] = "ACK_TIMEOUT"
                 record["response_at"] = time.time()

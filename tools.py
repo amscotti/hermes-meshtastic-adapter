@@ -131,7 +131,12 @@ def assess_signal_quality(snr: float | None) -> str:
 
 
 def _first_not_none(*values: Any) -> Any:
-    """Return the first value that is not None (0 / 0.0 are kept)."""
+    """Return the first value that is not None (0 / 0.0 are kept).
+
+    Mirrored as ``MeshtasticAdapter._first_not_none`` in adapter.py; keep both
+    in sync (tools loads as ``meshtastic_tools`` and cannot import the adapter
+    at module load without a cycle risk through the gateway stack).
+    """
     for value in values:
         if value is not None:
             return value
