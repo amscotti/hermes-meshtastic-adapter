@@ -1521,7 +1521,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if not pkt_id:
             return None
 
-        future = self.loop.create_future() if create_future and self.loop else None
+        # Bind the ACK future to the loop that will *await* it — the loop running
+        # this send, not necessarily self.loop (a send driven from an agent
+        # session may run on a different loop; awaiting a future bound to another
+        # loop raises "future belongs to a different loop"). The pubsub thread
+        # later resolves it via future.get_loop().call_soon_threadsafe.
+        future = None
+        if create_future:
+            try:
+                fut_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                fut_loop = self.loop
+            if fut_loop is not None:
+                future = fut_loop.create_future()
         with self._ack_lock:
             existing_response = self._ack_responses.get(pkt_id)
             record = existing_response or {
@@ -1655,10 +1667,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
             and applied_status in (AckStatus.ACK, AckStatus.NAK)
             and future
             and not future.done()
-            and self.loop
-            and self.loop.is_running()
         ):
-            self.loop.call_soon_threadsafe(self._set_ack_future_result, future, snapshot)
+            # Marshal resolution onto the future's OWN loop (the send loop that
+            # created it), not self.loop — they can differ.
+            fut_loop = future.get_loop()
+            if fut_loop is not None and fut_loop.is_running():
+                fut_loop.call_soon_threadsafe(self._set_ack_future_result, future, snapshot)
 
         if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
