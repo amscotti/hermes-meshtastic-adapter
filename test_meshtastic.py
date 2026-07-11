@@ -1013,6 +1013,29 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         # Wire/JSON surface stays the plain string value.
         self.assertEqual(str(res.raw_response["chunks"][0]["ack"]["status"]), "ack")
 
+    async def test_ack_future_binds_to_awaiting_loop_not_self_loop(self):
+        """The ACK future must bind to the loop that awaits it, not adapter.loop.
+
+        A send driven from an agent session can run on a different event loop
+        than the one captured at connect(). Binding the future to self.loop and
+        then awaiting it on the send loop raised "future belongs to a different
+        loop". The future must live on the running (send) loop, and pubsub
+        resolution must marshal onto that same loop.
+        """
+        other_loop = asyncio.new_event_loop()
+        self.addCleanup(other_loop.close)
+        self.adapter.loop = other_loop  # pretend connect() ran on a different loop
+
+        fut = self.adapter._track_pending_ack("77007", "!ab12cd34", "hi", create_future=True)
+        self.assertIsNotNone(fut)
+        # Bound to the loop awaiting it here, NOT adapter.loop.
+        self.assertIs(fut.get_loop(), asyncio.get_running_loop())
+        self.assertIsNot(fut.get_loop(), other_loop)
+        # And awaiting it must not raise the cross-loop ValueError.
+        self.adapter._set_ack_future_result(fut, {"status": AckStatus.ACK})
+        record = await fut
+        self.assertEqual(record["status"], AckStatus.ACK)
+
     async def test_implicit_ack_from_relay_is_not_delivery(self):
         """A routing ACK relayed by another node is implicit — not confirmed delivery."""
         iface = self.adapter.get_interfaces()[0]
