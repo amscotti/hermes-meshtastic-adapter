@@ -60,9 +60,19 @@ Five source modules, no package nesting:
 
 This is the subtlest part of the code. Meshtastic's `pubsub` delivers packets on a **background thread**, but Hermes runs on an asyncio loop. The bridge:
 
-1. `_on_receive_pubsub` (pubsub thread) → `loop.call_soon_threadsafe` pushes onto `self._incoming_queue` (asyncio.Queue).
+1. `_on_receive_pubsub` (pubsub thread) → `_schedule_on_loop(self.loop, ...)` pushes onto `self._incoming_queue` (asyncio.Queue). Always the **platform** loop from `connect()` — that loop owns the queue.
 2. `_consume_incoming_queue` (loop task) drains it and calls `_on_receive`.
 3. `_on_receive` records live freshness for the sender via `_update_observed` (BEFORE the auth gate, so even non-allowlisted nodes get a current `last_heard`/signal), then authorizes the sender, filters self-echo, logs signal/telemetry/position to SQLite, and for TEXT packets builds a `MessageEvent` and calls `self.handle_message(event)`.
+
+### Dual event-loop model
+
+`self.loop` is the **platform loop** (inbound queue, reconnect/drain tasks). Hermes agent sessions may call `send()` on a **different** running loop. Rules:
+
+- **Inbound / lifecycle**: always `self.loop` (queue owner).
+- **ACK waiters**: create on `_awaiting_loop()`, resolve with `_schedule_on_loop(future.get_loop(), ...)`. Never bind an awaitable to `self.loop` if a different loop will await it (`ValueError: future belongs to a different loop`).
+- **Transport I/O**: `_iface_lock` protects only short `_interfaces` map operations. Slow `sendText` / `close` / liveness work runs on executor threads under `_transport_lock` (`_send_text_locked`, `_close_interfaces_serialized`, `_drop_interface_if_dead_serialized`). Meshtastic is not thread-safe for concurrent sends, and an event loop must never block acquiring the transport lock.
+- **Disconnect**: `_fail_pending_acks("DISCONNECTED")` settles outstanding ACK futures on their owning loops.
+- First cross-loop send logs once at INFO (`_cross_loop_send_logged`, under `_ack_lock`).
 
 ### Node freshness overlay
 
