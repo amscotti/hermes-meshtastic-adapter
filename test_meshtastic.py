@@ -990,6 +990,12 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         # Plain strings still match (StrEnum + public JSON surface).
         self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
         self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
+        # Disconnect-settled waiters must not spin retries against a closed radio.
+        self.assertFalse(
+            self.adapter._is_retriable_failure(
+                r({"status": AckStatus.TIMEOUT, "error_reason": "DISCONNECTED"})
+            )
+        )
 
     async def test_real_ack_from_destination_is_delivery(self):
         """A routing ACK whose sender IS the destination confirms real delivery."""
@@ -1035,6 +1041,303 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.adapter._set_ack_future_result(fut, {"status": AckStatus.ACK})
         record = await fut
         self.assertEqual(record["status"], AckStatus.ACK)
+
+    async def test_ack_resolution_marshals_to_future_loop_not_self_loop(self):
+        """_record_ack_response must schedule on the future's loop, not self.loop.
+
+        Covers the half of the cross-loop fix that the bind-only test misses:
+        a late pubsub ACK must call_soon_threadsafe on future.get_loop() even
+        when adapter.loop is a different (non-running) loop.
+        """
+        platform_loop = asyncio.new_event_loop()
+        self.addCleanup(platform_loop.close)
+        self.adapter.loop = platform_loop  # connect() loop ≠ send loop
+
+        send_loop = asyncio.get_running_loop()
+        dest = "!ab12cd34"
+        pkt_id = 77008
+        fut = self.adapter._track_pending_ack(str(pkt_id), dest, "hi", create_future=True)
+        self.assertIsNotNone(fut)
+        self.assertIs(fut.get_loop(), send_loop)
+
+        def fire_ack_from_background():
+            self.adapter._record_ack_response(
+                {
+                    "fromId": dest,
+                    "decoded": {
+                        "requestId": pkt_id,
+                        "routing": {"errorReason": "NONE"},
+                    },
+                },
+                dest,
+                "hi",
+            )
+
+        with patch.object(
+            send_loop, "call_soon_threadsafe", wraps=send_loop.call_soon_threadsafe
+        ) as send_ts:
+            # platform_loop is not running — scheduling there would drop the ACK.
+            with patch.object(platform_loop, "call_soon_threadsafe") as platform_ts:
+                await asyncio.to_thread(fire_ack_from_background)
+                record = await asyncio.wait_for(fut, timeout=1.0)
+
+        self.assertEqual(record["status"], AckStatus.ACK)
+        send_scheduled = [c.args[0] for c in send_ts.call_args_list if c.args]
+        self.assertIn(self.adapter._set_ack_future_result, send_scheduled)
+        platform_ts.assert_not_called()
+
+    def test_schedule_on_loop_skips_when_loop_not_running(self):
+        """Dropped schedules must not raise; return False for observability."""
+        dead = asyncio.new_event_loop()
+        self.addCleanup(dead.close)
+        called = []
+
+        ok = self.adapter._schedule_on_loop(dead, called.append, "x", what="unit-test skip")
+        self.assertFalse(ok)
+        self.assertEqual(called, [])
+
+        ok_none = self.adapter._schedule_on_loop(None, called.append, "x", what="unit-test none")
+        self.assertFalse(ok_none)
+
+    def test_schedule_on_loop_swallows_closed_loop_race(self):
+        """call_soon_threadsafe can raise if the loop closes after is_running()."""
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        ok = self.adapter._schedule_on_loop(loop, lambda: None, what="unit-test toctou")
+        self.assertFalse(ok)
+
+    def test_inbound_pubsub_always_targets_platform_loop(self):
+        """Inbound enqueue must use self.loop (queue owner), never a send loop."""
+        platform_loop = MagicMock()
+        platform_loop.is_running.return_value = True
+        self.adapter.loop = platform_loop
+        self.adapter._incoming_queue = MagicMock()
+
+        self.adapter._on_receive_pubsub({"id": 1}, interface=None)
+
+        platform_loop.call_soon_threadsafe.assert_called_once()
+        args = platform_loop.call_soon_threadsafe.call_args[0]
+        self.assertIs(args[0], self.adapter._incoming_queue.put_nowait)
+
+    async def test_cross_loop_send_logs_once(self):
+        """First ACK future on a non-platform loop logs; later ones stay quiet."""
+        other_loop = asyncio.new_event_loop()
+        self.addCleanup(other_loop.close)
+        self.adapter.loop = other_loop
+        self.adapter._cross_loop_send_logged = False
+
+        with self.assertLogs("adapter", level="INFO") as cm:
+            self.adapter._track_pending_ack("1", "!ab12cd34", "a", create_future=True)
+            self.adapter._track_pending_ack("2", "!ab12cd34", "b", create_future=True)
+
+        cross = [line for line in cm.output if "different event loop" in line]
+        self.assertEqual(len(cross), 1)
+        self.assertTrue(self.adapter._cross_loop_send_logged)
+
+    async def test_disconnect_settles_pending_ack_waiters(self):
+        """disconnect() must unblock ACK waiters instead of leaving them until timeout."""
+        fut = self.adapter._track_pending_ack("99001", "!ab12cd34", "hi", create_future=True)
+        self.assertIsNotNone(fut)
+        self.assertFalse(fut.done())
+
+        await self.adapter.disconnect()
+
+        record = await asyncio.wait_for(fut, timeout=1.0)
+        self.assertEqual(record["status"], AckStatus.TIMEOUT)
+        self.assertEqual(record["error_reason"], "DISCONNECTED")
+        with self.adapter._ack_lock:
+            self.assertNotIn("99001", self.adapter._ack_futures)
+
+    async def test_send_text_serialized_under_transport_lock(self):
+        """Concurrent sends must not interleave Meshtastic sendText calls."""
+        iface = self.adapter.get_interfaces()[0]
+        active = {"n": 0, "max": 0}
+        gate = threading.Lock()
+        ids = {"n": 0}
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            with gate:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            time.sleep(0.05)
+            with gate:
+                active["n"] -= 1
+                ids["n"] += 1
+                pid = 88000 + ids["n"]
+            if onResponse:
+                onResponse(
+                    {
+                        "fromId": destinationId or "!ab12cd34",
+                        "decoded": {"requestId": pid, "routing": {"errorReason": "NONE"}},
+                    }
+                )
+            return SimpleNamespace(id=pid)
+
+        iface.sendText = send_text
+        with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "1"}):
+            results = await asyncio.gather(
+                self.adapter.send(chat_id="meshtastic:!ab12cd34", content="one"),
+                self.adapter.send(chat_id="meshtastic:!ab12cd34", content="two"),
+                self.adapter.send(chat_id="meshtastic:!ab12cd34", content="three"),
+            )
+        self.assertTrue(all(r.success for r in results))
+        self.assertEqual(active["max"], 1)
+
+    async def test_disconnect_during_send_does_not_block_loop_or_leave_ack_waiter(self):
+        """Slow sendText must not block the loop; late ACK registration settles."""
+        iface = self.adapter.get_interfaces()[0]
+        started = threading.Event()
+        release = threading.Event()
+
+        def send_text(text, destinationId=None, **kwargs):
+            started.set()
+            if not release.wait(timeout=2):
+                raise TimeoutError("test did not release sendText")
+            return SimpleNamespace(id=99101)
+
+        iface.sendText = send_text
+        send_task = asyncio.create_task(
+            self.adapter.send(
+                chat_id="meshtastic:!ab12cd34",
+                content="blocked send",
+                metadata={"meshtastic_ack_timeout": 30},
+            )
+        )
+        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+
+        disconnect_task = asyncio.create_task(self.adapter.disconnect())
+        # If disconnect acquired a contended threading lock on this loop, this
+        # sleep and assertion could not run until sendText completed.
+        await asyncio.sleep(0.05)
+        self.assertFalse(disconnect_task.done())
+
+        release.set()
+        result = await asyncio.wait_for(send_task, timeout=1)
+        await asyncio.wait_for(disconnect_task, timeout=1)
+        self.assertFalse(result.success)
+        self.assertIn("disconnected while waiting for ACK", result.error)
+        self.assertEqual(result.raw_response["chunks"][0]["ack"]["error_reason"], "DISCONNECTED")
+        with self.adapter._ack_lock:
+            self.assertNotIn("99101", self.adapter._ack_futures)
+
+    async def test_disconnect_makes_implicit_ack_terminal(self):
+        """An unresolved relay ACK becomes DISCONNECTED, not retriable implicit."""
+        dest = "!ab12cd34"
+        pkt_id = "99102"
+        fut = self.adapter._track_pending_ack(pkt_id, dest, "hi", create_future=True)
+        self.adapter._record_ack_response(
+            {
+                "fromId": "!9e77edec",
+                "decoded": {"requestId": int(pkt_id), "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertFalse(fut.done())
+
+        await self.adapter.disconnect()
+        record = await asyncio.wait_for(fut, timeout=1)
+        self.assertEqual(record["status"], AckStatus.TIMEOUT)
+        self.assertEqual(record["error_reason"], "DISCONNECTED")
+
+    async def test_pubsub_real_ack_upgrades_one_shot_implicit_callback(self):
+        """A real routing ACK from pubsub upgrades an earlier relay callback."""
+        dest = "!ab12cd34"
+        pkt_id = "99103"
+        fut = self.adapter._track_pending_ack(pkt_id, dest, "hi", create_future=True)
+        self.adapter._record_ack_response(
+            {
+                "fromId": "!9e77edec",
+                "decoded": {"requestId": int(pkt_id), "routing": {"errorReason": "NONE"}},
+            },
+            dest,
+            "hi",
+        )
+        self.assertFalse(fut.done())
+
+        self.adapter._on_receive(
+            {
+                "fromId": dest,
+                "decoded": {"requestId": int(pkt_id), "routing": {"errorReason": "NONE"}},
+            }
+        )
+        record = await asyncio.wait_for(fut, timeout=1)
+        self.assertEqual(record["status"], AckStatus.ACK)
+        self.assertEqual(record["ack_from"], dest)
+
+    async def test_stale_interface_open_is_closed_not_registered(self):
+        """An open completing after lifecycle turnover must close its result."""
+        lifecycle_id = self.adapter._lifecycle_id
+        opened = SimpleNamespace(close=MagicMock())
+        self.adapter._open_interface = MagicMock(return_value=opened)
+        self.adapter._running = False
+        self.adapter._lifecycle_id += 1
+
+        result = await asyncio.to_thread(
+            self.adapter._open_and_register_interface, "stale_port", lifecycle_id
+        )
+        self.assertIsNone(result)
+        opened.close.assert_called_once()
+        self.assertNotIn(opened, self.adapter.get_interfaces())
+
+    async def test_connect_is_idempotent(self):
+        """A repeated connect must not replace live lifecycle tasks."""
+        consumer = self.adapter._incoming_consumer_task
+        drain = self.adapter._queue_drain_task
+        reconnects = dict(self.adapter._reconnect_tasks)
+        lifecycle_id = self.adapter._lifecycle_id
+
+        self.assertTrue(await self.adapter.connect())
+        self.assertIs(self.adapter._incoming_consumer_task, consumer)
+        self.assertIs(self.adapter._queue_drain_task, drain)
+        self.assertEqual(self.adapter._reconnect_tasks, reconnects)
+        self.assertEqual(self.adapter._lifecycle_id, lifecycle_id)
+
+    async def test_adapter_can_reconnect_after_disconnect(self):
+        """Lifecycle teardown keeps the transport worker reusable."""
+        await self.adapter.disconnect()
+        self.assertTrue(await self.adapter.connect())
+        for _ in range(100):
+            if self.adapter.get_interfaces():
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(self.adapter.get_interfaces())
+        res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="after reconnect")
+        self.assertTrue(res.success)
+
+    async def test_pubsub_callback_ignored_after_disconnect(self):
+        """A stale pubsub callback cannot enqueue into a stopped consumer."""
+        queue = self.adapter._incoming_queue
+        await self.adapter.disconnect()
+        self.adapter._on_receive_pubsub({"id": 1})
+        self.assertIsNone(self.adapter._incoming_queue)
+        self.assertIsNotNone(queue)
+        self.assertTrue(queue.empty())
+
+    async def test_send_queues_when_iface_drops_under_lock(self):
+        """If the locked send sees no interfaces, non-ACK sends still queue."""
+        # Fast-path still thinks we are connected; locked send discovers the drop.
+        with (
+            patch.object(self.adapter, "_has_interfaces", return_value=True),
+            patch.object(
+                self.adapter,
+                "_send_text_locked",
+                return_value=("no_iface", None, "!ab12cd34"),
+            ),
+        ):
+            res = await self.adapter._send_chunk(
+                "meshtastic:!ab12cd34",
+                "queued after race",
+                allow_queueing=True,
+                wait_for_ack=False,
+            )
+        self.assertTrue(res.success)
+        self.assertEqual(res.message_id, "queued")
+        with self.adapter._queue_lock:
+            self.assertTrue(
+                any(item["content"] == "queued after race" for item in self.adapter._outbound_queue)
+            )
 
     async def test_implicit_ack_from_relay_is_not_delivery(self):
         """A routing ACK relayed by another node is implicit — not confirmed delivery."""

@@ -71,8 +71,31 @@ to it. CLAUDE.md still quotes "237" (the LoRa *frame* size, not the app payload)
   collides with Hermes' own `tools` package. Set up by dynamic load in
   `adapter._load_tools_module` and `test_meshtastic.py`; preserve it.
 - **Threading boundary**: meshtastic `pubsub` delivers on a background thread;
-  all asyncio-loop state is touched only via `loop.call_soon_threadsafe`.
-  `_on_receive` runs on the loop, not the pubsub thread.
+  all asyncio-loop state is touched only via `_schedule_on_loop` /
+  `loop.call_soon_threadsafe`. `_on_receive` runs on the platform loop, not
+  the pubsub thread.
+- **Dual event-loop model** (easy to break silently):
+  - **Platform loop** (`self.loop`, set in `connect()`): owns `_incoming_queue`,
+    reconnect/drain tasks, and the pubsub→queue bridge. Inbound **must** always
+    schedule onto `self.loop` — never onto a send loop.
+  - **Send/ACK loop** (`_awaiting_loop()` / `future.get_loop()`): agent-session
+    `send()` may run on a *different* loop than `connect()`. ACK futures are
+    created on the awaiting loop and resolved via
+    `_schedule_on_loop(future.get_loop(), ...)`. Binding them to `self.loop`
+    and awaiting on the send loop raises
+    `ValueError: future belongs to a different loop` (message delivered, tool
+    reports failure).
+  - **Transport serialization**: `_iface_lock` protects only short
+    `_interfaces` map operations. Slow `sendText`/`close`/liveness calls run on
+    executor threads under `_transport_lock`; never acquire a contended
+    transport lock on an event-loop thread. Concurrent sessions + queue drain +
+    reconnect would otherwise race packet ids / response handlers / TX queue.
+    ACK waiters stay on the send loop; only transport I/O is serialized.
+  - **Disconnect** settles pending ACK futures via `_fail_pending_acks` so
+    foreign-loop waiters do not sit until the full ACK timeout.
+  - Helpers: `_awaiting_loop()`, `_schedule_on_loop(loop, cb, *args, what=...)`
+    (logs + returns False when the target loop is missing/not running/closed
+    mid-schedule).
 - **Dual imports everywhere**: `try: from . import x / except ImportError: import x`
   so the plugin works both as a package (in Hermes) and flat modules (in tests).
 - **Adapter↔tools link is a module-level singleton** (`tools.set_adapter` /
