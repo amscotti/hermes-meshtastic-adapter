@@ -564,6 +564,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         def _drain_then_close() -> None:
             try:
+                # Unbounded join is deliberate: a bounded join could let close
+                # run concurrently with an in-flight sendText, violating the
+                # transport serialization this path exists to preserve. The
+                # caller's await is time-bounded and this thread is a daemon,
+                # so a stuck worker still cannot pin process exit.
                 executor.shutdown(wait=True)
                 self._close_interfaces_serialized(interfaces)
             except BaseException as exc:
@@ -2609,6 +2614,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     )
                     return
                 active_token = self._ack_tokens.get(pkt_id)
+                # Two-level stale defense: the lifecycle_id check above already
+                # rejects callbacks from dead lifecycles; this token check is
+                # the second level, rejecting same-lifecycle packet-id reuse
+                # where an older send's id is still tracked. A missing token
+                # entry is only possible after lifecycle turnover, which the
+                # first level already caught — so no entry means accept.
                 if active_token is not None and active_token is not send_token:
                     logger.debug("Ignoring stale ACK callback for packet_id=%s", pkt_id)
                     return
