@@ -126,6 +126,36 @@ def retry_backoff() -> float:
         return 5.0
 
 
+def is_retriable_failure(result: SendResult) -> bool:
+    """Decide whether a failed chunk send is worth re-sending.
+
+    Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
+    ACK, or a NAK whose reason is not permanent. Pre-send errors (no
+    interface, missing pubkey, bad chat_id) carry no ACK record and are
+    never retried — re-sending can't fix them.
+    """
+    ack = (result.raw_response or {}).get("ack")
+    if not isinstance(ack, dict):
+        return False
+    status = ack.get("status")
+    reason = str(ack.get("error_reason") or "").upper()
+    # Adapter teardown — do not retry into a closed transport.
+    if reason == "DISCONNECTED":
+        return False
+    # Adapter-internal synthetic NAK: the packet id collided with an
+    # in-flight waiter. The chunk was already transmitted by sendText before
+    # the collision was detected, so retrying would duplicate it on-air.
+    # Fail safe and leave delivery to the (already sent) original packet.
+    if reason == "DUPLICATE_PACKET_ID":
+        return False
+    # No confirmation, or only a relay confirmed — both warrant a retry.
+    if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
+        return True
+    if status == AckStatus.NAK:
+        return reason not in PERMANENT_NAK_REASONS
+    return False
+
+
 class AckTracker:
     """Owns the ACK/NACK bookkeeping dicts and the lock that serializes them.
 
@@ -640,32 +670,3 @@ class AckTracker:
                 if self._ack_futures.get(pkt_id) is future:
                     self._ack_futures.pop(pkt_id, None)
                 self._prune_ack_history_locked()
-
-    def _is_retriable_failure(self, result: SendResult) -> bool:
-        """Decide whether a failed chunk send is worth re-sending.
-
-        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
-        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
-        interface, missing pubkey, bad chat_id) carry no ACK record and are
-        never retried — re-sending can't fix them.
-        """
-        ack = (result.raw_response or {}).get("ack")
-        if not isinstance(ack, dict):
-            return False
-        status = ack.get("status")
-        reason = str(ack.get("error_reason") or "").upper()
-        # Adapter teardown — do not retry into a closed transport.
-        if reason == "DISCONNECTED":
-            return False
-        # Adapter-internal synthetic NAK: the packet id collided with an
-        # in-flight waiter. The chunk was already transmitted by sendText before
-        # the collision was detected, so retrying would duplicate it on-air.
-        # Fail safe and leave delivery to the (already sent) original packet.
-        if reason == "DUPLICATE_PACKET_ID":
-            return False
-        # No confirmation, or only a relay confirmed — both warrant a retry.
-        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
-            return True
-        if status == AckStatus.NAK:
-            return reason not in PERMANENT_NAK_REASONS
-        return False

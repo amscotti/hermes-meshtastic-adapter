@@ -43,6 +43,7 @@ sys.modules["meshtastic_tools"] = meshtastic_tools
 tools_spec.loader.exec_module(meshtastic_tools)
 
 import telemetry_db
+import transport
 from adapter import (
     HAS_MESHTASTIC,
     AckStatus,
@@ -3175,28 +3176,17 @@ class TestMeshtasticTcpTransport(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.tcp_port, 4403)
         self.assertEqual(adapter._connection_targets(), ["tcp://meshgw.local:4403"])
 
-    def test_parse_tcp_target(self):
-        self.assertEqual(
-            MeshtasticAdapter._parse_tcp_target("tcp://192.168.1.50:4403"),
-            ("192.168.1.50", 4403),
-        )
-        # Missing port falls back to the default.
-        self.assertEqual(
-            MeshtasticAdapter._parse_tcp_target("tcp://meshgw.local"),
-            ("meshgw.local", 4403),
-        )
-
     def test_ipv6_target_round_trip(self):
         """IPv6 literals are bracketed when built and unbracketed when parsed."""
         adapter = self._adapter(MESHTASTIC_TCP_HOST="2001:db8::1", MESHTASTIC_TCP_PORT="8080")
         self.assertEqual(adapter._connection_targets(), ["tcp://[2001:db8::1]:8080"])
         self.assertEqual(
-            MeshtasticAdapter._parse_tcp_target("tcp://[2001:db8::1]:8080"),
+            transport.parse_tcp_target("tcp://[2001:db8::1]:8080"),
             ("2001:db8::1", 8080),
         )
         # Bracketed literal without a port falls back to the default.
         self.assertEqual(
-            MeshtasticAdapter._parse_tcp_target("tcp://[fe80::1]"),
+            transport.parse_tcp_target("tcp://[fe80::1]"),
             ("fe80::1", 4403),
         )
 

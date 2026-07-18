@@ -1,4 +1,4 @@
-"""Unit tests for the ACK/NACK state machine (ack_state.AckTracker).
+"""Unit tests for the ACK/NACK state machine (ack_state).
 
 Pure-logic tests that don't need an assembled adapter. Integration coverage of
 the tracker (lock ordering, lifecycle checks, send()-level ACK waits, pruning)
@@ -18,31 +18,29 @@ if os.path.isdir(hermes_agent_path):
 from gateway.platforms.base import SendResult
 
 import ack_state
-from ack_state import ACK_RECORD_LIMIT, PERMANENT_NAK_REASONS, AckStatus, AckTracker
+from ack_state import ACK_RECORD_LIMIT, PERMANENT_NAK_REASONS, AckStatus
 
 
-class TestAckTrackerRetrabilityClassification(unittest.TestCase):
+class TestRetriabilityClassification(unittest.TestCase):
     """Only ACK-observed transient failures are retriable.
 
     Moved from test_meshtastic.TestMeshtasticPlatform.test_is_retriable_failure_classification
-    — the method is pure (never reads its adapter back-reference), so the
-    tracker can be exercised directly without an assembled adapter.
+    — ack_state.is_retriable_failure is a pure module-level function, so it is
+    exercised directly without a tracker or an assembled adapter.
     """
 
     def _r(self, ack):
         return SendResult(success=False, raw_response={"ack": ack} if ack else None)
 
     def test_classification(self):
-        tracker = AckTracker(adapter=None)
-
-        self.assertTrue(tracker._is_retriable_failure(self._r({"status": AckStatus.TIMEOUT})))
+        self.assertTrue(ack_state.is_retriable_failure(self._r({"status": AckStatus.TIMEOUT})))
         self.assertTrue(
-            tracker._is_retriable_failure(
+            ack_state.is_retriable_failure(
                 self._r({"status": AckStatus.NAK, "error_reason": "NO_ROUTE"})
             )
         )
         self.assertFalse(
-            tracker._is_retriable_failure(
+            ack_state.is_retriable_failure(
                 self._r({"status": AckStatus.NAK, "error_reason": "TOO_LARGE"})
             )
         )
@@ -57,26 +55,26 @@ class TestAckTrackerRetrabilityClassification(unittest.TestCase):
             "RATE_LIMIT_EXCEEDED",
         ):
             self.assertFalse(
-                tracker._is_retriable_failure(
+                ack_state.is_retriable_failure(
                     self._r({"status": AckStatus.NAK, "error_reason": reason})
                 ),
                 f"{reason} should be permanent",
             )
-        self.assertFalse(tracker._is_retriable_failure(self._r({"status": AckStatus.ACK})))
-        self.assertTrue(tracker._is_retriable_failure(self._r({"status": AckStatus.IMPLICIT_ACK})))
+        self.assertFalse(ack_state.is_retriable_failure(self._r({"status": AckStatus.ACK})))
+        self.assertTrue(ack_state.is_retriable_failure(self._r({"status": AckStatus.IMPLICIT_ACK})))
         # Plain strings still match (StrEnum + public JSON surface).
-        self.assertTrue(tracker._is_retriable_failure(self._r({"status": "timeout"})))
-        self.assertFalse(tracker._is_retriable_failure(self._r(None)))  # pre-send error
+        self.assertTrue(ack_state.is_retriable_failure(self._r({"status": "timeout"})))
+        self.assertFalse(ack_state.is_retriable_failure(self._r(None)))  # pre-send error
         # Disconnect-settled waiters must not spin retries against a closed radio.
         self.assertFalse(
-            tracker._is_retriable_failure(
+            ack_state.is_retriable_failure(
                 self._r({"status": AckStatus.TIMEOUT, "error_reason": "DISCONNECTED"})
             )
         )
         # Adapter-internal collision NAK: the chunk was already transmitted, so
         # retrying would duplicate it on-air.
         self.assertFalse(
-            tracker._is_retriable_failure(
+            ack_state.is_retriable_failure(
                 self._r({"status": AckStatus.NAK, "error_reason": "DUPLICATE_PACKET_ID"})
             )
         )

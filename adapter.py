@@ -58,6 +58,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Value snapshots re-exported so existing imports/tests keep resolving.
+# transport reads its own module attributes at call time, so tests must
+# patch transport.HAS_MESHTASTIC / transport.pub, not these adapter copies.
 HAS_MESHTASTIC = transport.HAS_MESHTASTIC
 pub = transport.pub
 DEFAULT_TCP_PORT = transport.DEFAULT_TCP_PORT
@@ -199,7 +202,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return await self._ack_tracker._wait_for_ack(pkt_id, future, timeout)
 
     def _is_retriable_failure(self, result: SendResult) -> bool:
-        return self._ack_tracker._is_retriable_failure(result)
+        return ack_state.is_retriable_failure(result)
 
     def _ack_wait_config(self, metadata: dict[str, Any] | None) -> tuple[bool, float]:
         return ack_state.ack_wait_config(metadata)
@@ -328,7 +331,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Live-observed per-node overlay (last_heard / signal learned from the
         # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
         # node and layered over the library's node DB by the mesh_* tools.
-        self._node_freshness = node_freshness.NodeFreshness()
+        self._node_freshness = self._create_node_freshness()
 
         # Active hardware connections mapping: devPath -> interface.
         # _iface_lock protects only short map/state operations; slow Meshtastic
@@ -780,6 +783,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 expanded.add(f"!{bare}")
         os.environ["MESHTASTIC_ALLOWED_NODES"] = ",".join(sorted(expanded))
 
+    def _create_node_freshness(self) -> node_freshness.NodeFreshness:
+        """Factory seam so tests/subclasses can substitute a bounded overlay."""
+        return node_freshness.NodeFreshness()
+
     def _update_observed(
         self,
         node_id: str,
@@ -914,14 +921,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
         for TCP, otherwise a serial device path (or ``mock_port`` fallback).
         """
         return transport.connection_targets(self.tcp_host, self.tcp_port, self.serial_port)
-
-    @staticmethod
-    def _parse_tcp_target(target: str) -> tuple[str, int]:
-        """Parse a ``tcp://host:port`` target key into ``(host, port)``.
-
-        Handles bracketed IPv6 literals, e.g. ``tcp://[::1]:4403``.
-        """
-        return transport.parse_tcp_target(target)
 
     def _open_interface(self, target: str) -> Any:
         """Open the serial/TCP interface for a connection target.
