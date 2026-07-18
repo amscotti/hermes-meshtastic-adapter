@@ -62,16 +62,18 @@ This is the subtlest part of the code. Meshtastic's `pubsub` delivers packets on
 
 1. `_on_receive_pubsub` (pubsub thread) → `_schedule_on_loop(self.loop, ...)` pushes onto `self._incoming_queue` (asyncio.Queue). Always the **platform** loop from `connect()` — that loop owns the queue.
 2. `_consume_incoming_queue` (loop task) drains it and calls `_on_receive`.
-3. `_on_receive` records live freshness for the sender via `_update_observed` (BEFORE the auth gate, so even non-allowlisted nodes get a current `last_heard`/signal), then authorizes the sender, filters self-echo, logs signal/telemetry/position to SQLite, and for TEXT packets builds a `MessageEvent` and calls `self.handle_message(event)`.
+3. `_on_receive` first offers routing packets to `_maybe_record_pubsub_ack` — a fallback that only *upgrades* an existing `IMPLICIT_ACK` (relay) record to a real ACK, because the one-shot `onAckNak` callback is consumed by the first response. It intentionally never resolves a still-`PENDING` waiter (packet-id reuse risk). It then records live freshness for the sender via `_update_observed` (BEFORE the auth gate, so even non-allowlisted nodes get a current `last_heard`/signal), then authorizes the sender, filters self-echo, logs signal/telemetry/position to SQLite, and for TEXT packets builds a `MessageEvent` and calls `self.handle_message(event)`.
 
 ### Dual event-loop model
 
 `self.loop` is the **platform loop** (inbound queue, reconnect/drain tasks). Hermes agent sessions may call `send()` on a **different** running loop. Rules:
 
-- **Inbound / lifecycle**: always `self.loop` (queue owner).
-- **ACK waiters**: create on `_awaiting_loop()`, resolve with `_schedule_on_loop(future.get_loop(), ...)`. Never bind an awaitable to `self.loop` if a different loop will await it (`ValueError: future belongs to a different loop`).
-- **Transport I/O**: `_iface_lock` protects only short `_interfaces` map operations. Slow `sendText` / `close` / liveness work runs on executor threads under `_transport_lock` (`_send_text_locked`, `_close_interfaces_serialized`, `_drop_interface_if_dead_serialized`). Meshtastic is not thread-safe for concurrent sends, and an event loop must never block acquiring the transport lock.
-- **Disconnect**: `_fail_pending_acks("DISCONNECTED")` settles outstanding ACK futures on their owning loops.
+- **Inbound / normal lifecycle tasks**: `self.loop` (queue owner). Disconnect
+  teardown may move to a live caller loop if the original platform loop stops
+  or its teardown task is cancelled; generation checks keep old tasks stale.
+- **ACK waiters**: `concurrent.futures.Future` in `_ack_futures`; await via `asyncio.wrap_future`. Resolve with `_set_ack_future_result` from any thread (no target-loop schedule).
+- **Transport I/O**: `_iface_lock` for short map ops; lifecycle-scoped daemon `_DaemonTransportExecutor` serializes `sendText` / `close` / liveness. Never close interfaces on the event-loop thread; close/shutdown waits are time-bounded.
+- **Disconnect**: `_fail_pending_acks("DISCONNECTED")`; concurrent callers poll the shared completion future (no `to_thread` wait). Cancelled open / drain timeouts: `MESHTASTIC_OPEN_CANCEL_TIMEOUT`, `MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT` (`0` = no wait).
 - First cross-loop send logs once at INFO (`_cross_loop_send_logged`, under `_ack_lock`).
 
 ### Node freshness overlay
@@ -92,7 +94,7 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 ### Outbound path (Hermes → mesh)
 
-`send()` → `_chunk_message` splits content into UTF-8-byte-bounded chunks with `[i/n]` prefixes (the protocol app-payload ceiling is 233 bytes — `mesh_pb2.Constants.DATA_PAYLOAD_LEN`; `MESHTASTIC_CHUNK_BYTES` overrides, clamped to 233), paces them by `MESHTASTIC_CHUNK_DELAY` → `_send_chunk` → `_send_immediate` calls the blocking `iface.sendText(..., wantAck=True)` via `run_in_executor`.
+`send()` → `_chunk_message` splits content into UTF-8-byte-bounded chunks with `[i/n]` prefixes (the protocol app-payload ceiling is 233 bytes — `mesh_pb2.Constants.DATA_PAYLOAD_LEN`; `MESHTASTIC_CHUNK_BYTES` overrides, clamped to 233), paces them by `MESHTASTIC_CHUNK_DELAY` → `_send_chunk` → `_send_immediate` submits the blocking `iface.sendText(..., wantAck=True)` to the lifecycle-scoped `_DaemonTransportExecutor` and awaits it with `asyncio.wrap_future`.
 
 **ACK/NACK is observability-first.** By default sends are non-blocking; `onAckNak` callbacks just record status into `_pending_acks` / `_ack_responses` (bounded at `ACK_RECORD_LIMIT`). Only when `MESHTASTIC_ACK_TIMEOUT > 0` (or send metadata requests it) does `_wait_for_ack` block and let a NAK/timeout make `SendResult.success` false.
 

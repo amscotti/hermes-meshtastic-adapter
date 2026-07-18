@@ -9,10 +9,13 @@ import asyncio
 import importlib
 import logging
 import os
+import queue
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
+from contextlib import ExitStack
 from datetime import datetime
 from enum import StrEnum
 from types import ModuleType, SimpleNamespace
@@ -37,6 +40,67 @@ except ImportError:
     import telemetry_db
 
 logger = logging.getLogger(__name__)
+
+
+class _DaemonTransportExecutor:
+    """Single-worker daemon thread for blocking Meshtastic I/O.
+
+    Daemon so a stuck open/close cannot pin process exit. Callers await via
+    ``asyncio.wrap_future(executor.submit(...))``.
+    """
+
+    def __init__(self, name: str = "meshtastic-transport") -> None:
+        self._jobs: queue.Queue[
+            tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any], ConcurrentFuture] | None
+        ] = queue.Queue()
+        self._closed = False
+        self._state_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> ConcurrentFuture:
+        fut: ConcurrentFuture = ConcurrentFuture()
+        # Check + enqueue atomically with shutdown's sentinel. Every accepted
+        # job is therefore before the sentinel and cannot be stranded behind it.
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._jobs.put((fn, args, kwargs, fut))
+        return fut
+
+    def _run(self) -> None:
+        while True:
+            item = self._jobs.get()
+            if item is None:
+                return
+            fn, args, kwargs, fut = item
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                try:
+                    fut.set_exception(exc)
+                except ConcurrentInvalidStateError:
+                    pass
+            else:
+                try:
+                    fut.set_result(result)
+                except ConcurrentInvalidStateError:
+                    pass
+
+    def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
+        """Stop accepting work. Optionally join the worker for up to ``timeout``."""
+        with self._state_lock:
+            if not self._closed:
+                self._closed = True
+                self._jobs.put(None)
+        if wait:
+            self._thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
 
 # --- Lazy/Conditional Imports for Meshtastic & PubSub ---
 try:
@@ -336,16 +400,25 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         # Active hardware connections mapping: devPath -> interface.
         # _iface_lock protects only short map/state operations; slow Meshtastic
-        # I/O is serialized on executor threads by _transport_lock so no event
-        # loop can block waiting behind sendText/close.
+        # I/O is serialized by the lifecycle's single daemon transport worker.
         self._interfaces: dict[str, Any] = {}
         self._iface_lock = threading.Lock()
-        self._transport_lock = threading.Lock()
-        self._transport_executor: ThreadPoolExecutor | None = None
+        self._transport_executor: _DaemonTransportExecutor | None = None
         self._pubsub_subscribed = False
         self._lifecycle_id = 0
         self._lifecycle_lock = threading.Lock()
         self._disconnecting = False
+        # Waiters poll the shared completion future (_disconnect_future), not
+        # this Event, so concurrent disconnects never occupy default-executor
+        # workers. The Event remains only as a teardown-completion signal for
+        # tests/diagnostics.
+        self._disconnect_done = threading.Event()
+        self._disconnect_done.set()
+        self._disconnect_future: ConcurrentFuture | None = None
+        self._disconnect_task: asyncio.Task | None = None
+        self._disconnect_owner_loop: asyncio.AbstractEventLoop | None = None
+        self._disconnect_interfaces: list[tuple[str, Any]] = []
+        self._disconnect_close_started = False
 
         # Outbound message queue for temporary drops (Phase 3 Task 2)
         # Bounded at 100 messages, oldest-first eviction
@@ -353,14 +426,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._queue_lock = threading.Lock()
         self._pending_acks: dict[str, dict[str, Any]] = {}
         self._ack_responses: dict[str, dict[str, Any]] = {}
-        self._ack_futures: dict[str, asyncio.Future] = {}
+        # Internal generation tags prevent a reused packet id from consuming an
+        # early response that belonged to an older send.
+        self._ack_tokens: dict[str, object] = {}
+        self._ack_response_tokens: dict[str, object] = {}
+        # sendText can invoke onAckNak before returning the packet id. Stage
+        # those responses by send generation until _track_pending_ack installs
+        # the packet-id token; this also keeps stale-lifecycle callbacks out of
+        # shared ACK history.
+        self._ack_inflight_tokens: dict[object, int] = {}
+        self._early_ack_packets: dict[object, tuple[dict, str, str, int]] = {}
+        # concurrent.futures.Future: set_result is thread-safe from any thread
+        # (including disconnect on another loop). Awaiters use asyncio.wrap_future.
+        self._ack_futures: dict[str, ConcurrentFuture] = {}
         self._ack_lock = threading.Lock()
 
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
-        # a *different* loop (agent session); those bind to the awaiting loop
-        # via _awaiting_loop() / future.get_loop(), never to self.loop alone.
-        # Transport I/O is serialized with _transport_lock (not the platform loop).
+        # a *different* loop (agent session). ACK completion uses
+        # concurrent.futures (loop-independent); transport I/O is serialized
+        # on the daemon worker (not the platform loop).
         self.loop: asyncio.AbstractEventLoop | None = None
         self._cross_loop_send_logged = False
         self._reconnect_tasks: dict[str, asyncio.Task] = {}
@@ -408,57 +493,189 @@ class MeshtasticAdapter(BasePlatformAdapter):
         with self._iface_lock:
             return self._interfaces.pop(target, None)
 
-    def _take_interfaces(self) -> list[tuple[str, Any]]:
-        """Atomically detach all interfaces from the active map."""
-        with self._iface_lock:
-            items = list(self._interfaces.items())
-            self._interfaces.clear()
-            return items
+    def _pop_interface_for_lifecycle(
+        self, target: str, lifecycle_id: int
+    ) -> tuple[bool, Any | None]:
+        """Remove ``target`` only while ``lifecycle_id`` still owns adapter state."""
+        with self._lifecycle_lock:
+            if lifecycle_id != self._lifecycle_id or not self._running:
+                return False, None
+            with self._iface_lock:
+                return True, self._interfaces.pop(target, None)
 
     def _close_interfaces_serialized(self, interfaces: list[Any]) -> None:
         """Close interfaces on a worker thread, serialized with sendText."""
-        with self._transport_lock:
-            for iface in interfaces:
+        for iface in interfaces:
+            try:
+                iface.close()
+            except Exception as exc:
+                logger.error("Error closing Meshtastic interface: %s", exc)
+
+    @staticmethod
+    async def _await_concurrent_future(
+        future: ConcurrentFuture, timeout: float | None = None
+    ) -> Any:
+        """Await without propagating asyncio cancellation into queued worker jobs.
+
+        Polling (rather than ``asyncio.shield(asyncio.wrap_future(...))``) keeps
+        the implementation trivial and guarantees a caller ``CancelledError``
+        cannot reach the daemon worker job. The 10ms cadence is a deliberate
+        tradeoff: awaits only cover slow, infrequent transport open/close/drain
+        calls, so the wakeup cost is negligible relative to the I/O latency.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not future.done():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError
+            await asyncio.sleep(0.01)
+        return future.result()
+
+    async def _close_interfaces_on_daemon_thread(
+        self, interfaces: list[Any], timeout: float
+    ) -> None:
+        """Close via a short-lived daemon thread — never on the event-loop thread."""
+        close_fut: ConcurrentFuture = ConcurrentFuture()
+
+        def _close() -> None:
+            try:
+                self._close_interfaces_serialized(interfaces)
+            except BaseException as exc:
                 try:
-                    iface.close()
-                except Exception as exc:
-                    logger.error("Error closing Meshtastic interface: %s", exc)
+                    close_fut.set_exception(exc)
+                except ConcurrentInvalidStateError:
+                    pass
+            else:
+                try:
+                    close_fut.set_result(None)
+                except ConcurrentInvalidStateError:
+                    pass
+
+        threading.Thread(target=_close, name="meshtastic-close", daemon=True).start()
+        await self._await_concurrent_future(close_fut, timeout)
+
+    async def _close_interfaces_after_executor(
+        self,
+        executor: _DaemonTransportExecutor,
+        interfaces: list[Any],
+        timeout: float,
+    ) -> None:
+        """Close only after a shutting-down worker drains accepted transport work."""
+        close_fut: ConcurrentFuture = ConcurrentFuture()
+
+        def _drain_then_close() -> None:
+            try:
+                executor.shutdown(wait=True)
+                self._close_interfaces_serialized(interfaces)
+            except BaseException as exc:
+                try:
+                    close_fut.set_exception(exc)
+                except ConcurrentInvalidStateError:
+                    pass
+            else:
+                try:
+                    close_fut.set_result(None)
+                except ConcurrentInvalidStateError:
+                    pass
+
+        threading.Thread(
+            target=_drain_then_close,
+            name="meshtastic-close-after-worker",
+            daemon=True,
+        ).start()
+        await self._await_concurrent_future(close_fut, timeout)
 
     async def _close_interfaces(self, interfaces: list[Any]) -> None:
         if not interfaces:
             return
+        timeout = self._executor_shutdown_timeout()
         with self._lifecycle_lock:
             executor = self._transport_executor
-        if executor is None:
-            # Only possible for an adapter that never connected; no transport
-            # work can be in flight in that state.
-            self._close_interfaces_serialized(interfaces)
-            return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(executor, self._close_interfaces_serialized, interfaces)
+        try:
+            if executor is not None:
+                try:
+                    close_fut = executor.submit(self._close_interfaces_serialized, interfaces)
+                except RuntimeError:
+                    # Executor shut down between the read and submit. Wait for
+                    # its accepted work to drain before closing, preserving the
+                    # no-concurrent-sendText/close transport invariant.
+                    await self._close_interfaces_after_executor(executor, interfaces, timeout)
+                    return
+                else:
+                    await self._await_concurrent_future(close_fut, timeout)
+                    return
+            if executor is None:
+                await self._close_interfaces_on_daemon_thread(interfaces, timeout)
+        except TimeoutError:
+            logger.warning(
+                "Meshtastic interface close still running after %.1fs; disconnect continues "
+                "(daemon transport worker will finish in the background)",
+                timeout,
+            )
+
+    @staticmethod
+    def _open_cancel_timeout() -> float:
+        """Seconds to wait for a cancelled open before abandoning the await.
+
+        ``0`` means do not wait (abandon immediately). The constructor still
+        runs on the daemon transport worker and closes a stale result via
+        lifecycle_id. Override with MESHTASTIC_OPEN_CANCEL_TIMEOUT.
+        """
+        raw = os.getenv("MESHTASTIC_OPEN_CANCEL_TIMEOUT") or "5"
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
+    @staticmethod
+    def _executor_shutdown_timeout() -> float:
+        """Seconds to wait for transport-worker drain / close during disconnect.
+
+        ``0`` means do not wait. Override with MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT.
+        """
+        raw = os.getenv("MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT") or "5"
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
+    async def _shutdown_transport_executor(self, executor: _DaemonTransportExecutor) -> None:
+        """Shut down the daemon transport worker without hanging forever."""
+        timeout = self._executor_shutdown_timeout()
+        executor.shutdown(wait=False)
+        deadline = time.monotonic() + timeout
+        # Poll without blocking the platform loop. Daemon worker means a stuck
+        # operation cannot pin process exit after this bounded wait expires.
+        while executor.is_alive() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if executor.is_alive():
+            logger.warning(
+                "Meshtastic transport executor still busy after %.1fs during disconnect; "
+                "continuing (daemon worker will finish in the background)",
+                timeout,
+            )
 
     def _drop_interface_if_dead_serialized(self, target: str, iface: Any) -> bool | None:
         """Atomically probe and close a dead interface.
 
         Returns None if the target changed, True if alive, and False after a
-        dead interface was removed and closed. The transport lock covers probe
-        through removal so a send cannot slip between them.
+        dead interface was removed and closed. This runs on the single daemon
+        transport worker, so probe-through-removal is serialized against
+        sendText: a send cannot slip between them.
         """
-        with self._transport_lock:
-            with self._iface_lock:
-                if self._interfaces.get(target) is not iface:
-                    return None
-            if self._interface_is_alive(iface):
-                return True
-            with self._iface_lock:
-                if self._interfaces.get(target) is not iface:
-                    return None
-                self._interfaces.pop(target, None)
-            try:
-                iface.close()
-            except Exception as exc:
-                logger.error("Error closing dropped Meshtastic interface: %s", exc)
-            return False
+        with self._iface_lock:
+            if self._interfaces.get(target) is not iface:
+                return None
+        if self._interface_is_alive(iface):
+            return True
+        with self._iface_lock:
+            if self._interfaces.get(target) is not iface:
+                return None
+            self._interfaces.pop(target, None)
+        try:
+            iface.close()
+        except Exception as exc:
+            logger.error("Error closing dropped Meshtastic interface: %s", exc)
+        return False
 
     def _open_and_register_interface(self, target: str, lifecycle_id: int) -> Any | None:
         """Open on a worker, then atomically adopt or close a stale result."""
@@ -484,17 +701,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
         pub.unsubscribe(self._on_connection_lost, "meshtastic.connection.lost")
         pub.unsubscribe(self._on_connection_established, "meshtastic.connection.established")
         self._pubsub_subscribed = False
-
-    def _awaiting_loop(self) -> asyncio.AbstractEventLoop | None:
-        """Loop running the current coroutine, else the platform (connect) loop.
-
-        ACK futures and other awaitables must be created on the loop that will
-        await them. Agent-session sends can run outside ``self.loop``.
-        """
-        try:
-            return asyncio.get_running_loop()
-        except RuntimeError:
-            return self.loop
 
     def _schedule_on_loop(
         self,
@@ -526,6 +732,38 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # Loop closed between is_running() and call_soon_threadsafe.
             logger.debug("Skipping %s: %s", what, exc)
             return False
+
+    def _cancel_task_threadsafe(self, task: asyncio.Task) -> None:
+        """Cancel a task regardless of which loop owns it.
+
+        ``Task.cancel()`` touches the owning loop's internal state and is only
+        safe to call from that loop's thread. Disconnect teardown may run on a
+        follower loop that took over after the platform loop's owner task was
+        cancelled/stranded; in that case foreign-loop tasks are cancelled via
+        ``call_soon_threadsafe``. A stopped-but-open loop accepts the callback
+        and cancels the task before it can resume into a later lifecycle.
+        """
+        loop = task.get_loop()
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop is current_loop:
+            task.cancel()
+            return
+        if task.done() or loop.is_closed():
+            return
+        try:
+            # Unlike _schedule_on_loop (the inbound bridge), cancellation must
+            # also be queued on a stopped loop in case it is restarted later.
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError as exc:
+            logger.debug("Skipping task cancellation: %s", exc)
+
+    def _lifecycle_is_active(self, lifecycle_id: int) -> bool:
+        """Return whether ``lifecycle_id`` still owns adapter loop tasks."""
+        with self._lifecycle_lock:
+            return self._running and self._lifecycle_id == lifecycle_id
 
     def _run_db_write(self, fn: Callable[[], None]) -> None:
         """Run a blocking telemetry DB write off the event loop when one is available.
@@ -731,18 +969,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._lifecycle_id += 1
             lifecycle_id = self._lifecycle_id
             if self._transport_executor is None:
-                self._transport_executor = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="meshtastic-transport"
-                )
+                self._transport_executor = _DaemonTransportExecutor(name="meshtastic-transport")
         self.loop = asyncio.get_running_loop()
         self._cross_loop_send_logged = False
 
         self._set_tools_adapter(self)
         self._subscribe_pubsub()
 
-        # Initialize incoming queue and consumer task
-        self._incoming_queue = asyncio.Queue()
-        self._incoming_consumer_task = asyncio.create_task(self._consume_incoming_queue())
+        # Pass the generation and queue explicitly so a task stranded on an old
+        # loop cannot consume a replacement lifecycle's queue after restart.
+        incoming_queue = asyncio.Queue()
+        self._incoming_queue = incoming_queue
+        self._incoming_consumer_task = asyncio.create_task(
+            self._consume_incoming_queue(lifecycle_id, incoming_queue)
+        )
 
         # Determine connection targets to open
         targets = self._connection_targets()
@@ -756,7 +996,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
 
         # Start queue drain monitoring
-        self._queue_drain_task = asyncio.create_task(self._drain_queue_loop())
+        self._queue_drain_task = asyncio.create_task(self._drain_queue_loop(lifecycle_id))
 
         self._mark_connected()
         return True
@@ -873,7 +1113,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def _reconnect_loop(self, target: str, lifecycle_id: int):
         """Exponential backoff reconnect loop for one connection target."""
         backoff = 1.0
-        while self._running:
+        while self._lifecycle_is_active(lifecycle_id):
             try:
                 with self._iface_lock:
                     needs_connect = target not in self._interfaces
@@ -882,23 +1122,48 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     # Constructors can block. The worker adopts the result only
                     # if this lifecycle still wants it; canceled/stale opens are
                     # closed before the worker returns.
-                    loop = asyncio.get_running_loop()
                     with self._lifecycle_lock:
                         executor = self._transport_executor
                     if executor is None:
                         break
-                    open_future = loop.run_in_executor(
-                        executor,
-                        lambda t=target, lid=lifecycle_id: self._open_and_register_interface(
-                            t, lid
-                        ),
+                    open_cf = executor.submit(
+                        lambda t=target, lid=lifecycle_id: self._open_and_register_interface(t, lid)
                     )
                     try:
-                        iface = await asyncio.shield(open_future)
+                        iface = await self._await_concurrent_future(open_cf)
                     except asyncio.CancelledError:
-                        # Constructor work cannot be canceled once running. Wait
-                        # for its stale-lifecycle cleanup before disconnect exits.
-                        await open_future
+                        # Constructor work cannot be canceled once running.
+                        # Wait briefly for stale-lifecycle cleanup; if the open
+                        # is hung (or timeout is 0), abandon the await so
+                        # disconnect can finish. Daemon worker still closes a
+                        # late result via lifecycle_id.
+                        timeout = self._open_cancel_timeout()
+                        if timeout > 0:
+                            try:
+                                await self._await_concurrent_future(open_cf, timeout)
+                            except TimeoutError:
+                                logger.warning(
+                                    "Meshtastic open for %s still running after %.1fs cancel "
+                                    "wait; disconnect continues (stale result will be closed)",
+                                    target,
+                                    timeout,
+                                )
+                            except Exception:
+                                # The constructor failed after we were cancelled.
+                                # Preserve the CancelledError — that is the
+                                # meaningful outcome for the caller; the worker
+                                # already logged the open failure.
+                                logger.debug(
+                                    "Cancelled Meshtastic open for %s also raised",
+                                    target,
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.warning(
+                                "Meshtastic open for %s abandoned immediately on cancel "
+                                "(MESHTASTIC_OPEN_CANCEL_TIMEOUT=0); stale result will be closed",
+                                target,
+                            )
                         raise
                     if iface is None:
                         break
@@ -922,7 +1187,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             except Exception as e:
                 logger.error(f"Failed to connect to Meshtastic on {target}: {e}")
-                dropped = self._pop_interface(target)
+                active_lifecycle, dropped = self._pop_interface_for_lifecycle(target, lifecycle_id)
+                if not active_lifecycle:
+                    break
                 if dropped is not None:
                     await self._close_interfaces([dropped])
 
@@ -932,21 +1199,17 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 continue
 
             # If successfully connected, poll until the connection drops
-            while self._running:
+            while self._lifecycle_is_active(lifecycle_id):
                 with self._iface_lock:
                     if target not in self._interfaces:
                         break
                     iface = self._interfaces[target]
-                loop = asyncio.get_running_loop()
                 with self._lifecycle_lock:
                     executor = self._transport_executor
                 if executor is None:
                     break
-                alive = await loop.run_in_executor(
-                    executor,
-                    self._drop_interface_if_dead_serialized,
-                    target,
-                    iface,
+                alive = await asyncio.wrap_future(
+                    executor.submit(self._drop_interface_if_dead_serialized, target, iface)
                 )
                 if alive is None:
                     break
@@ -993,9 +1256,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # No known liveness handle (e.g. the mock interface) — assume alive.
         return True
 
-    async def _drain_queue_loop(self):
+    async def _drain_queue_loop(self, lifecycle_id: int):
         """Monitor and drain the outbound messages queue when connections are active."""
-        while self._running:
+        while self._lifecycle_is_active(lifecycle_id):
             if self._has_interfaces() and self._outbound_queue:
                 with self._queue_lock:
                     item = self._outbound_queue.pop(0)
@@ -1011,15 +1274,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     try:
                         res = await asyncio.shield(send_task)
                     except asyncio.CancelledError:
-                        try:
-                            res = await send_task
-                        except Exception:
-                            with self._queue_lock:
-                                self._outbound_queue.insert(0, item)
-                        else:
-                            if not res.success:
+                        timeout = self._executor_shutdown_timeout()
+                        done, _ = await asyncio.wait({send_task}, timeout=timeout)
+                        if done:
+                            try:
+                                res = send_task.result()
+                            except Exception:
                                 with self._queue_lock:
                                     self._outbound_queue.insert(0, item)
+                            else:
+                                if not res.success:
+                                    with self._queue_lock:
+                                        self._outbound_queue.insert(0, item)
+                        else:
+                            # Delivery is indeterminate: do not requeue and risk
+                            # a duplicate. The daemon worker may still complete.
+                            logger.warning(
+                                "Queued Meshtastic send still running after %.1fs during "
+                                "disconnect; not requeueing (delivery indeterminate)",
+                                timeout,
+                            )
                         raise
                     if not res.success:
                         with self._queue_lock:
@@ -1036,81 +1310,246 @@ class MeshtasticAdapter(BasePlatformAdapter):
             else:
                 await asyncio.sleep(1.0)
 
+    def _start_disconnect_task(self, completion: ConcurrentFuture) -> None:
+        """Start teardown on the event loop that owns platform tasks."""
+        current_loop = asyncio.get_running_loop()
+        with self._lifecycle_lock:
+            if completion.done():
+                return
+            owner_loop = self._disconnect_owner_loop
+            task = self._disconnect_task
+            if (
+                owner_loop is not None
+                and owner_loop is not current_loop
+                and owner_loop.is_running()
+            ):
+                # task=None means a call_soon_threadsafe callback is reserved
+                # but has not run yet. A live task likewise still owns teardown.
+                if task is None or not task.done():
+                    return
+            needs_task = task is None or task.done() or not task.get_loop().is_running()
+            if needs_task:
+                # Check + assign under one cross-thread lock so concurrent
+                # takeover callers cannot launch duplicate teardown tasks.
+                if task is not None and not task.done():
+                    self._cancel_task_threadsafe(task)
+                self._disconnect_owner_loop = current_loop
+                self._disconnect_task = current_loop.create_task(self._disconnect_impl(completion))
+
     async def disconnect(self) -> None:
-        """Close connection and stop loops."""
+        """Request platform-loop teardown and await its shared completion."""
+        platform_loop: asyncio.AbstractEventLoop | None = None
         with self._lifecycle_lock:
             if self._disconnecting:
-                wait_for_disconnect = True
+                completion = self._disconnect_future
+                start_teardown = False
             else:
-                wait_for_disconnect = False
+                completion = ConcurrentFuture()
+                self._disconnect_future = completion
                 self._disconnecting = True
+                self._disconnect_done.clear()
                 self._running = False
                 self._lifecycle_id += 1
-        if wait_for_disconnect:
-            logger.debug("Waiting for Meshtastic disconnect already in progress")
-            while True:
+                start_teardown = True
+                # Snapshot the platform loop under the lock alongside the
+                # _running flip so teardown is dispatched to the loop that owns
+                # the lifecycle tasks.
+                consumer_task = self._incoming_consumer_task
+                platform_loop = consumer_task.get_loop() if consumer_task is not None else self.loop
+
+        if completion is None:
+            return
+        if start_teardown:
+            current_loop = asyncio.get_running_loop()
+            if platform_loop is current_loop:
                 with self._lifecycle_lock:
-                    if not self._disconnecting:
-                        return
-                await asyncio.sleep(0.01)
+                    self._disconnect_owner_loop = current_loop
+                self._start_disconnect_task(completion)
+            elif platform_loop is not None and platform_loop.is_running():
+                with self._lifecycle_lock:
+                    self._disconnect_owner_loop = platform_loop
+                try:
+                    platform_loop.call_soon_threadsafe(self._start_disconnect_task, completion)
+                except RuntimeError:
+                    with self._lifecycle_lock:
+                        self._disconnect_owner_loop = current_loop
+                    self._start_disconnect_task(completion)
+            else:
+                # Platform loop already stopped: fallback cleanup can still
+                # cancel (without awaiting) old-loop tasks and close transport.
+                with self._lifecycle_lock:
+                    self._disconnect_owner_loop = current_loop
+                self._start_disconnect_task(completion)
+        else:
+            logger.debug("Waiting for Meshtastic disconnect already in progress")
+
+        # Polling does not tie completion to the caller loop and caller
+        # cancellation cannot cancel the shared teardown. If the owner loop
+        # stops after accepting the callback, take over cleanup here.
         try:
-            self._set_tools_adapter(None)
-            self._unsubscribe_pubsub()
-
-            # Detach first: transport workers that have not started sendText will
-            # see no active interface. Workers already inside sendText finish before
-            # close because both operations use _transport_lock.
-            ports = self._take_interfaces()
-
-            # Settle currently registered waiters immediately. A sendText worker
-            # that returns after this sweep is handled by _track_pending_ack's
-            # !_running branch and gets an immediate DISCONNECTED result.
-            self._fail_pending_acks(reason="DISCONNECTED")
-
-            # Cancel tasks
-            lifecycle_tasks = list(self._reconnect_tasks.values())
-            if self._queue_drain_task:
-                lifecycle_tasks.append(self._queue_drain_task)
-            if self._incoming_consumer_task:
-                lifecycle_tasks.append(self._incoming_consumer_task)
-            for task in lifecycle_tasks:
-                task.cancel()
-            if lifecycle_tasks:
-                await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
-            self._reconnect_tasks.clear()
-            self._queue_drain_task = None
-            self._incoming_consumer_task = None
-            self._incoming_queue = None
-
-            # Cancel pending message tasks
-            message_tasks = list(self._message_tasks)
-            for task in message_tasks:
-                task.cancel()
-            if message_tasks:
-                await asyncio.gather(*message_tasks, return_exceptions=True)
-            self._message_tasks.clear()
-
-            await self._close_interfaces([iface for _, iface in ports])
+            while not completion.done():
+                # Detect cancelled/done owner tasks even when their loop is still
+                # running, plus tasks stranded on a stopped loop.
+                self._start_disconnect_task(completion)
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            # If this caller reserved a foreign-loop callback that never ran,
+            # transfer the empty reservation locally before propagating caller
+            # cancellation. The teardown task is independent of this waiter.
+            current_loop = asyncio.get_running_loop()
             with self._lifecycle_lock:
+                take_over = not completion.done() and self._disconnect_task is None
+                if take_over:
+                    self._disconnect_owner_loop = current_loop
+            if take_over:
+                self._start_disconnect_task(completion)
+            raise
+        completion.result()
+
+    async def _disconnect_impl(self, completion: ConcurrentFuture) -> None:
+        """Teardown implementation; always owned by the platform loop when live."""
+        failure: BaseException | None = None
+        cancelled = False
+        superseded = False
+        current_task = asyncio.current_task()
+        try:
+            with self._lifecycle_lock:
+                if (
+                    not self._disconnecting
+                    or self._disconnect_future is not completion
+                    or self._disconnect_task is not current_task
+                ):
+                    superseded = True
+                    return
+                # Claim all lifecycle-owned state atomically while ownership is
+                # valid. A stale task may later finish work on this snapshot,
+                # but can never reach a newly connected lifecycle's state.
+                self._set_tools_adapter(None)
+                self._unsubscribe_pubsub()
+                with self._iface_lock:
+                    detached = list(self._interfaces.items())
+                    self._interfaces.clear()
+                if detached:
+                    self._disconnect_interfaces.extend(detached)
+                ports = list(self._disconnect_interfaces)
+                self._fail_pending_acks(reason="DISCONNECTED")
+                lifecycle_tasks = list(self._reconnect_tasks.values())
+                if self._queue_drain_task:
+                    lifecycle_tasks.append(self._queue_drain_task)
+                if self._incoming_consumer_task:
+                    lifecycle_tasks.append(self._incoming_consumer_task)
+                self._reconnect_tasks.clear()
+                self._queue_drain_task = None
+                self._incoming_consumer_task = None
+                self._incoming_queue = None
+            # Cancel on each task's owning loop. A takeover teardown may run on
+            # a follower loop while the platform loop is still running; calling
+            # Task.cancel() directly from another thread is not safe, so foreign-
+            # loop tasks are marshalled via call_soon_threadsafe.
+            current_loop = asyncio.get_running_loop()
+            for task in lifecycle_tasks:
+                self._cancel_task_threadsafe(task)
+            local_lifecycle_tasks = [
+                task for task in lifecycle_tasks if task.get_loop() is current_loop
+            ]
+            if local_lifecycle_tasks:
+                await asyncio.gather(*local_lifecycle_tasks, return_exceptions=True)
+            with self._lifecycle_lock:
+                if (
+                    not self._disconnecting
+                    or self._disconnect_future is not completion
+                    or self._disconnect_task is not current_task
+                ):
+                    superseded = True
+                    return
+                message_tasks = list(self._message_tasks)
+                self._message_tasks.clear()
+            for task in message_tasks:
+                self._cancel_task_threadsafe(task)
+            local_message_tasks = [
+                task for task in message_tasks if task.get_loop() is current_loop
+            ]
+            if local_message_tasks:
+                await asyncio.gather(*local_message_tasks, return_exceptions=True)
+            with self._lifecycle_lock:
+                if (
+                    not self._disconnecting
+                    or self._disconnect_future is not completion
+                    or self._disconnect_task is not current_task
+                ):
+                    superseded = True
+                    return
+                should_start_close = not self._disconnect_close_started
+                if should_start_close:
+                    self._disconnect_close_started = True
+            if should_start_close:
+                await self._close_interfaces([iface for _, iface in ports])
+            with self._lifecycle_lock:
+                if (
+                    not self._disconnecting
+                    or self._disconnect_future is not completion
+                    or self._disconnect_task is not current_task
+                ):
+                    superseded = True
+                    return
                 executor = self._transport_executor
                 self._transport_executor = None
             if executor is not None:
-                await asyncio.to_thread(executor.shutdown, wait=True)
+                # Bounded join on a daemon worker — safe to call from the loop
+                # thread because shutdown(wait) only joins with a timeout.
+                await self._shutdown_transport_executor(executor)
             logger.info("Disconnected Meshtastic Platform.")
+        except asyncio.CancelledError:
+            # Do not advertise completion. Cleanup is idempotent; a polling
+            # caller will atomically start a takeover task on a live loop.
+            cancelled = True
+            raise
+        except BaseException as exc:
+            failure = exc
+            logger.error("Error disconnecting Meshtastic platform: %s", exc, exc_info=True)
         finally:
-            with self._lifecycle_lock:
-                self._disconnecting = False
+            if cancelled or superseded:
+                with self._lifecycle_lock:
+                    if self._disconnect_task is current_task:
+                        self._disconnect_task = None
+                        self._disconnect_owner_loop = None
+            else:
+                with self._lifecycle_lock:
+                    if (
+                        self._disconnecting
+                        and self._disconnect_future is completion
+                        and self._disconnect_task is current_task
+                    ):
+                        # Settle completion before releasing ownership so polling
+                        # callers cannot observe task=None with completion pending.
+                        try:
+                            if failure is None:
+                                completion.set_result(None)
+                            else:
+                                completion.set_exception(failure)
+                        except ConcurrentInvalidStateError:
+                            pass
+                        self._disconnecting = False
+                        self._disconnect_done.set()
+                        self._disconnect_interfaces.clear()
+                        self._disconnect_close_started = False
+                        self._disconnect_task = None
+                        self._disconnect_owner_loop = None
 
     def _on_receive_pubsub(self, packet, interface=None):
         """Wrapper callback called by the pubsub framework (running on PySub background thread).
 
         Always marshals onto the *platform* loop (``self.loop``): that is the
-        loop that owns ``_incoming_queue``. Do not use ``_awaiting_loop()`` here
-        — there is no running loop on the pubsub thread, and a send-loop queue
-        would never be drained.
+        loop that owns ``_incoming_queue``. There is no running loop on the
+        pubsub thread, and a send-loop queue would never be drained.
         """
         if not self._running or self._incoming_queue is None:
             return
+        if interface is not None:
+            with self._iface_lock:
+                if not any(active is interface for active in self._interfaces.values()):
+                    logger.debug("Ignoring packet from detached Meshtastic interface")
+                    return
         self._schedule_on_loop(
             self.loop,
             self._incoming_queue.put_nowait,
@@ -1133,18 +1572,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Log Meshtastic-reported connection establishment (pubsub background thread)."""
         logger.info("Meshtastic reported connection established (interface=%s).", interface)
 
-    async def _consume_incoming_queue(self):
+    async def _consume_incoming_queue(self, lifecycle_id: int, incoming_queue: asyncio.Queue):
         """Consume incoming packets from the asyncio Queue."""
-        while self._running:
+        while self._lifecycle_is_active(lifecycle_id):
             try:
-                incoming_queue = self._incoming_queue
-                if incoming_queue is None:
-                    await asyncio.sleep(0.1)
-                    continue
-
                 packet, interface = await incoming_queue.get()
                 try:
-                    self._on_receive(packet, interface)
+                    # Keep lifecycle ownership through synchronous dispatch so
+                    # disconnect/reconnect cannot advance the generation in the
+                    # gap between validation and _on_receive side effects.
+                    with self._lifecycle_lock:
+                        if lifecycle_id != self._lifecycle_id or not self._running:
+                            break
+                        self._on_receive(packet, interface)
                 finally:
                     incoming_queue.task_done()
             except asyncio.CancelledError:
@@ -1420,10 +1860,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
         pkt_id = str(request_id)
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id)
-            # Only waiters need the pubsub fallback. Non-waiting sends already
-            # get callback observability, and matching historical records here
-            # would risk updating a reused packet id.
-            if record is None or pkt_id not in self._ack_futures:
+            # This fallback exists for exactly one case: a DM whose first
+            # response was a relay confirmation recorded as IMPLICIT_ACK. The
+            # meshtastic library removes the onResponse handler after the first
+            # invocation, so the real end-to-end routing ACK that follows arrives
+            # only via pubsub (_on_receive) and must upgrade the record to ACK.
+            #
+            # For a still-PENDING waiter the magic-named onAckNak callback is the
+            # authoritative channel for the first response (the library invokes
+            # it for the routing ACK when wantAck + onResponse are set), so the
+            # pubsub path is intentionally *not* used there. Routing a pubsub
+            # ACK for a PENDING waiter would also risk misattributing a reused
+            # packet id. Non-waiting sends already get callback observability.
+            if (
+                record is None
+                or pkt_id not in self._ack_futures
+                or record.get("status") != AckStatus.IMPLICIT_ACK
+            ):
                 return False
             dest = str(record.get("dest") or "")
         self._record_ack_response(packet, dest, "")
@@ -1689,14 +2142,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if not isinstance(ack, dict):
             return False
         status = ack.get("status")
+        reason = str(ack.get("error_reason") or "").upper()
         # Adapter teardown — do not retry into a closed transport.
-        if str(ack.get("error_reason") or "").upper() == "DISCONNECTED":
+        if reason == "DISCONNECTED":
+            return False
+        # Adapter-internal synthetic NAK: the packet id collided with an
+        # in-flight waiter. The chunk was already transmitted by sendText before
+        # the collision was detected, so retrying would duplicate it on-air.
+        # Fail safe and leave delivery to the (already sent) original packet.
+        if reason == "DUPLICATE_PACKET_ID":
             return False
         # No confirmation, or only a relay confirmed — both warrant a retry.
         if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
             return True
         if status == AckStatus.NAK:
-            reason = str(ack.get("error_reason") or "").upper()
             return reason not in self.PERMANENT_NAK_REASONS
         return False
 
@@ -1799,40 +2258,109 @@ class MeshtasticAdapter(BasePlatformAdapter):
         content: str,
         *,
         create_future: bool = False,
-    ) -> asyncio.Future | None:
-        """Track packet IDs for ACK/NACK response observability."""
+        send_token: object | None = None,
+    ) -> ConcurrentFuture | None:
+        """Track packet IDs for ACK/NACK response observability.
+
+        Waiters are stored as ``concurrent.futures.Future`` so pubsub/disconnect
+        can ``set_result`` from any thread without needing the awaiter's event
+        loop to be running. ``_wait_for_ack`` wraps it on the caller's loop.
+        """
         if not pkt_id:
             return None
 
-        # Bind the ACK future to the loop that will *await* it (_awaiting_loop),
-        # not the platform loop alone — a send driven from an agent session may
-        # run on a different loop; awaiting a future bound to another loop
-        # raises "future belongs to a different loop". Pubsub resolution later
-        # marshals onto future.get_loop() via _schedule_on_loop.
-        future = None
+        cf_future: ConcurrentFuture | None = None
         log_cross_loop = False
         cross_platform_id = 0
         cross_send_id = 0
         if create_future:
-            fut_loop = self._awaiting_loop()
-            if fut_loop is not None:
-                future = fut_loop.create_future()
-                if self.loop is not None and fut_loop is not self.loop:
-                    cross_platform_id = id(self.loop)
-                    cross_send_id = id(fut_loop)
-                    log_cross_loop = True
+            cf_future = ConcurrentFuture()
+            try:
+                send_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                send_loop = None
+            if send_loop is not None and self.loop is not None and send_loop is not self.loop:
+                cross_platform_id = id(self.loop)
+                cross_send_id = id(send_loop)
+                log_cross_loop = True
         with self._ack_lock:
             if log_cross_loop and not self._cross_loop_send_logged:
                 self._cross_loop_send_logged = True
             else:
                 log_cross_loop = False
             existing_response = self._ack_responses.get(pkt_id)
+            if send_token is not None:
+                response_token = self._ack_response_tokens.get(pkt_id)
+                if existing_response is not None and response_token is not send_token:
+                    # Same numeric packet id from an older send/lifecycle.
+                    existing_response = None
+
+            active_future = self._ack_futures.get(pkt_id)
+            if active_future is not None and not active_future.done():
+                collision = {
+                    "dest": dest,
+                    "bytes": len(content.encode("utf-8")),
+                    "sent_at": time.time(),
+                    "response_at": time.time(),
+                    "status": AckStatus.NAK,
+                    "error_reason": "DUPLICATE_PACKET_ID",
+                }
+                self._ack_futures.pop(pkt_id, None)
+                self._pending_acks[pkt_id] = collision
+                self._ack_responses[pkt_id] = collision
+                self._set_ack_future_result(active_future, dict(collision))
+                if cf_future is not None:
+                    # Poison this reused id so neither old nor new generation
+                    # callbacks can overwrite the definitive collision result.
+                    self._ack_tokens[pkt_id] = object()
+                    self._ack_response_tokens.pop(pkt_id, None)
+                    self._set_ack_future_result(cf_future, dict(collision))
+                    return cf_future
+                # Fire-and-forget collision: the old waiter is terminated, and
+                # the new send's token now owns the id so its real ACK callback
+                # can still update the record (a delayed old-token ACK is
+                # ignored as stale by _record_ack_response).
+                if send_token is not None:
+                    self._ack_tokens[pkt_id] = send_token
+                logger.warning(
+                    "Meshtastic packet id collision with active ACK waiter: packet_id=%s",
+                    pkt_id,
+                )
+                return None
+
+            prior_token = self._ack_tokens.get(pkt_id)
+            if (
+                cf_future is not None
+                and send_token is not None
+                and prior_token is not None
+                and prior_token is not send_token
+            ):
+                # A delayed wire ACK for the older packet would be
+                # indistinguishable from an ACK for this reuse. Fail safe.
+                collision = {
+                    "dest": dest,
+                    "bytes": len(content.encode("utf-8")),
+                    "sent_at": time.time(),
+                    "response_at": time.time(),
+                    "status": AckStatus.NAK,
+                    "error_reason": "DUPLICATE_PACKET_ID",
+                }
+                self._pending_acks[pkt_id] = collision
+                self._ack_responses[pkt_id] = collision
+                self._ack_tokens[pkt_id] = object()
+                self._ack_response_tokens.pop(pkt_id, None)
+                self._set_ack_future_result(cf_future, dict(collision))
+                self._prune_ack_history_locked()
+                return cf_future
+
             record = existing_response or {
                 "dest": dest,
                 "bytes": len(content.encode("utf-8")),
                 "sent_at": time.time(),
                 "status": AckStatus.PENDING,
             }
+            if send_token is not None:
+                self._ack_tokens[pkt_id] = send_token
             # sendText can finish after disconnect's ACK sweep. Never register
             # a fresh waiter into a stopped lifecycle; preserve a real ACK/NAK
             # that arrived early, otherwise settle as disconnected now.
@@ -1849,18 +2377,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 record["error_reason"] = "DISCONNECTED"
                 record["response_at"] = time.time()
             self._pending_acks[pkt_id] = record
-            if future and self._running:
-                self._ack_futures[pkt_id] = future
-            elif future:
+            if cf_future is not None and self._running:
+                self._ack_futures[pkt_id] = cf_future
+            elif cf_future is not None:
                 existing_response = record
             self._prune_ack_history_locked()
 
         if log_cross_loop:
             logger.info(
                 "Meshtastic send/ACK running on a different event loop than "
-                "connect() (platform loop id=%s, send loop id=%s). ACK "
-                "waiters bind to the send loop; inbound traffic stays on "
-                "the platform loop. Transport I/O is serialized via _transport_lock.",
+                "connect() (platform loop id=%s, send loop id=%s). ACK waiters "
+                "use concurrent.futures (loop-independent settle); inbound "
+                "traffic stays on the platform loop. Transport I/O is "
+                "serialized on the daemon worker.",
                 cross_platform_id,
                 cross_send_id,
             )
@@ -1869,22 +2398,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # waiter was created, resolve immediately. An early *implicit* ACK is not
         # definitive — leave the waiter open so a real ACK (or timeout) decides.
         if (
-            future
+            cf_future is not None
             and existing_response
-            and not future.done()
+            and not cf_future.done()
             and existing_response.get("status") != AckStatus.IMPLICIT_ACK
         ):
-            future.set_result(existing_response)
-        return future
+            self._set_ack_future_result(cf_future, existing_response)
+
+        return cf_future
 
     def _fail_pending_acks(self, reason: str = "DISCONNECTED") -> None:
         """Resolve outstanding ACK waiters (e.g. on disconnect).
 
-        Each future is settled on its own loop so a send awaiting on an
-        agent-session loop unblocks promptly instead of sitting until timeout.
+        ``concurrent.futures.Future.set_result`` is thread-safe, so waiters on
+        any agent-session loop unblock without requiring that loop to be running
+        for the *set* (only for the awaiter to resume).
         """
-        to_resolve: list[tuple[asyncio.Future, dict[str, Any]]] = []
+        to_resolve: list[tuple[ConcurrentFuture, dict[str, Any]]] = []
         with self._ack_lock:
+            self._ack_inflight_tokens.clear()
+            self._early_ack_packets.clear()
             items = list(self._ack_futures.items())
             self._ack_futures.clear()
             for pkt_id, future in items:
@@ -1906,22 +2439,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 self._ack_responses[pkt_id] = record
                 if future is not None and not future.done():
                     to_resolve.append((future, dict(record)))
+            self._prune_ack_history_locked()
 
         for future, snapshot in to_resolve:
-            if not self._schedule_on_loop(
-                future.get_loop(),
-                self._set_ack_future_result,
-                future,
-                snapshot,
-                what=f"ACK fail ({reason})",
-            ):
-                # Same-loop fallback (disconnect often runs on the platform loop;
-                # foreign-loop waiters need their loop still running).
-                try:
-                    if future.get_loop() is asyncio.get_running_loop() and not future.done():
-                        future.set_result(snapshot)
-                except RuntimeError:
-                    pass
+            self._set_ack_future_result(future, snapshot)
 
     def get_ack_status(self, packet_id: str) -> dict[str, Any] | None:
         """Return the latest ACK/NACK status for a packet id, if observed."""
@@ -1942,16 +2463,46 @@ class MeshtasticAdapter(BasePlatformAdapter):
             evictable = [key for key in store if key not in self._ack_futures]
             for key in evictable[:excess]:
                 store.pop(key, None)
+        retained = set(self._pending_acks) | set(self._ack_responses) | set(self._ack_futures)
+        for tokens in (self._ack_tokens, self._ack_response_tokens):
+            for key in list(tokens):
+                if key not in retained:
+                    tokens.pop(key, None)
 
     def _make_ack_callback(self, dest: str, content: str):
         """Build a Meshtastic onResponse callback that receives ACK/NACK packets."""
 
+        return self._make_ack_callback_for_send(dest, content, None)
+
+    def _make_ack_callback_for_send(
+        self,
+        dest: str,
+        content: str,
+        send_token: object | None,
+        lifecycle_id: int | None = None,
+    ):
+        """Build the magic-named callback with an optional send generation tag."""
+
         def onAckNak(packet):
-            self._record_ack_response(packet, dest, content)
+            self._record_ack_response(
+                packet,
+                dest,
+                content,
+                send_token=send_token,
+                lifecycle_id=lifecycle_id,
+            )
 
         return onAckNak
 
-    def _record_ack_response(self, packet: dict, dest: str, content: str) -> None:
+    def _record_ack_response(
+        self,
+        packet: dict,
+        dest: str,
+        content: str,
+        *,
+        send_token: object | None = None,
+        lifecycle_id: int | None = None,
+    ) -> None:
         """Log and store Meshtastic ACK/NACK responses without blocking send().
 
         Distinguishes a **real** end-to-end ACK (routing ACK sender IS the
@@ -1988,7 +2539,36 @@ class MeshtasticAdapter(BasePlatformAdapter):
         else:
             status = AckStatus.ACK
 
-        with self._ack_lock:
+        # Hold lifecycle ownership through the ACK-store commit. This closes the
+        # check-to-commit window where disconnect/reconnect could otherwise
+        # advance the generation after validation but before _ack_lock.
+        with ExitStack() as stack:
+            if lifecycle_id is not None:
+                stack.enter_context(self._lifecycle_lock)
+                if lifecycle_id != self._lifecycle_id or not self._running:
+                    logger.debug(
+                        "Ignoring ACK callback from stale lifecycle: packet_id=%s",
+                        pkt_id,
+                    )
+                    return
+            stack.enter_context(self._ack_lock)
+            if send_token is not None:
+                inflight_lifecycle = self._ack_inflight_tokens.get(send_token)
+                if inflight_lifecycle is not None:
+                    if lifecycle_id is not None and inflight_lifecycle != lifecycle_id:
+                        return
+                    self._early_ack_packets[send_token] = (
+                        packet,
+                        dest,
+                        content,
+                        inflight_lifecycle,
+                    )
+                    return
+                active_token = self._ack_tokens.get(pkt_id)
+                if active_token is not None and active_token is not send_token:
+                    logger.debug("Ignoring stale ACK callback for packet_id=%s", pkt_id)
+                    return
+                self._ack_response_tokens[pkt_id] = send_token
             record = self._pending_acks.get(pkt_id, {})
             prior = record.get("status")
             # Never let a weaker/later relay confirmation overwrite a definitive
@@ -2023,26 +2603,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 snapshot = dict(record)
             self._pending_acks[pkt_id] = record
             self._ack_responses[pkt_id] = record
-            future = self._ack_futures.get(pkt_id)
+            if applied_status in (AckStatus.ACK, AckStatus.NAK):
+                future = self._ack_futures.pop(pkt_id, None)
+            else:
+                future = self._ack_futures.get(pkt_id)
+            self._prune_ack_history_locked()
 
         # Resolve the waiter only on a DEFINITIVE outcome (real ACK or NAK). An
         # implicit ACK updates the record but keeps the wait open, so a real ACK
         # can still arrive — and if it doesn't, the timeout drives a retry.
-        # Marshal onto the future's OWN loop (the send loop that created it),
-        # not self.loop — they can differ when agent sessions use another loop.
+        # concurrent.futures.Future.set_result is thread-safe (pubsub thread OK).
         if (
             snapshot is not None
             and applied_status in (AckStatus.ACK, AckStatus.NAK)
             and future
             and not future.done()
         ):
-            self._schedule_on_loop(
-                future.get_loop(),
-                self._set_ack_future_result,
-                future,
-                snapshot,
-                what=f"ACK future resolve packet_id={pkt_id}",
-            )
+            self._set_ack_future_result(future, snapshot)
 
         if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
@@ -2067,19 +2644,29 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 pkt_id,
             )
 
-    def _set_ack_future_result(self, future: asyncio.Future, record: dict[str, Any]) -> None:
-        if not future.done():
+    def _set_ack_future_result(
+        self, future: ConcurrentFuture | asyncio.Future, record: dict[str, Any]
+    ) -> None:
+        """Complete an ACK waiter. concurrent.futures is the storage type (thread-safe).
+
+        ``done()`` then ``set_result()`` is not atomic: pubsub and disconnect can
+        both race. Swallow InvalidStateError when another thread won.
+        """
+        try:
             future.set_result(record)
+        except (ConcurrentInvalidStateError, asyncio.InvalidStateError):
+            pass
 
     async def _wait_for_ack(
         self,
         pkt_id: str,
-        future: asyncio.Future,
+        future: ConcurrentFuture,
         timeout: float,
     ) -> dict[str, Any]:
         """Wait for ACK/NACK response or mark the packet timed out."""
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            wrapped = asyncio.wrap_future(future)
+            return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
         except TimeoutError:
             with self._ack_lock:
                 record = self._pending_acks.get(pkt_id, {})
@@ -2101,7 +2688,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return record
         finally:
             with self._ack_lock:
-                self._ack_futures.pop(pkt_id, None)
+                if self._ack_futures.get(pkt_id) is future:
+                    self._ack_futures.pop(pkt_id, None)
+                self._prune_ack_history_locked()
 
     def _queue_outbound_chunk(self, chat_id: str, chunk: str) -> SendResult:
         """Enqueue a chunk while disconnected (bounded, oldest-first eviction)."""
@@ -2114,84 +2703,84 @@ class MeshtasticAdapter(BasePlatformAdapter):
         logger.info("Outbound connection down. Message successfully queued.")
         return SendResult(success=True, message_id="queued")
 
-    def _send_text_locked(
+    def _send_text_serialized(
         self,
         *,
+        lifecycle_id: int,
         dest: str,
         content: str,
         parts: list[str],
         reply_id: int | None,
         ack_callback: Callable[..., Any],
     ) -> tuple[str | None, Any, str]:
-        """Select an interface and call sendText under ``_transport_lock``.
+        """Select an interface and call sendText on the single transport worker.
 
         Returns ``(error, packet, dest)``. ``error`` is a short machine token:
-        ``no_iface``, ``no_pubkey``, or None on success. Holding the lock for the
-        full select+send path serializes concurrent agent-session sends and
+        ``no_iface``, ``no_pubkey``, or None on success. The worker serializes
+        concurrent agent-session sends and
         platform reconnect/close against Meshtastic's unsynchronized packet-id /
         response-handler / TX-queue state.
         """
-        # Only worker threads enter this lock. Map access remains a short
-        # _iface_lock section, so event loops never block behind sendText.
-        with self._transport_lock:
-            with self._iface_lock:
-                ifaces = list(self._interfaces.values())
-                if not ifaces:
-                    return "no_iface", None, dest
+        with self._iface_lock:
+            if lifecycle_id != self._lifecycle_id or not self._running:
+                return "no_iface", None, dest
+            ifaces = list(self._interfaces.values())
+            if not ifaces:
+                return "no_iface", None, dest
 
-            iface = ifaces[0]
-            if dest.startswith("!"):
-                node_info = None
-                for current_iface in ifaces:
-                    nodes = getattr(current_iface, "nodes", None) or {}
-                    # Exact key first, then case-insensitive scan of the node DB.
-                    if dest in nodes:
+        iface = ifaces[0]
+        if dest.startswith("!"):
+            node_info = None
+            for current_iface in ifaces:
+                nodes = getattr(current_iface, "nodes", None) or {}
+                # Exact key first, then case-insensitive scan of the node DB.
+                if dest in nodes:
+                    iface = current_iface
+                    node_info = nodes[dest]
+                    break
+                dest_bare = dest.lstrip("!")
+                for nid, ninfo in nodes.items():
+                    if str(nid).lower().lstrip("!") == dest_bare:
                         iface = current_iface
-                        node_info = nodes[dest]
+                        node_info = ninfo
+                        dest = str(nid)  # use the library's key form for sendText
                         break
-                    dest_bare = dest.lstrip("!")
-                    for nid, ninfo in nodes.items():
-                        if str(nid).lower().lstrip("!") == dest_bare:
-                            iface = current_iface
-                            node_info = ninfo
-                            dest = str(nid)  # use the library's key form for sendText
-                            break
-                    if node_info is not None:
-                        break
-                if node_info is not None and not node_info.get("user", {}).get("publicKey"):
-                    return "no_pubkey", None, dest
-                pkt = iface.sendText(
-                    text=content,
-                    destinationId=dest,
-                    wantAck=True,
-                    onResponse=ack_callback,
-                    replyId=reply_id,
-                )
-                return None, pkt, dest
-
-            channel_index = 0
-            channel_name_or_index = parts[2] if len(parts) > 2 else "0"
-            if channel_name_or_index.isdigit():
-                channel_index = int(channel_name_or_index)
-            else:
-                for current_iface in ifaces:
-                    if hasattr(current_iface, "localNode") and hasattr(
-                        current_iface.localNode, "channels"
-                    ):
-                        for ch in current_iface.localNode.channels:
-                            ch_name = self._channel_field(ch, "name")
-                            if ch_name and ch_name.lower() == channel_name_or_index.lower():
-                                iface = current_iface
-                                channel_index = self._channel_field(ch, "index") or 0
-                                break
+                if node_info is not None:
+                    break
+            if node_info is not None and not node_info.get("user", {}).get("publicKey"):
+                return "no_pubkey", None, dest
             pkt = iface.sendText(
                 text=content,
-                channelIndex=channel_index,
+                destinationId=dest,
                 wantAck=True,
                 onResponse=ack_callback,
                 replyId=reply_id,
             )
             return None, pkt, dest
+
+        channel_index = 0
+        channel_name_or_index = parts[2] if len(parts) > 2 else "0"
+        if channel_name_or_index.isdigit():
+            channel_index = int(channel_name_or_index)
+        else:
+            for current_iface in ifaces:
+                if hasattr(current_iface, "localNode") and hasattr(
+                    current_iface.localNode, "channels"
+                ):
+                    for ch in current_iface.localNode.channels:
+                        ch_name = self._channel_field(ch, "name")
+                        if ch_name and ch_name.lower() == channel_name_or_index.lower():
+                            iface = current_iface
+                            channel_index = self._channel_field(ch, "index") or 0
+                            break
+        pkt = iface.sendText(
+            text=content,
+            channelIndex=channel_index,
+            wantAck=True,
+            onResponse=ack_callback,
+            replyId=reply_id,
+        )
+        return None, pkt, dest
 
     async def _send_chunk(
         self,
@@ -2205,7 +2794,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Helper to send a single wrapped chunk, queueing it on failure/disconnect."""
         # Fast path under _iface_lock (map presence only). _send_immediate
-        # re-checks under _transport_lock around sendText so a disconnect
+        # re-checks on the serialized transport worker so a disconnect
         # between these cannot send on a closed interface without surfacing
         # no_iface for queueing.
         if not self._has_interfaces():
@@ -2246,6 +2835,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         reply_id: int | None = None,
     ) -> SendResult:
         """Dispatch one text chunk immediately to the interface."""
+        send_token: object | None = None
         try:
             parts = chat_id.split(":", 2)
             if len(parts) < 2:
@@ -2257,37 +2847,108 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if dest.startswith("!"):
                 dest = self._normalize_node_id(dest) or dest
 
-            loop = asyncio.get_running_loop()
-            ack_callback = self._make_ack_callback(dest, content)
+            send_token = object()
             with self._lifecycle_lock:
                 executor = self._transport_executor
+                lifecycle_id = self._lifecycle_id
             if executor is None:
                 return SendResult(success=False, error="No active interfaces connected")
+            with self._ack_lock:
+                self._ack_inflight_tokens[send_token] = lifecycle_id
+            ack_callback = self._make_ack_callback_for_send(dest, content, send_token, lifecycle_id)
             try:
-                err, pkt, dest = await loop.run_in_executor(
-                    executor,
-                    lambda: self._send_text_locked(
-                        dest=dest,
-                        content=content,
-                        parts=parts,
-                        reply_id=reply_id,
-                        ack_callback=ack_callback,
-                    ),
+                err, pkt, dest = await asyncio.wrap_future(
+                    executor.submit(
+                        lambda: self._send_text_serialized(
+                            lifecycle_id=lifecycle_id,
+                            dest=dest,
+                            content=content,
+                            parts=parts,
+                            reply_id=reply_id,
+                            ack_callback=ack_callback,
+                        )
+                    )
                 )
             except RuntimeError as exc:
                 if "cannot schedule new futures after shutdown" in str(exc).lower():
+                    with self._ack_lock:
+                        self._ack_inflight_tokens.pop(send_token, None)
+                        self._early_ack_packets.pop(send_token, None)
                     return SendResult(success=False, error="No active interfaces connected")
                 raise
+            with self._lifecycle_lock:
+                stale_lifecycle = lifecycle_id != self._lifecycle_id or not self._running
+            # Inspect definitive pre-send failures before lifecycle turnover.
+            # In particular, a stale-generation worker returns no_iface before
+            # sendText, which lets _send_chunk safely queue a non-ACK message.
             if err == "no_iface":
+                with self._ack_lock:
+                    self._ack_inflight_tokens.pop(send_token, None)
+                    self._early_ack_packets.pop(send_token, None)
                 return SendResult(success=False, error="No active interfaces connected")
             if err == "no_pubkey":
+                with self._ack_lock:
+                    self._ack_inflight_tokens.pop(send_token, None)
+                    self._early_ack_packets.pop(send_token, None)
                 return SendResult(
                     success=False,
                     error=f"Target node {dest} has no public key; direct message cannot be encrypted",
                 )
-
+            if stale_lifecycle:
+                with self._ack_lock:
+                    self._ack_inflight_tokens.pop(send_token, None)
+                    self._early_ack_packets.pop(send_token, None)
+                pkt_id = self._extract_packet_id(pkt)
+                # Note: deliberately NOT stored in _pending_acks/_ack_responses.
+                # A stale-lifecycle send must not pollute the new lifecycle's ACK
+                # bookkeeping (an old worker returning after reconnect cannot
+                # enter new ACK state). The outcome is surfaced only via this
+                # SendResult's raw_response.
+                ack_record = {
+                    "dest": dest,
+                    "bytes": len(content.encode("utf-8")),
+                    "status": AckStatus.TIMEOUT,
+                    "error_reason": "DISCONNECTED",
+                    "response_at": time.time(),
+                }
+                error = (
+                    f"Meshtastic disconnected while waiting for ACK on packet {pkt_id}"
+                    if wait_for_ack and pkt_id
+                    else "Meshtastic disconnected while transport send was in progress"
+                )
+                return SendResult(
+                    success=False,
+                    message_id=pkt_id,
+                    error=error,
+                    raw_response={
+                        "packet_id": pkt_id,
+                        "dest": dest,
+                        "ack_requested": True,
+                        "ack_waited": wait_for_ack,
+                        "ack_timeout": ack_timeout if wait_for_ack else None,
+                        "ack": ack_record,
+                    },
+                )
             pkt_id = self._extract_packet_id(pkt)
-            ack_future = self._track_pending_ack(pkt_id, dest, content, create_future=wait_for_ack)
+            ack_future = self._track_pending_ack(
+                pkt_id,
+                dest,
+                content,
+                create_future=wait_for_ack,
+                send_token=send_token,
+            )
+            with self._ack_lock:
+                self._ack_inflight_tokens.pop(send_token, None)
+                early_ack = self._early_ack_packets.pop(send_token, None)
+            if early_ack is not None:
+                early_packet, early_dest, early_content, early_lifecycle = early_ack
+                self._record_ack_response(
+                    early_packet,
+                    early_dest,
+                    early_content,
+                    send_token=send_token,
+                    lifecycle_id=early_lifecycle,
+                )
             logger.info(
                 "Meshtastic chunk queued: dest=%s packet_id=%s bytes=%d text=%r",
                 dest,
@@ -2356,6 +3017,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"Failed to deliver message immediately: {e}", exc_info=True)
             return SendResult(success=False, error=str(e))
+        finally:
+            if send_token is not None:
+                with self._ack_lock:
+                    self._ack_inflight_tokens.pop(send_token, None)
+                    self._early_ack_packets.pop(send_token, None)
 
     async def edit_message(
         self,

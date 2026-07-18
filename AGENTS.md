@@ -2,8 +2,7 @@
 
 Compact guidance for AI agents working in this repo. Deep architecture
 (inbound/outbound paths, connection lifecycle, freshness overlay) is in
-`CLAUDE.md` — read it. **This file supersedes `CLAUDE.md` where they differ**:
-CLAUDE.md's command paths and the "237 byte" figure are dated (corrected below).
+`CLAUDE.md` — read it alongside this file.
 
 ## Setup gotcha: where the tooling actually lives
 
@@ -11,9 +10,8 @@ CLAUDE.md's command paths and the "237 byte" figure are dated (corrected below).
   repo's `.venv`** (uv-managed; no `pip` inside). Use `.venv/bin/python` for all
   local commands.
 - **The Hermes venv `~/.hermes/hermes-agent/venv/bin/python` does NOT have
-  `ruff`/`pyrefly`/`coverage`** — CLAUDE.md's commands point there and fail with
-  "No module named ruff". (CI instead `pip install`s `requirements-dev.txt` into
-  its `actions/setup-python` interpreter.)
+  `ruff`/`pyrefly`/`coverage`**. CI instead `pip install`s
+  `requirements-dev.txt` into its `actions/setup-python` interpreter.
 - **`gateway.*` is NOT in this repo** — import failures without Hermes on
   `sys.path` are expected, not a bug. The `.venv` resolves it locally via
   `~/.hermes/hermes-agent`; CI checks out `NousResearch/hermes-agent` into
@@ -53,12 +51,11 @@ The source list in `[tool.coverage.run]` is
 **`meshtastic_tools`, not `tools`** (see the dynamic-load convention below).
 `coverage run -m unittest ...` reads this config; no `--source` flag needed.
 
-## Payload ceiling is 233, not 237
+## Payload ceiling is 233 bytes
 
 `mesh_pb2.Constants.DATA_PAYLOAD_LEN == 233`; `sendData` raises above it.
 `MAX_MESSAGE_LENGTH = 233` and `_chunk_message` clamps `MESHTASTIC_CHUNK_BYTES`
-to it. CLAUDE.md still quotes "237" (the LoRa *frame* size, not the app payload)
-— ignore that figure.
+to it.
 
 ## Conventions that cause silent failures if broken
 
@@ -78,24 +75,24 @@ to it. CLAUDE.md still quotes "237" (the LoRa *frame* size, not the app payload)
   - **Platform loop** (`self.loop`, set in `connect()`): owns `_incoming_queue`,
     reconnect/drain tasks, and the pubsub→queue bridge. Inbound **must** always
     schedule onto `self.loop` — never onto a send loop.
-  - **Send/ACK loop** (`_awaiting_loop()` / `future.get_loop()`): agent-session
-    `send()` may run on a *different* loop than `connect()`. ACK futures are
-    created on the awaiting loop and resolved via
-    `_schedule_on_loop(future.get_loop(), ...)`. Binding them to `self.loop`
-    and awaiting on the send loop raises
-    `ValueError: future belongs to a different loop` (message delivered, tool
-    reports failure).
+  - **Send/ACK waiters**: stored as `concurrent.futures.Future` (thread-safe
+    `set_result` from pubsub or disconnect on any loop). Callers await
+    `asyncio.wrap_future(...)` on the send loop. Do not store bare
+    `asyncio.Future` in `_ack_futures` — that reintroduces cross-loop settle
+    failures when the awaiter's loop is not running.
   - **Transport serialization**: `_iface_lock` protects only short
     `_interfaces` map operations. Slow `sendText`/`close`/liveness calls run on
-    executor threads under `_transport_lock`; never acquire a contended
-    transport lock on an event-loop thread. Concurrent sessions + queue drain +
-    reconnect would otherwise race packet ids / response handlers / TX queue.
-    ACK waiters stay on the send loop; only transport I/O is serialized.
-  - **Disconnect** settles pending ACK futures via `_fail_pending_acks` so
-    foreign-loop waiters do not sit until the full ACK timeout.
-  - Helpers: `_awaiting_loop()`, `_schedule_on_loop(loop, cb, *args, what=...)`
-    (logs + returns False when the target loop is missing/not running/closed
-    mid-schedule).
+    the lifecycle-scoped single daemon transport worker. Never run Meshtastic
+    close on the event-loop thread.
+  - **Disconnect** settles pending ACKs via `_fail_pending_acks`, concurrent
+    callers poll the shared completion future (no default-executor wait —
+    avoids pool deadlock). Bounds cancelled-open wait (`MESHTASTIC_OPEN_CANCEL_TIMEOUT`,
+    `0` = abandon immediately) and close/executor drain
+    (`MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT`). Transport worker is a **daemon**
+    thread so a stuck open cannot pin process exit.
+  - Helpers: `_schedule_on_loop` (inbound queue only),
+    `_set_ack_future_result` (any thread; swallows InvalidStateError races),
+    `_cancel_task_threadsafe` (cancels foreign-loop tasks via `call_soon_threadsafe`).
 - **Dual imports everywhere**: `try: from . import x / except ImportError: import x`
   so the plugin works both as a package (in Hermes) and flat modules (in tests).
 - **Adapter↔tools link is a module-level singleton** (`tools.set_adapter` /
