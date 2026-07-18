@@ -126,6 +126,47 @@ def retry_backoff() -> float:
         return 5.0
 
 
+def is_retriable_failure(result: SendResult) -> bool:
+    """Decide whether a failed chunk send is worth re-sending.
+
+    Retry only on **evidence of non-delivery**, so a lost message gets
+    another chance without flooding the mesh with duplicates:
+
+    * ``TIMEOUT`` — nothing came back at all.
+    * non-permanent ``NAK`` — e.g. ``MAX_RETRANSMIT``, the firmware's own
+      "reliable send failed" verdict after its ``NUM_RELIABLE_RETX`` tries.
+
+    An ``IMPLICIT_ACK`` is deliberately **not** retried: a relay rebroadcast
+    our packet, so the mesh carried it and non-delivery is not established —
+    the destination's real ACK may still arrive (``_maybe_record_pubsub_ack``
+    upgrades the record if it does). Retrying on implicit re-sent one reply
+    many times on a relayed path, since every copy actually reached the user
+    (each app attempt is ~3 radio transmissions).
+
+    Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
+    record and are never retried — re-sending can't fix them.
+    """
+    ack = (result.raw_response or {}).get("ack")
+    if not isinstance(ack, dict):
+        return False
+    status = ack.get("status")
+    reason = str(ack.get("error_reason") or "").upper()
+    # Adapter teardown — do not retry into a closed transport.
+    if reason == "DISCONNECTED":
+        return False
+    # Adapter-internal synthetic NAK: the packet id collided with an
+    # in-flight waiter. The chunk was already transmitted by sendText before
+    # the collision was detected, so retrying would duplicate it on-air.
+    # Fail safe and leave delivery to the (already sent) original packet.
+    if reason == "DUPLICATE_PACKET_ID":
+        return False
+    if status == AckStatus.TIMEOUT:
+        return True
+    if status == AckStatus.NAK:
+        return reason not in PERMANENT_NAK_REASONS
+    return False
+
+
 class AckTracker:
     """Owns the ACK/NACK bookkeeping dicts and the lock that serializes them.
 
@@ -640,43 +681,3 @@ class AckTracker:
                 if self._ack_futures.get(pkt_id) is future:
                     self._ack_futures.pop(pkt_id, None)
                 self._prune_ack_history_locked()
-
-    def _is_retriable_failure(self, result: SendResult) -> bool:
-        """Decide whether a failed chunk send is worth re-sending.
-
-        Retry only on **evidence of non-delivery**, so a lost message gets
-        another chance without flooding the mesh with duplicates:
-
-        * ``TIMEOUT`` — nothing came back at all.
-        * non-permanent ``NAK`` — e.g. ``MAX_RETRANSMIT``, the firmware's own
-          "reliable send failed" verdict after its ``NUM_RELIABLE_RETX`` tries.
-
-        An ``IMPLICIT_ACK`` is deliberately **not** retried: a relay rebroadcast
-        our packet, so the mesh carried it and non-delivery is not established —
-        the destination's real ACK may still arrive (``_maybe_record_pubsub_ack``
-        upgrades the record if it does). Retrying on implicit re-sent one reply
-        many times on a relayed path, since every copy actually reached the user
-        (each app attempt is ~3 radio transmissions).
-
-        Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
-        record and are never retried — re-sending can't fix them.
-        """
-        ack = (result.raw_response or {}).get("ack")
-        if not isinstance(ack, dict):
-            return False
-        status = ack.get("status")
-        reason = str(ack.get("error_reason") or "").upper()
-        # Adapter teardown — do not retry into a closed transport.
-        if reason == "DISCONNECTED":
-            return False
-        # Adapter-internal synthetic NAK: the packet id collided with an
-        # in-flight waiter. The chunk was already transmitted by sendText before
-        # the collision was detected, so retrying would duplicate it on-air.
-        # Fail safe and leave delivery to the (already sent) original packet.
-        if reason == "DUPLICATE_PACKET_ID":
-            return False
-        if status == AckStatus.TIMEOUT:
-            return True
-        if status == AckStatus.NAK:
-            return reason not in PERMANENT_NAK_REASONS
-        return False
