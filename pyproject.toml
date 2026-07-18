@@ -29,6 +29,10 @@ ignore = [
     # Tests patch sys.path before importing Hermes and local plugin modules.
     "E402",
 ]
+"test_ack_state.py" = [
+    # Test patches sys.path before importing the gateway and local plugin modules.
+    "E402",
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -38,7 +42,7 @@ line-ending = "auto"
 [tool.coverage.run]
 # tools.py is loaded dynamically as `meshtastic_tools` (see test_meshtastic.py
 # and adapter._load_tools_module) to avoid colliding with Hermes' `tools` pkg.
-source = ["adapter", "meshtastic_tools", "telemetry_db", "schemas"]
+source = ["adapter", "ack_state", "chunking", "meshtastic_tools", "mock_interface", "node_freshness", "telemetry_db", "schemas", "transport"]
 branch = false
 
 [tool.coverage.report]
@@ -57,9 +61,14 @@ exclude_lines = [
 # adapter.py / tools.py.
 project-includes = [
     "adapter.py",
+    "ack_state.py",
+    "chunking.py",
+    "mock_interface.py",
+    "node_freshness.py",
     "schemas.py",
     "telemetry_db.py",
     "tools.py",
+    "transport.py",
 ]
 project-excludes = [
     "/.git",
