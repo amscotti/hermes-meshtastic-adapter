@@ -1142,9 +1142,18 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         executor = self._transport_executor
                     if executor is None:
                         break
-                    open_cf = executor.submit(
-                        lambda t=target, lid=lifecycle_id: self._open_and_register_interface(t, lid)
-                    )
+                    try:
+                        open_cf = executor.submit(
+                            lambda t=target, lid=lifecycle_id: self._open_and_register_interface(
+                                t, lid
+                            )
+                        )
+                    except RuntimeError as exc:
+                        # Executor shutdown mid-teardown — not a connection
+                        # failure, so no backoff/retry: just exit the loop.
+                        if "cannot schedule new futures after shutdown" in str(exc).lower():
+                            break
+                        raise
                     try:
                         iface = await self._await_concurrent_future(open_cf)
                     except asyncio.CancelledError:
@@ -1460,6 +1469,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     detached = list(self._interfaces.items())
                     self._interfaces.clear()
                 if detached:
+                    # Accumulate (do NOT clear on supersede): a follower task
+                    # continuing this same teardown epoch must close what any
+                    # superseded owner detached. The list is only cleared when
+                    # an owner actually settles completion. Double-close cannot
+                    # occur — _disconnect_close_started gates who runs close.
                     self._disconnect_interfaces.extend(detached)
                 ports = list(self._disconnect_interfaces)
                 self._fail_pending_acks(reason="DISCONNECTED")
@@ -2674,17 +2688,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 pkt_id,
             )
 
-    def _set_ack_future_result(
-        self, future: ConcurrentFuture | asyncio.Future, record: dict[str, Any]
-    ) -> None:
-        """Complete an ACK waiter. concurrent.futures is the storage type (thread-safe).
+    def _set_ack_future_result(self, future: ConcurrentFuture, record: dict[str, Any]) -> None:
+        """Complete an ACK waiter (concurrent.futures is the storage type, thread-safe).
 
         ``done()`` then ``set_result()`` is not atomic: pubsub and disconnect can
         both race. Swallow InvalidStateError when another thread won.
         """
         try:
             future.set_result(record)
-        except (ConcurrentInvalidStateError, asyncio.InvalidStateError):
+        except ConcurrentInvalidStateError:
             pass
 
     async def _wait_for_ack(

@@ -1812,6 +1812,33 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 await task
             self.assertLess(time.monotonic() - start, 0.15)
 
+    async def test_reconnect_loop_exits_quietly_on_executor_shutdown(self):
+        """Submit rejection at teardown breaks the loop without a failure log."""
+        dead = _DaemonTransportExecutor("meshtastic-test-submit-dead")
+        dead.shutdown(wait=True)
+        with patch.object(self.adapter, "_transport_executor", dead):
+            with self.assertNoLogs("adapter", level="ERROR"):
+                await asyncio.wait_for(
+                    self.adapter._reconnect_loop("gone_port", self.adapter._lifecycle_id),
+                    timeout=2,
+                )
+
+    async def test_reconnect_loop_reraises_unexpected_runtime_error(self):
+        """A non-shutdown RuntimeError from submit takes the failure path."""
+        executor = MagicMock()
+        executor.submit.side_effect = RuntimeError("something else broke")
+        with patch.object(self.adapter, "_transport_executor", executor):
+            with self.assertLogs("adapter", level="ERROR") as cm:
+                task = asyncio.create_task(
+                    self.adapter._reconnect_loop("gone_port", self.adapter._lifecycle_id)
+                )
+                await asyncio.sleep(0.1)
+                with self.adapter._lifecycle_lock:
+                    self.adapter._lifecycle_id += 1  # stale generation ends the loop
+                await asyncio.wait_for(task, timeout=2)
+
+        self.assertTrue(any("Failed to connect" in line for line in cm.output))
+
     async def test_pubsub_packet_from_detached_interface_is_ignored(self):
         """A packet from an interface no longer registered is dropped."""
         foreign_iface = SimpleNamespace()
