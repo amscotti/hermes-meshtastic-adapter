@@ -323,31 +323,6 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         # Verify handler was never called
         self.adapter.handle_message.assert_not_called()
 
-    def test_update_observed_last_heard_and_direct_signal(self):
-        """last_heard tracks rx_time; snr/rssi only from direct (0-hop) packets."""
-        self.adapter._update_observed("!aaaa1111", 1_700_000_000, 5.0, -80, 0)
-        obs = self.adapter.get_observed_node("!aaaa1111")
-        self.assertEqual(obs["last_heard"], 1_700_000_000)
-        self.assertEqual(obs["snr"], 5.0)
-        self.assertEqual(obs["rssi"], -80)
-        self.assertEqual(obs["hops_away"], 0)
-
-    def test_update_observed_relayed_packet_skips_signal(self):
-        """A relayed (hop>0) packet bumps last_heard but not snr/rssi."""
-        self.adapter._update_observed("!bbbb2222", None, 3.0, -90, 2)
-        obs = self.adapter.get_observed_node("!bbbb2222")
-        self.assertGreater(obs["last_heard"], 0)
-        self.assertEqual(obs["hops_away"], 2)
-        self.assertNotIn("snr", obs)  # relay metrics belong to the last hop
-        self.assertNotIn("rssi", obs)
-
-    def test_update_observed_future_rxtime_clamped(self):
-        """A future rx_time (clock skew) is clamped to now."""
-        self.adapter._update_observed("!cccc3333", time.time() + 10_000, None, None, None)
-        self.assertLessEqual(
-            self.adapter.get_observed_node("!cccc3333")["last_heard"], time.time() + 1
-        )
-
     async def test_unauthorized_node_still_observed(self):
         """An unauthorized node is filtered from Hermes but still tracked (watch-only)."""
         packet = {
@@ -377,15 +352,6 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             node["last_heard"], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fresher))
         )
-
-    def test_observed_overlay_is_size_bounded(self):
-        """The observed overlay evicts the stalest entry past its cap."""
-        self.adapter.OBSERVED_NODE_LIMIT = 3
-        for i in range(10):
-            self.adapter._update_observed(f"!n{i:07d}", 1_700_000_000 + i, None, None, None)
-        self.assertLessEqual(len(self.adapter._node_observed), 3)
-        self.assertIn("!n0000009", self.adapter._node_observed)  # newest kept
-        self.assertNotIn("!n0000000", self.adapter._node_observed)  # stalest evicted
 
     async def test_payload_splitting_on_send(self):
         """Verify outbound messages above the 233-byte ceiling are split."""
@@ -600,33 +566,6 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             )
         reconstructed = "".join(call[1]["text"].split("] ", 1)[1] for call in calls)
         self.assertEqual(reconstructed, long_emoji_msg)
-
-    def test_mixed_ascii_emoji_chunk_reconstruction(self):
-        """Verify mixed ASCII and emoji chunks reconstruct without dropping spaces."""
-        message = ("status update " * 30) + ("💩" * 40) + " final words"
-        chunks = self.adapter._chunk_message(message)
-
-        self.assertGreater(len(chunks), 1)
-        for chunk in chunks:
-            self.assertLessEqual(len(chunk.encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH)
-
-        reconstructed = "".join(chunk.split("] ", 1)[1] for chunk in chunks)
-        self.assertEqual(reconstructed, message)
-
-    def test_default_chunk_budget_is_conservative(self):
-        """With no override, chunks stay within the conservative default budget.
-
-        The raw protocol ceiling is 233 bytes, but that leaves no room for
-        encrypted-DM (PKI) overhead — the radio NAKs oversized DM chunks with
-        TOO_LARGE — so the default must be lower.
-        """
-        self.assertEqual(self.adapter.DEFAULT_CHUNK_BYTES, 170)
-        self.assertEqual(self.adapter.MAX_MESSAGE_LENGTH, 233)
-        # setUp leaves MESHTASTIC_CHUNK_BYTES blank → default budget applies.
-        chunks = self.adapter._chunk_message("A" * 400)
-        self.assertGreater(len(chunks), 1)
-        for chunk in chunks:
-            self.assertLessEqual(len(chunk.encode("utf-8")), self.adapter.DEFAULT_CHUNK_BYTES)
 
     def test_declares_native_chunking(self):
         """The adapter chunks in send(), so the gateway must not truncate payloads."""
@@ -938,59 +877,6 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(res.success)
         self.assertEqual(iface.sendText.call_count, 1)  # single attempt, no retry
-
-    def test_is_retriable_failure_classification(self):
-        """Only ACK-observed transient failures are retriable."""
-        from gateway.platforms.base import SendResult
-
-        def r(ack):
-            return SendResult(success=False, raw_response={"ack": ack} if ack else None)
-
-        self.assertTrue(self.adapter._is_retriable_failure(r({"status": AckStatus.TIMEOUT})))
-        self.assertTrue(
-            self.adapter._is_retriable_failure(
-                r({"status": AckStatus.NAK, "error_reason": "NO_ROUTE"})
-            )
-        )
-        self.assertFalse(
-            self.adapter._is_retriable_failure(
-                r({"status": AckStatus.NAK, "error_reason": "TOO_LARGE"})
-            )
-        )
-        # PKI / auth failures are permanent — re-sending can't fix a key problem.
-        for reason in (
-            "PKI_FAILED",
-            "PKI_UNKNOWN_PUBKEY",
-            "PKI_SEND_FAIL_PUBLIC_KEY",
-            "ADMIN_PUBLIC_KEY_UNAUTHORIZED",
-            "NOT_AUTHORIZED",
-            "DUTY_CYCLE_LIMIT",
-            "RATE_LIMIT_EXCEEDED",
-        ):
-            self.assertFalse(
-                self.adapter._is_retriable_failure(
-                    r({"status": AckStatus.NAK, "error_reason": reason})
-                ),
-                f"{reason} should be permanent",
-            )
-        self.assertFalse(self.adapter._is_retriable_failure(r({"status": AckStatus.ACK})))
-        self.assertTrue(self.adapter._is_retriable_failure(r({"status": AckStatus.IMPLICIT_ACK})))
-        # Plain strings still match (StrEnum + public JSON surface).
-        self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
-        self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
-        # Disconnect-settled waiters must not spin retries against a closed radio.
-        self.assertFalse(
-            self.adapter._is_retriable_failure(
-                r({"status": AckStatus.TIMEOUT, "error_reason": "DISCONNECTED"})
-            )
-        )
-        # Adapter-internal collision NAK: the chunk was already transmitted, so
-        # retrying would duplicate it on-air.
-        self.assertFalse(
-            self.adapter._is_retriable_failure(
-                r({"status": AckStatus.NAK, "error_reason": "DUPLICATE_PACKET_ID"})
-            )
-        )
 
     async def test_real_ack_from_destination_is_delivery(self):
         """A routing ACK whose sender IS the destination confirms real delivery."""
@@ -2768,43 +2654,6 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         event = self.adapter.handle_message.call_args[0][0]
         self.assertEqual(event.reply_to_message_id, "7788")
 
-    def test_chunk_bytes_clamped_to_protocol_ceiling(self):
-        """MESHTASTIC_CHUNK_BYTES above the 233-byte ceiling is clamped down."""
-        # A single-chunk payload (<= default 170) is unaffected by the override.
-        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "500"}):
-            chunks = self.adapter._chunk_message("short message")
-        self.assertEqual(chunks, ["short message"])
-        # A long payload over 233 bytes must still split — never a single 500-byte chunk.
-        long = "y" * 400
-        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "500"}):
-            chunks = self.adapter._chunk_message(long)
-        self.assertGreater(len(chunks), 1)
-        for c in chunks:
-            self.assertLessEqual(len(c.encode("utf-8")), self.adapter.MAX_MESSAGE_LENGTH)
-
-    def test_chunk_bytes_garbage_falls_back_to_default(self):
-        """A non-numeric MESHTASTIC_CHUNK_BYTES falls back to the default, not crash."""
-        long = "z" * 400  # exceeds the 170 default, so it must still split
-        with patch.dict(os.environ, {"MESHTASTIC_CHUNK_BYTES": "not-a-number"}):
-            chunks = self.adapter._chunk_message(long)
-        self.assertGreater(len(chunks), 1)
-        for c in chunks:
-            self.assertLessEqual(len(c.encode("utf-8")), self.adapter.DEFAULT_CHUNK_BYTES)
-
-    def test_split_utf8_handles_no_whitespace_and_multibyte(self):
-        """_split_utf8 splits long runs without spaces and respects UTF-8 boundaries."""
-        # No whitespace: must still split by byte budget (char_idx<=0 path never trips).
-        no_ws = "x" * 500
-        parts = self.adapter._split_utf8(no_ws, 50)
-        self.assertTrue(len(parts) > 1)
-        self.assertEqual("".join(parts), no_ws)
-        # Multi-byte: a split point must never land inside a UTF-8 character.
-        multibyte = "日本語" * 50  # 3 bytes/char
-        parts = self.adapter._split_utf8(multibyte, 20)
-        self.assertEqual("".join(parts), multibyte)
-        for p in parts:
-            p.encode("utf-8")  # each part is valid UTF-8 on its own
-
     async def test_outbound_queue_evicts_oldest_when_disconnected(self):
         """With no interfaces, sends queue (bounded at 100) and evict oldest-first."""
         self.adapter._interfaces.clear()
@@ -3239,7 +3088,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
 
     def test_discover_serial_ports_prefers_meshtastic_findPorts(self):
         """auto discovery should use meshtastic.util.findPorts when available."""
-        with patch("adapter.HAS_MESHTASTIC", True):
+        with patch("transport.HAS_MESHTASTIC", True):
             with patch(
                 "meshtastic.util.findPorts", return_value=["/dev/cu.usbserial-mesh"]
             ) as find_ports:

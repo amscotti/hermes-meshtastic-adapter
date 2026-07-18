@@ -9,22 +9,14 @@ import asyncio
 import importlib
 import logging
 import os
-import queue
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
-from contextlib import ExitStack
 from datetime import datetime
-from enum import StrEnum
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any, cast
-
-try:
-    import serial.tools.list_ports
-except ImportError:  # pragma: no cover - optional dependency in tests
-    serial = None
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -35,189 +27,50 @@ from gateway.platforms.base import (
 )
 
 try:
+    from . import ack_state
+except ImportError:
+    import ack_state
+
+try:
     from . import telemetry_db
 except ImportError:
     import telemetry_db
 
+try:
+    from . import chunking
+except ImportError:
+    import chunking
+
+try:
+    from . import mock_interface
+except ImportError:
+    import mock_interface
+
+try:
+    from . import node_freshness
+except ImportError:
+    import node_freshness
+
+try:
+    from . import transport
+except ImportError:
+    import transport
+
 logger = logging.getLogger(__name__)
 
+HAS_MESHTASTIC = transport.HAS_MESHTASTIC
+pub = transport.pub
+DEFAULT_TCP_PORT = transport.DEFAULT_TCP_PORT
+_DaemonTransportExecutor = transport._DaemonTransportExecutor
 
-class _DaemonTransportExecutor:
-    """Single-worker daemon thread for blocking Meshtastic I/O.
-
-    Daemon so a stuck open/close cannot pin process exit. Callers await via
-    ``asyncio.wrap_future(executor.submit(...))``.
-    """
-
-    def __init__(self, name: str = "meshtastic-transport") -> None:
-        self._jobs: queue.Queue[
-            tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any], ConcurrentFuture] | None
-        ] = queue.Queue()
-        self._closed = False
-        self._state_lock = threading.Lock()
-        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
-        self._thread.start()
-
-    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> ConcurrentFuture:
-        fut: ConcurrentFuture = ConcurrentFuture()
-        # Check + enqueue atomically with shutdown's sentinel. Every accepted
-        # job is therefore before the sentinel and cannot be stranded behind it.
-        with self._state_lock:
-            if self._closed:
-                raise RuntimeError("cannot schedule new futures after shutdown")
-            self._jobs.put((fn, args, kwargs, fut))
-        return fut
-
-    def _run(self) -> None:
-        while True:
-            item = self._jobs.get()
-            if item is None:
-                return
-            fn, args, kwargs, fut = item
-            if not fut.set_running_or_notify_cancel():
-                continue
-            try:
-                result = fn(*args, **kwargs)
-            except BaseException as exc:
-                try:
-                    fut.set_exception(exc)
-                except ConcurrentInvalidStateError:
-                    pass
-            else:
-                try:
-                    fut.set_result(result)
-                except ConcurrentInvalidStateError:
-                    pass
-
-    def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
-        """Stop accepting work. Optionally join the worker for up to ``timeout``."""
-        with self._state_lock:
-            if not self._closed:
-                self._closed = True
-                self._jobs.put(None)
-        if wait:
-            self._thread.join(timeout)
-
-    def is_alive(self) -> bool:
-        return self._thread.is_alive()
-
-
-# --- Lazy/Conditional Imports for Meshtastic & PubSub ---
-try:
-    import meshtastic
-    import meshtastic.serial_interface
-    import meshtastic.tcp_interface
-    from pubsub import pub
-
-    HAS_MESHTASTIC = True
-except ImportError:
-    HAS_MESHTASTIC = False
-    pub = None
-
-# Default Meshtastic TCP API port exposed by WiFi/Ethernet-capable nodes.
-DEFAULT_TCP_PORT = 4403
-
-
-class AckStatus(StrEnum):
-    """Lifecycle of an outbound chunk's ACK bookkeeping.
-
-    Stored on ACK records as these string values (``StrEnum`` serializes to the
-    value), so ``SendResult.raw_response`` / ``get_ack_status`` stay JSON-friendly
-    and backward-compatible with plain-string consumers.
-
-    ``ACK`` is a real end-to-end confirmation (routing ACK sender == destination).
-    ``IMPLICIT_ACK`` is a relay-only confirmation (official client DELIVERED vs
-    RECEIVED) — not delivery for our purposes.
-    """
-
-    PENDING = "pending"
-    ACK = "ack"
-    IMPLICIT_ACK = "implicit_ack"
-    NAK = "nak"
-    TIMEOUT = "timeout"
+# ACK bookkeeping state machine lives in ack_state; AckStatus is re-exported
+# here so existing imports from adapter keep resolving.
+AckStatus = ack_state.AckStatus
 
 
 # --- Mock Implementation for Testing / Dry Run ---
-class MockLocalNode:
-    def __init__(self, interface):
-        self.interface = interface
-        self.nodeId = "!da1b1613"
-        self.channels = [
-            {"index": 0, "name": "Primary", "psk": "AES128"},
-            {"index": 1, "name": "Telemetry", "psk": "AES128"},
-        ]
-
-
-class MockSerialInterface:
-    """Mock Meshtastic interface that simulates hardware behaviour."""
-
-    def __init__(self, devPath=None, noProto=True):
-        self.devPath = devPath or "mock_port"
-        self.nodes = {
-            "!da1b1613": {
-                "num": 3659208211,
-                "user": {
-                    "id": "!da1b1613",
-                    "longName": "Phoenix HQ",
-                    "shortName": "PHX",
-                    "hwModel": "HELTEC_V3",
-                    "role": "CLIENT_BASE",
-                    "publicKey": "mock_pub_key_hq",
-                },
-                "deviceMetrics": {
-                    "batteryLevel": 85,
-                    "voltage": 4.12,
-                    "uptimeSeconds": 1200,
-                },
-                "position": {
-                    "latitude": 42.6983,
-                    "longitude": -71.1234,
-                    "altitude": 105,
-                },
-                "snr": 8.5,
-                "rssi": -92,
-                "lastHeard": time.time(),
-            },
-            "!ab12cd34": {
-                "num": 2870135092,
-                "user": {
-                    "id": "!ab12cd34",
-                    "longName": "Park Sensor Node",
-                    "shortName": "PARK",
-                    "hwModel": "SENSECAP_T1000",
-                    "role": "SENSOR",
-                    "publicKey": "mock_pub_key_sensor",
-                },
-                "deviceMetrics": {
-                    "batteryLevel": 92,
-                    "voltage": 4.15,
-                    "uptimeSeconds": 5000,
-                },
-                "environmentMetrics": {
-                    "temperature": 22.4,
-                    "relativeHumidity": 54.2,
-                    "barometricPressure": 1013.25,
-                },
-                "snr": 5.0,
-                "rssi": -105,
-                "lastHeard": time.time() - 300,
-            },
-        }
-        self.localNode = MockLocalNode(self)
-        self.metadata = {"firmwareVersion": "2.3.15"}
-        logger.info(f"Initialized Mock Serial Connection on {self.devPath}")
-
-    def getMyNodeId(self):
-        return "!da1b1613"
-
-    def sendText(self, text, destinationId=None, channelIndex=0, **kwargs):
-        logger.info(
-            f"[Mock] Sent message to {destinationId or 'broadcast'} on channel {channelIndex}: {text}"
-        )
-        return SimpleNamespace(id=int(time.time() * 1000) & 0xFFFFFFFF)
-
-    def close(self):
-        logger.info("[Mock] Closed connection")
+MockSerialInterface = mock_interface.MockSerialInterface
+MockLocalNode = mock_interface.MockLocalNode
 
 
 class MeshtasticAdapter(BasePlatformAdapter):
@@ -226,17 +79,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
     with Hermes async message routing.
     """
 
-    # Meshtastic's raw Data payload ceiling (bytes) —
-    # mesh_pb2.Constants.DATA_PAYLOAD_LEN (233), enforced by sendData which
-    # raises above it. (The 237 figure sometimes quoted is the LoRa frame size;
-    # the usable app-payload is 233.)
-    MAX_MESSAGE_LENGTH = 233
-
-    # Default per-chunk byte budget. Even the 233 ceiling leaves no headroom for
-    # PKI/encryption overhead on direct messages — the radio NAKs oversized DM
-    # chunks with TOO_LARGE — so the out-of-the-box default is conservative and
-    # also helps multi-hop reliability. Override with MESHTASTIC_CHUNK_BYTES.
-    DEFAULT_CHUNK_BYTES = 170
+    MAX_MESSAGE_LENGTH = chunking.MAX_MESSAGE_LENGTH
+    DEFAULT_CHUNK_BYTES = chunking.DEFAULT_CHUNK_BYTES
 
     # This adapter chunks long replies natively in send() (numbered LoRa-safe
     # chunks), so the gateway delivery router must hand us the full payload
@@ -244,39 +88,127 @@ class MeshtasticAdapter(BasePlatformAdapter):
     splits_long_messages = True
 
     # Upper bound on retained ACK/NACK bookkeeping records to avoid unbounded
-    # memory growth on a long-running gateway. Oldest non-pending records evict first.
-    ACK_RECORD_LIMIT = 1000
-
-    # NAK reasons where re-sending the identical packet cannot help — retrying
-    # would only waste shared airtime. Transient failures (timeouts, no-route,
-    # max-retransmit) are NOT listed here and remain eligible for retry. See
-    # mesh_pb2.Routing.Error for the full enum. INVALID_REQUEST is intentionally
-    # absent — it is not a real Routing.Error value (BAD_REQUEST is).
-    # DUTY_CYCLE_LIMIT / RATE_LIMIT_EXCEEDED are included because our fixed
-    # retry backoff (MESHTASTIC_RETRY_BACKOFF, ~seconds) is far shorter than
-    # their reset windows (minutes); retrying would only compound the limit.
-    PERMANENT_NAK_REASONS = frozenset(
-        {
-            "TOO_LARGE",
-            "NO_CHANNEL",
-            "BAD_REQUEST",
-            "NOT_AUTHORIZED",
-            "PKI_FAILED",
-            "PKI_UNKNOWN_PUBKEY",
-            "PKI_SEND_FAIL_PUBLIC_KEY",
-            "ADMIN_PUBLIC_KEY_UNAUTHORIZED",
-            "DUTY_CYCLE_LIMIT",
-            "RATE_LIMIT_EXCEEDED",
-        }
-    )
+    # memory growth on a long-running gateway. Oldest non-pending records evict
+    # first. Aliases ack_state.ACK_RECORD_LIMIT (single source of truth); kept as
+    # a class attribute so tests can override it per-instance, and AckTracker
+    # reads it via its adapter back-reference.
+    ACK_RECORD_LIMIT = ack_state.ACK_RECORD_LIMIT
 
     # Upper bound on the per-node "observed" overlay (live last_heard / signal
-    # learned from the packet stream). Stalest entry evicts first on overflow.
-    OBSERVED_NODE_LIMIT = 2048
-
     @property
     def message_len_fn(self):
         return lambda text: len(str(text).encode("utf-8"))
+
+    # --- ACK state delegates -------------------------------------------------
+    # The ACK bookkeeping dicts and _ack_lock live on self._ack_tracker
+    # (ack_state.AckTracker). send() and tests read them through these
+    # read-only properties, and the state-machine methods route through the
+    # thin delegates below. Lock acquisition order and lifecycle checks remain
+    # entirely inside AckTracker.
+
+    @property
+    def _pending_acks(self) -> dict[str, dict[str, Any]]:
+        return self._ack_tracker._pending_acks
+
+    @property
+    def _ack_responses(self) -> dict[str, dict[str, Any]]:
+        return self._ack_tracker._ack_responses
+
+    @property
+    def _ack_tokens(self) -> dict[str, object]:
+        return self._ack_tracker._ack_tokens
+
+    @property
+    def _ack_response_tokens(self) -> dict[str, object]:
+        return self._ack_tracker._ack_response_tokens
+
+    @property
+    def _ack_inflight_tokens(self) -> dict[object, int]:
+        return self._ack_tracker._ack_inflight_tokens
+
+    @property
+    def _early_ack_packets(self) -> dict[object, tuple[dict, str, str, int]]:
+        return self._ack_tracker._early_ack_packets
+
+    @property
+    def _ack_futures(self) -> dict[str, ConcurrentFuture]:
+        return self._ack_tracker._ack_futures
+
+    @property
+    def _ack_lock(self) -> threading.Lock:
+        return self._ack_tracker._ack_lock
+
+    def _maybe_record_pubsub_ack(self, packet: dict) -> bool:
+        return self._ack_tracker._maybe_record_pubsub_ack(packet)
+
+    def _track_pending_ack(
+        self,
+        pkt_id: str | None,
+        dest: str,
+        content: str,
+        *,
+        create_future: bool = False,
+        send_token: object | None = None,
+    ) -> ConcurrentFuture | None:
+        return self._ack_tracker._track_pending_ack(
+            pkt_id, dest, content, create_future=create_future, send_token=send_token
+        )
+
+    def _fail_pending_acks(self, reason: str = "DISCONNECTED") -> None:
+        self._ack_tracker._fail_pending_acks(reason)
+
+    def get_ack_status(self, packet_id: str) -> dict[str, Any] | None:
+        return self._ack_tracker.get_ack_status(packet_id)
+
+    def _make_ack_callback(self, dest: str, content: str):
+        return self._ack_tracker._make_ack_callback(dest, content)
+
+    def _make_ack_callback_for_send(
+        self,
+        dest: str,
+        content: str,
+        send_token: object | None,
+        lifecycle_id: int | None = None,
+    ):
+        return self._ack_tracker._make_ack_callback_for_send(
+            dest, content, send_token, lifecycle_id
+        )
+
+    def _record_ack_response(
+        self,
+        packet: dict,
+        dest: str,
+        content: str,
+        *,
+        send_token: object | None = None,
+        lifecycle_id: int | None = None,
+    ) -> None:
+        self._ack_tracker._record_ack_response(
+            packet, dest, content, send_token=send_token, lifecycle_id=lifecycle_id
+        )
+
+    def _set_ack_future_result(self, future: ConcurrentFuture, record: dict[str, Any]) -> None:
+        self._ack_tracker._set_ack_future_result(future, record)
+
+    async def _wait_for_ack(
+        self,
+        pkt_id: str,
+        future: ConcurrentFuture,
+        timeout: float,
+    ) -> dict[str, Any]:
+        return await self._ack_tracker._wait_for_ack(pkt_id, future, timeout)
+
+    def _is_retriable_failure(self, result: SendResult) -> bool:
+        return self._ack_tracker._is_retriable_failure(result)
+
+    def _ack_wait_config(self, metadata: dict[str, Any] | None) -> tuple[bool, float]:
+        return ack_state.ack_wait_config(metadata)
+
+    def _send_retries(self, metadata: dict[str, Any] | None) -> int:
+        return ack_state.send_retries(metadata)
+
+    def _retry_backoff(self) -> float:
+        return ack_state.retry_backoff()
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -396,7 +328,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Live-observed per-node overlay (last_heard / signal learned from the
         # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
         # node and layered over the library's node DB by the mesh_* tools.
-        self._node_observed: dict[str, dict[str, Any]] = {}
+        self._node_freshness = node_freshness.NodeFreshness()
 
         # Active hardware connections mapping: devPath -> interface.
         # _iface_lock protects only short map/state operations; slow Meshtastic
@@ -424,22 +356,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Bounded at 100 messages, oldest-first eviction
         self._outbound_queue: list[dict[str, Any]] = []
         self._queue_lock = threading.Lock()
-        self._pending_acks: dict[str, dict[str, Any]] = {}
-        self._ack_responses: dict[str, dict[str, Any]] = {}
-        # Internal generation tags prevent a reused packet id from consuming an
-        # early response that belonged to an older send.
-        self._ack_tokens: dict[str, object] = {}
-        self._ack_response_tokens: dict[str, object] = {}
-        # sendText can invoke onAckNak before returning the packet id. Stage
-        # those responses by send generation until _track_pending_ack installs
-        # the packet-id token; this also keeps stale-lifecycle callbacks out of
-        # shared ACK history.
-        self._ack_inflight_tokens: dict[object, int] = {}
-        self._early_ack_packets: dict[object, tuple[dict, str, str, int]] = {}
-        # concurrent.futures.Future: set_result is thread-safe from any thread
-        # (including disconnect on another loop). Awaiters use asyncio.wrap_future.
-        self._ack_futures: dict[str, ConcurrentFuture] = {}
-        self._ack_lock = threading.Lock()
+        # ACK/NACK tracking state machine: owns the 7 ACK dicts + _ack_lock.
+        # Exposed on the adapter via read-only property delegates below so
+        # send() and tests can keep reading self._ack_lock / self._pending_acks.
+        self._ack_tracker = ack_state.AckTracker(self)
 
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
@@ -868,47 +788,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         rssi: Any,
         hop_count: int | None,
     ) -> None:
-        """Record live packet observations for a node, keyed by node id.
-
-        Mirrors the official Meshtastic client: ``last_heard`` is refreshed from
-        the packet's ``rxTime`` on every received packet (clamped to now, so a
-        skewed clock can't push it into the future); ``snr``/``rssi`` are
-        refreshed only from **direct** (0-hop) packets, since a relayed packet's
-        link metrics belong to the last hop, not the origin node.
-
-        Runs on the loop thread (via the incoming-queue consumer), same as the
-        mesh_* tools that read it, so no locking is needed.
-        """
-        now = time.time()
-        try:
-            last_heard = min(float(rx_time), now) if rx_time else now
-        except (TypeError, ValueError):
-            last_heard = now
-
-        obs = self._node_observed.get(node_id)
-        if obs is None:
-            if len(self._node_observed) >= self.OBSERVED_NODE_LIMIT:
-                stalest = min(
-                    self._node_observed,
-                    key=lambda k: self._node_observed[k].get("last_heard", 0.0),
-                )
-                self._node_observed.pop(stalest, None)
-            obs = {}
-            self._node_observed[node_id] = obs
-
-        obs["last_heard"] = max(obs.get("last_heard", 0.0), last_heard)
-        if hop_count is not None:
-            obs["hops_away"] = hop_count
-        if hop_count == 0:  # direct packet: link metrics describe this node
-            if snr is not None:
-                obs["snr"] = snr
-            if rssi is not None:
-                obs["rssi"] = rssi
+        self._node_freshness.update(node_id, rx_time, snr, rssi, hop_count)
 
     def get_observed_node(self, node_id: str) -> dict[str, Any]:
-        """Return the live-observed overlay for a node id ({} if never heard)."""
-        obs = self._node_observed.get(node_id)
-        return dict(obs) if obs else {}
+        return self._node_freshness.get(node_id)
 
     def _get_interface_node_id(self, interface: Any) -> str | None:
         """Return the local Meshtastic node ID for an interface, if known.
@@ -1030,20 +913,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         ``_reconnect_loop`` and ``_open_interface`` — a ``tcp://host:port`` URL
         for TCP, otherwise a serial device path (or ``mock_port`` fallback).
         """
-        if self.tcp_host:
-            host = self.tcp_host
-            # Bracket bare IPv6 literals so "host:port" stays unambiguous.
-            if ":" in host and not host.startswith("["):
-                host = f"[{host}]"
-            return [f"tcp://{host}:{self.tcp_port}"]
-
-        if self.serial_port == "auto":
-            ports = self._discover_serial_ports()
-            if not ports:
-                logger.warning("No serial ports discovered. Using fallback mock interface.")
-                return ["mock_port"]
-            return ports
-        return [self.serial_port]
+        return transport.connection_targets(self.tcp_host, self.tcp_port, self.serial_port)
 
     @staticmethod
     def _parse_tcp_target(target: str) -> tuple[str, int]:
@@ -1051,27 +921,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         Handles bracketed IPv6 literals, e.g. ``tcp://[::1]:4403``.
         """
-        rest = target[len("tcp://") :]
-
-        if rest.startswith("["):
-            # Bracketed IPv6 literal: "[host]" or "[host]:port".
-            host, sep, after = rest[1:].partition("]")
-            if not sep:
-                return rest, DEFAULT_TCP_PORT
-            if after.startswith(":") and after[1:]:
-                try:
-                    return host, int(after[1:])
-                except ValueError:
-                    return host, DEFAULT_TCP_PORT
-            return host, DEFAULT_TCP_PORT
-
-        host, sep, port_str = rest.rpartition(":")
-        if not sep:
-            return rest, DEFAULT_TCP_PORT
-        try:
-            return host, int(port_str)
-        except ValueError:
-            return rest, DEFAULT_TCP_PORT
+        return transport.parse_tcp_target(target)
 
     def _open_interface(self, target: str) -> Any:
         """Open the serial/TCP interface for a connection target.
@@ -1080,18 +930,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         executor. Falls back to the mock interface when the Meshtastic libraries
         are unavailable so the plugin still loads.
         """
-        if target == "mock_port" or not HAS_MESHTASTIC:
-            if target.startswith("tcp://") and not HAS_MESHTASTIC:
-                logger.warning(
-                    "Meshtastic library not installed — falling back to the mock interface "
-                    "for TCP target %s. Install requirements.txt to reach the real node.",
-                    target,
-                )
-            return MockSerialInterface(devPath=target)
-        if target.startswith("tcp://"):
-            host, port = self._parse_tcp_target(target)
-            return meshtastic.tcp_interface.TCPInterface(hostname=host, portNumber=port)
-        return meshtastic.serial_interface.SerialInterface(devPath=target)
+        return transport.open_interface(target)
 
     def _discover_serial_ports(self) -> list[str]:
         """Discover likely Meshtastic serial devices cross-platform.
@@ -1101,35 +940,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         gadget on the host. Fall back to pyserial / glob when the library is
         unavailable.
         """
-        if HAS_MESHTASTIC:
-            try:
-                import meshtastic.util as meshtastic_util
-
-                ports = list(meshtastic_util.findPorts(True) or [])
-                if ports:
-                    return ports
-            except Exception as e:
-                logger.debug("meshtastic.util.findPorts discovery failed: %s", e)
-        try:
-            if serial is not None:
-                ports = [p.device for p in serial.tools.list_ports.comports()]
-                if ports:
-                    return ports
-        except Exception as e:
-            logger.debug("serial.tools.list_ports discovery failed: %s", e)
-        # Fallback for minimal environments where pyserial list_ports is unavailable.
-        import glob
-
-        patterns = [
-            "/dev/cu.usbserial*",
-            "/dev/cu.usbmodem*",
-            "/dev/ttyUSB*",
-            "/dev/ttyACM*",
-        ]
-        ports = []
-        for pat in patterns:
-            ports.extend(glob.glob(pat))
-        return ports
+        return transport.discover_serial_ports()
 
     async def _reconnect_loop(self, target: str, lifecycle_id: int):
         """Exponential backoff reconnect loop for one connection target."""
@@ -1893,44 +1704,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"Error handling inbound Meshtastic packet: {e}", exc_info=True)
 
-    def _maybe_record_pubsub_ack(self, packet: dict) -> bool:
-        """Record a routing ACK from pubsub when it matches an outbound packet."""
-        if not isinstance(packet, dict):
-            return False
-        decoded = packet.get("decoded", {})
-        if not isinstance(decoded, dict):
-            return False
-        request_id = decoded.get("requestId")
-        if request_id is None:
-            request_id = decoded.get("request_id")
-        routing = decoded.get("routing")
-        if request_id is None or not isinstance(routing, dict):
-            return False
-        pkt_id = str(request_id)
-        with self._ack_lock:
-            record = self._pending_acks.get(pkt_id)
-            # This fallback exists for exactly one case: a DM whose first
-            # response was a relay confirmation recorded as IMPLICIT_ACK. The
-            # meshtastic library removes the onResponse handler after the first
-            # invocation, so the real end-to-end routing ACK that follows arrives
-            # only via pubsub (_on_receive) and must upgrade the record to ACK.
-            #
-            # For a still-PENDING waiter the magic-named onAckNak callback is the
-            # authoritative channel for the first response (the library invokes
-            # it for the routing ACK when wantAck + onResponse are set), so the
-            # pubsub path is intentionally *not* used there. Routing a pubsub
-            # ACK for a PENDING waiter would also risk misattributing a reused
-            # packet id. Non-waiting sends already get callback observability.
-            if (
-                record is None
-                or pkt_id not in self._ack_futures
-                or record.get("status") != AckStatus.IMPLICIT_ACK
-            ):
-                return False
-            dest = str(record.get("dest") or "")
-        self._record_ack_response(packet, dest, "")
-        return True
-
     @staticmethod
     def _first_not_none(*values: Any) -> Any:
         """Return the first value that is not None (0 / 0.0 / False are kept).
@@ -2137,147 +1910,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
             continuation_message_ids=tuple(sent_ids[1:]) if len(sent_ids) > 1 else (),
         )
 
-    def _ack_wait_config(self, metadata: dict[str, Any] | None) -> tuple[bool, float]:
-        """Return whether to wait for ACK/NACK responses and for how long."""
-        timeout_raw = os.getenv("MESHTASTIC_ACK_TIMEOUT", "0")
-        if metadata and "meshtastic_ack_timeout" in metadata:
-            timeout_raw = metadata["meshtastic_ack_timeout"]
-
-        try:
-            timeout = max(0.0, float(timeout_raw or 0))
-        except (TypeError, ValueError):
-            timeout = 0.0
-
-        wait = timeout > 0
-        if metadata and "meshtastic_wait_for_ack" in metadata:
-            wait = bool(metadata["meshtastic_wait_for_ack"])
-            if wait and timeout <= 0:
-                timeout = 30.0
-        return wait, timeout
-
-    def _send_retries(self, metadata: dict[str, Any] | None) -> int:
-        """Number of extra delivery attempts for un-ACKed chunks (0 = no retry)."""
-        raw = os.getenv("MESHTASTIC_SEND_RETRIES", "0")
-        if metadata and "meshtastic_send_retries" in metadata:
-            raw = metadata["meshtastic_send_retries"]
-        try:
-            return max(0, int(raw or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def _retry_backoff(self) -> float:
-        """Seconds to wait between delivery retries (default 5.0).
-
-        An explicit ``0`` is honored (no delay); a missing/empty/garbage value
-        falls back to the default so a misconfiguration can't remove all pacing.
-        """
-        raw = os.getenv("MESHTASTIC_RETRY_BACKOFF", "")
-        if not raw:
-            return 5.0
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return 5.0
-
-    def _is_retriable_failure(self, result: SendResult) -> bool:
-        """Decide whether a failed chunk send is worth re-sending.
-
-        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
-        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
-        interface, missing pubkey, bad chat_id) carry no ACK record and are
-        never retried — re-sending can't fix them.
-        """
-        ack = (result.raw_response or {}).get("ack")
-        if not isinstance(ack, dict):
-            return False
-        status = ack.get("status")
-        reason = str(ack.get("error_reason") or "").upper()
-        # Adapter teardown — do not retry into a closed transport.
-        if reason == "DISCONNECTED":
-            return False
-        # Adapter-internal synthetic NAK: the packet id collided with an
-        # in-flight waiter. The chunk was already transmitted by sendText before
-        # the collision was detected, so retrying would duplicate it on-air.
-        # Fail safe and leave delivery to the (already sent) original packet.
-        if reason == "DUPLICATE_PACKET_ID":
-            return False
-        # No confirmation, or only a relay confirmed — both warrant a retry.
-        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
-            return True
-        if status == AckStatus.NAK:
-            return reason not in self.PERMANENT_NAK_REASONS
-        return False
-
     def _chunk_message(self, content: str) -> list[str]:
-        """Split text into LoRa-safe UTF-8 byte chunks with sequence prefixes."""
-        content = (content or "").strip()
-        # Clamp to the protocol hard ceiling — sendData raises above
-        # DATA_PAYLOAD_LEN (233), so a misconfigured larger value would NAK
-        # every full chunk with TOO_LARGE. Non-numeric values fall back to the
-        # default (same defensive pattern as _retry_backoff / _send_retries).
-        raw = os.getenv("MESHTASTIC_CHUNK_BYTES") or self.DEFAULT_CHUNK_BYTES
-        try:
-            limit = min(int(raw), self.MAX_MESSAGE_LENGTH)
-        except (TypeError, ValueError):
-            limit = self.DEFAULT_CHUNK_BYTES
-
-        if len(content.encode("utf-8")) <= limit:
-            return [content] if content else []
-
-        # We will iterate to find the correct number of chunks.
-        # A prefix is at most 12 bytes. So capacity is limit - 12.
-        capacity = max(10, limit - 12)
-        raw_chunks = self._split_utf8(content, capacity)
-        total = len(raw_chunks)
-
-        for _ in range(5):
-            chunks = []
-            remaining = content
-            i = 1
-            while remaining:
-                prefix = f"[{i}/{total}] "
-                prefix_len = len(prefix.encode("utf-8"))
-                capacity = max(10, limit - prefix_len)
-
-                parts = self._split_utf8(remaining, capacity)
-                if not parts:
-                    break
-                part = parts[0]
-                chunks.append(prefix + part)
-                remaining = remaining[len(part) :]
-                i += 1
-
-            actual_count = len(chunks)
-            if actual_count == total:
-                return chunks
-            total = actual_count
-
-        return chunks
+        return chunking.chunk_message(content)
 
     def _split_utf8(self, text: str, limit: int) -> list[str]:
-        """Split text by UTF-8 byte length, preferring whitespace boundaries."""
-        remaining = text
-        chunks: list[str] = []
-        while remaining:
-            if len(remaining.encode("utf-8")) <= limit:
-                chunks.append(remaining)
-                break
-            char_idx = min(len(remaining), limit)
-            while char_idx > 0 and len(remaining[:char_idx].encode("utf-8")) > limit:
-                char_idx -= 1
-            if char_idx <= 0:
-                char_idx = 1
-            split_idx = remaining[:char_idx].rfind(" ")
-            if split_idx > 0:
-                split_at = split_idx + 1
-                part = remaining[:split_at]
-                remaining = remaining[split_at:]
-            else:
-                part = remaining[:char_idx]
-                remaining = remaining[char_idx:]
-            if part:
-                chunks.append(part)
-        return chunks
+        return chunking.split_utf8(text, limit)
 
     def _extract_packet_id(self, pkt: Any) -> str | None:
         """Return a Meshtastic packet ID from object or dict packet shapes."""
@@ -2299,451 +1936,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return int(reply_to)
         except (TypeError, ValueError):
             return None
-
-    def _track_pending_ack(
-        self,
-        pkt_id: str | None,
-        dest: str,
-        content: str,
-        *,
-        create_future: bool = False,
-        send_token: object | None = None,
-    ) -> ConcurrentFuture | None:
-        """Track packet IDs for ACK/NACK response observability.
-
-        Waiters are stored as ``concurrent.futures.Future`` so pubsub/disconnect
-        can ``set_result`` from any thread without needing the awaiter's event
-        loop to be running. ``_wait_for_ack`` wraps it on the caller's loop.
-        """
-        if not pkt_id:
-            return None
-
-        cf_future: ConcurrentFuture | None = None
-        log_cross_loop = False
-        cross_platform_id = 0
-        cross_send_id = 0
-        if create_future:
-            cf_future = ConcurrentFuture()
-            try:
-                send_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                send_loop = None
-            if send_loop is not None and self.loop is not None and send_loop is not self.loop:
-                cross_platform_id = id(self.loop)
-                cross_send_id = id(send_loop)
-                log_cross_loop = True
-        with self._ack_lock:
-            if log_cross_loop and not self._cross_loop_send_logged:
-                self._cross_loop_send_logged = True
-            else:
-                log_cross_loop = False
-            existing_response = self._ack_responses.get(pkt_id)
-            if send_token is not None:
-                response_token = self._ack_response_tokens.get(pkt_id)
-                if existing_response is not None and response_token is not send_token:
-                    # Same numeric packet id from an older send/lifecycle.
-                    existing_response = None
-
-            active_future = self._ack_futures.get(pkt_id)
-            if active_future is not None and not active_future.done():
-                collision = {
-                    "dest": dest,
-                    "bytes": len(content.encode("utf-8")),
-                    "sent_at": time.time(),
-                    "response_at": time.time(),
-                    "status": AckStatus.NAK,
-                    "error_reason": "DUPLICATE_PACKET_ID",
-                }
-                self._ack_futures.pop(pkt_id, None)
-                self._pending_acks[pkt_id] = collision
-                self._ack_responses[pkt_id] = collision
-                self._set_ack_future_result(active_future, dict(collision))
-                if cf_future is not None:
-                    # Poison this reused id so neither old nor new generation
-                    # callbacks can overwrite the definitive collision result.
-                    self._ack_tokens[pkt_id] = object()
-                    self._ack_response_tokens.pop(pkt_id, None)
-                    self._set_ack_future_result(cf_future, dict(collision))
-                    return cf_future
-                # Fire-and-forget collision: the old waiter is terminated, and
-                # the new send's token now owns the id so its real ACK callback
-                # can still update the record (a delayed old-token ACK is
-                # ignored as stale by _record_ack_response).
-                if send_token is not None:
-                    self._ack_tokens[pkt_id] = send_token
-                logger.warning(
-                    "Meshtastic packet id collision with active ACK waiter: packet_id=%s",
-                    pkt_id,
-                )
-                return None
-
-            prior_token = self._ack_tokens.get(pkt_id)
-            if (
-                cf_future is not None
-                and send_token is not None
-                and prior_token is not None
-                and prior_token is not send_token
-            ):
-                # A delayed wire ACK for the older packet would be
-                # indistinguishable from an ACK for this reuse. Fail safe.
-                collision = {
-                    "dest": dest,
-                    "bytes": len(content.encode("utf-8")),
-                    "sent_at": time.time(),
-                    "response_at": time.time(),
-                    "status": AckStatus.NAK,
-                    "error_reason": "DUPLICATE_PACKET_ID",
-                }
-                self._pending_acks[pkt_id] = collision
-                self._ack_responses[pkt_id] = collision
-                self._ack_tokens[pkt_id] = object()
-                self._ack_response_tokens.pop(pkt_id, None)
-                self._set_ack_future_result(cf_future, dict(collision))
-                self._prune_ack_history_locked()
-                return cf_future
-
-            record = existing_response or {
-                "dest": dest,
-                "bytes": len(content.encode("utf-8")),
-                "sent_at": time.time(),
-                "status": AckStatus.PENDING,
-            }
-            if send_token is not None:
-                self._ack_tokens[pkt_id] = send_token
-            # sendText can finish after disconnect's ACK sweep. Never register
-            # a fresh waiter into a stopped lifecycle; preserve a real ACK/NAK
-            # that arrived early, otherwise settle as disconnected now.
-            if (
-                create_future
-                and not self._running
-                and record.get("status")
-                not in (
-                    AckStatus.ACK,
-                    AckStatus.NAK,
-                )
-            ):
-                record["status"] = AckStatus.TIMEOUT
-                record["error_reason"] = "DISCONNECTED"
-                record["response_at"] = time.time()
-            self._pending_acks[pkt_id] = record
-            if cf_future is not None and self._running:
-                self._ack_futures[pkt_id] = cf_future
-            elif cf_future is not None:
-                existing_response = record
-            self._prune_ack_history_locked()
-
-        if log_cross_loop:
-            logger.info(
-                "Meshtastic send/ACK running on a different event loop than "
-                "connect() (platform loop id=%s, send loop id=%s). ACK waiters "
-                "use concurrent.futures (loop-independent settle); inbound "
-                "traffic stays on the platform loop. Transport I/O is "
-                "serialized on the daemon worker.",
-                cross_platform_id,
-                cross_send_id,
-            )
-
-        # If a definitive response (real ACK / NAK) already arrived before the
-        # waiter was created, resolve immediately. An early *implicit* ACK is not
-        # definitive — leave the waiter open so a real ACK (or timeout) decides.
-        if (
-            cf_future is not None
-            and existing_response
-            and not cf_future.done()
-            and existing_response.get("status") != AckStatus.IMPLICIT_ACK
-        ):
-            self._set_ack_future_result(cf_future, existing_response)
-
-        return cf_future
-
-    def _fail_pending_acks(self, reason: str = "DISCONNECTED") -> None:
-        """Resolve outstanding ACK waiters (e.g. on disconnect).
-
-        ``concurrent.futures.Future.set_result`` is thread-safe, so waiters on
-        any agent-session loop unblock without requiring that loop to be running
-        for the *set* (only for the awaiter to resume).
-        """
-        to_resolve: list[tuple[ConcurrentFuture, dict[str, Any]]] = []
-        with self._ack_lock:
-            self._ack_inflight_tokens.clear()
-            self._early_ack_packets.clear()
-            items = list(self._ack_futures.items())
-            self._ack_futures.clear()
-            for pkt_id, future in items:
-                record = self._pending_acks.get(pkt_id)
-                if record is None:
-                    record = {
-                        "status": AckStatus.TIMEOUT,
-                        "error_reason": reason,
-                        "response_at": time.time(),
-                    }
-                elif record.get("status", AckStatus.PENDING) not in (
-                    AckStatus.ACK,
-                    AckStatus.NAK,
-                ):
-                    record["status"] = AckStatus.TIMEOUT
-                    record["error_reason"] = reason
-                    record["response_at"] = time.time()
-                self._pending_acks[pkt_id] = record
-                self._ack_responses[pkt_id] = record
-                if future is not None and not future.done():
-                    to_resolve.append((future, dict(record)))
-            self._prune_ack_history_locked()
-
-        for future, snapshot in to_resolve:
-            self._set_ack_future_result(future, snapshot)
-
-    def get_ack_status(self, packet_id: str) -> dict[str, Any] | None:
-        """Return the latest ACK/NACK status for a packet id, if observed."""
-        with self._ack_lock:
-            status = self._pending_acks.get(packet_id)
-            return dict(status) if status else None
-
-    def _prune_ack_history_locked(self) -> None:
-        """Bound ACK bookkeeping growth. Caller must hold ``_ack_lock``.
-
-        Records still awaiting a result (present in ``_ack_futures``) are never
-        evicted; the oldest completed records are dropped first.
-        """
-        for store in (self._pending_acks, self._ack_responses):
-            excess = len(store) - self.ACK_RECORD_LIMIT
-            if excess <= 0:
-                continue
-            evictable = [key for key in store if key not in self._ack_futures]
-            for key in evictable[:excess]:
-                store.pop(key, None)
-        retained = set(self._pending_acks) | set(self._ack_responses) | set(self._ack_futures)
-        for tokens in (self._ack_tokens, self._ack_response_tokens):
-            for key in list(tokens):
-                if key not in retained:
-                    tokens.pop(key, None)
-
-    def _make_ack_callback(self, dest: str, content: str):
-        """Build a Meshtastic onResponse callback that receives ACK/NACK packets."""
-
-        return self._make_ack_callback_for_send(dest, content, None)
-
-    def _make_ack_callback_for_send(
-        self,
-        dest: str,
-        content: str,
-        send_token: object | None,
-        lifecycle_id: int | None = None,
-    ):
-        """Build the magic-named callback with an optional send generation tag."""
-
-        def onAckNak(packet):
-            self._record_ack_response(
-                packet,
-                dest,
-                content,
-                send_token=send_token,
-                lifecycle_id=lifecycle_id,
-            )
-
-        return onAckNak
-
-    def _record_ack_response(
-        self,
-        packet: dict,
-        dest: str,
-        content: str,
-        *,
-        send_token: object | None = None,
-        lifecycle_id: int | None = None,
-    ) -> None:
-        """Log and store Meshtastic ACK/NACK responses without blocking send().
-
-        Distinguishes a **real** end-to-end ACK (routing ACK sender IS the
-        destination → :attr:`AckStatus.ACK`) from an **implicit** ACK relayed by
-        another node (sender ≠ destination → :attr:`AckStatus.IMPLICIT_ACK`).
-        Mirrors the official client's RECEIVED vs DELIVERED. Only real ACK /
-        NAK resolve a waiter; implicit ACKs leave it open for a real ACK or
-        timeout.
-
-        Definitive results (ACK/NAK) are never downgraded by a later implicit
-        ACK. When scheduling the waiter, a **snapshot** of the record is passed
-        so concurrent updates cannot mutate the dict the future will resolve to.
-        """
-        decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
-        routing = decoded.get("routing", {}) or {}
-        request_id = decoded.get("requestId")
-        if request_id is None:
-            request_id = decoded.get("request_id")
-        error_reason = routing.get("errorReason") or routing.get("error_reason")
-        pkt_id = str(request_id) if request_id is not None else "unknown"
-
-        # Who sent this ACK. Applied to DMs only (dest is a "!node" id).
-        # Missing sender still counts as a real ACK (backward compatible).
-        ack_from_raw = None
-        if isinstance(packet, dict):
-            ack_from_raw = packet.get("fromId") or packet.get("from")
-        ack_from = self._normalize_node_id(ack_from_raw)
-        dest_norm = self._normalize_node_id(dest) if dest.startswith("!") else None
-
-        if error_reason not in (None, "", "NONE"):
-            status = AckStatus.NAK
-        elif dest_norm and ack_from and ack_from != dest_norm:
-            status = AckStatus.IMPLICIT_ACK
-        else:
-            status = AckStatus.ACK
-
-        # Hold lifecycle ownership through the ACK-store commit. This closes the
-        # check-to-commit window where disconnect/reconnect could otherwise
-        # advance the generation after validation but before _ack_lock.
-        with ExitStack() as stack:
-            if lifecycle_id is not None:
-                stack.enter_context(self._lifecycle_lock)
-                if lifecycle_id != self._lifecycle_id or not self._running:
-                    logger.debug(
-                        "Ignoring ACK callback from stale lifecycle: packet_id=%s",
-                        pkt_id,
-                    )
-                    return
-            stack.enter_context(self._ack_lock)
-            if send_token is not None:
-                inflight_lifecycle = self._ack_inflight_tokens.get(send_token)
-                if inflight_lifecycle is not None:
-                    if lifecycle_id is not None and inflight_lifecycle != lifecycle_id:
-                        return
-                    self._early_ack_packets[send_token] = (
-                        packet,
-                        dest,
-                        content,
-                        inflight_lifecycle,
-                    )
-                    return
-                active_token = self._ack_tokens.get(pkt_id)
-                # Two-level stale defense: the lifecycle_id check above already
-                # rejects callbacks from dead lifecycles; this token check is
-                # the second level, rejecting same-lifecycle packet-id reuse
-                # where an older send's id is still tracked. A missing token
-                # entry is only possible after lifecycle turnover, which the
-                # first level already caught — so no entry means accept.
-                if active_token is not None and active_token is not send_token:
-                    logger.debug("Ignoring stale ACK callback for packet_id=%s", pkt_id)
-                    return
-                self._ack_response_tokens[pkt_id] = send_token
-            record = self._pending_acks.get(pkt_id, {})
-            prior = record.get("status")
-            # Never let a weaker/later relay confirmation overwrite a definitive
-            # real ACK or NAK already stored on the shared record.
-            if status == AckStatus.IMPLICIT_ACK and prior in (
-                AckStatus.ACK,
-                AckStatus.NAK,
-            ):
-                record["response_at"] = time.time()
-                applied_status = prior
-                snapshot = None  # no waiter resolution for a discarded implicit
-            else:
-                record.update(
-                    {
-                        "dest": record.get("dest", dest),
-                        "bytes": record.get("bytes", len(content.encode("utf-8"))),
-                        "status": status,
-                        "error_reason": error_reason,
-                        "ack_from": ack_from,
-                        "response_at": time.time(),
-                        "response": {
-                            "packet_id": (packet.get("id") if isinstance(packet, dict) else None),
-                            "request_id": request_id,
-                            "from_id": ack_from,
-                            "to_id": packet.get("toId") if isinstance(packet, dict) else None,
-                            "routing": routing,
-                        },
-                    }
-                )
-                applied_status = status
-                # Snapshot so a concurrent update cannot mutate the future result.
-                snapshot = dict(record)
-            self._pending_acks[pkt_id] = record
-            self._ack_responses[pkt_id] = record
-            if applied_status in (AckStatus.ACK, AckStatus.NAK):
-                future = self._ack_futures.pop(pkt_id, None)
-            else:
-                future = self._ack_futures.get(pkt_id)
-            self._prune_ack_history_locked()
-
-        # Resolve the waiter only on a DEFINITIVE outcome (real ACK or NAK). An
-        # implicit ACK updates the record but keeps the wait open, so a real ACK
-        # can still arrive — and if it doesn't, the timeout drives a retry.
-        # concurrent.futures.Future.set_result is thread-safe (pubsub thread OK).
-        if (
-            snapshot is not None
-            and applied_status in (AckStatus.ACK, AckStatus.NAK)
-            and future
-            and not future.done()
-        ):
-            self._set_ack_future_result(future, snapshot)
-
-        if applied_status == AckStatus.ACK and status == AckStatus.ACK:
-            logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
-        elif status == AckStatus.IMPLICIT_ACK and applied_status == AckStatus.IMPLICIT_ACK:
-            logger.info(
-                "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
-                pkt_id,
-                dest,
-                ack_from,
-            )
-        elif applied_status == AckStatus.NAK and status == AckStatus.NAK:
-            logger.warning(
-                "Meshtastic NAK received: packet_id=%s dest=%s reason=%s",
-                pkt_id,
-                dest,
-                error_reason,
-            )
-        elif status == AckStatus.IMPLICIT_ACK:
-            logger.debug(
-                "Meshtastic implicit ACK ignored after definitive status=%s: packet_id=%s",
-                applied_status,
-                pkt_id,
-            )
-
-    def _set_ack_future_result(self, future: ConcurrentFuture, record: dict[str, Any]) -> None:
-        """Complete an ACK waiter (concurrent.futures is the storage type, thread-safe).
-
-        ``done()`` then ``set_result()`` is not atomic: pubsub and disconnect can
-        both race. Swallow InvalidStateError when another thread won.
-        """
-        try:
-            future.set_result(record)
-        except ConcurrentInvalidStateError:
-            pass
-
-    async def _wait_for_ack(
-        self,
-        pkt_id: str,
-        future: ConcurrentFuture,
-        timeout: float,
-    ) -> dict[str, Any]:
-        """Wait for ACK/NACK response or mark the packet timed out."""
-        try:
-            wrapped = asyncio.wrap_future(future)
-            return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
-        except TimeoutError:
-            with self._ack_lock:
-                record = self._pending_acks.get(pkt_id, {})
-                # Only stamp TIMEOUT while still pending. A concurrent real ACK,
-                # NAK, or implicit ACK that landed between wait_for timing out
-                # and this lock acquisition must not be overwritten.
-                if record.get("status", AckStatus.PENDING) == AckStatus.PENDING:
-                    record["status"] = AckStatus.TIMEOUT
-                    record["error_reason"] = "ACK_TIMEOUT"
-                record["response_at"] = time.time()
-                self._pending_acks[pkt_id] = record
-                self._ack_responses[pkt_id] = record
-            logger.warning(
-                "Meshtastic ACK timeout: packet_id=%s timeout=%.1fs final_status=%s",
-                pkt_id,
-                timeout,
-                record.get("status"),
-            )
-            return record
-        finally:
-            with self._ack_lock:
-                if self._ack_futures.get(pkt_id) is future:
-                    self._ack_futures.pop(pkt_id, None)
-                self._prune_ack_history_locked()
 
     def _queue_outbound_chunk(self, chat_id: str, chunk: str) -> SendResult:
         """Enqueue a chunk while disconnected (bounded, oldest-first eviction)."""

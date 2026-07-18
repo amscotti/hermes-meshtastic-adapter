@@ -240,29 +240,52 @@ Sleeping or power-saving nodes may not receive messages immediately. Configure d
 
 ## Development
 
-Install runtime and development tools into the Hermes virtual environment:
+Dev tooling lives in the repo's `.venv` (uv-managed); use `.venv/bin/python`
+for the commands below. The Hermes venv at `~/.hermes/hermes-agent/venv` does
+**not** include ruff/pyrefly/coverage.
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+uv sync   # or: uv venv && uv pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-Run tests using the Hermes virtual environment:
+Run the full test suite (five test modules, mock serial + temp SQLite):
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m unittest test_meshtastic.py
+.venv/bin/python -m unittest \
+  test_meshtastic.py test_chunking.py test_node_freshness.py \
+  test_transport.py test_ack_state.py
 ```
-
-The tests use a mock Meshtastic serial interface and a temporary SQLite database.
 
 Run formatting, linting, and type checks:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python -m ruff format .
-~/.hermes/hermes-agent/venv/bin/python -m ruff check .
-~/.hermes/hermes-agent/venv/bin/python -m pyrefly check --python-interpreter-path ~/.hermes/hermes-agent/venv/bin/python --search-path ~/.hermes/hermes-agent
+.venv/bin/python -m ruff format .
+.venv/bin/python -m ruff check .
+.venv/bin/python -m pyrefly check \
+  --python-interpreter-path .venv/bin/python \
+  --search-path ~/.hermes/hermes-agent --min-severity warn
 ```
 
-Pull requests are checked by GitHub Actions for Ruff formatting, Ruff linting, Pyrefly type checking, and unit tests.
+Pull requests are checked by GitHub Actions for Ruff formatting, Ruff linting, Pyrefly type checking, and unit tests with an 80% coverage floor.
+
+### Repository layout
+
+Flat modules, no package nesting (the plugin is loaded by Hermes both as a package and as flat files):
+
+| File | Responsibility |
+| --- | --- |
+| `adapter.py` | `MeshtasticAdapter` — orchestrator: lifecycle, inbound→Hermes bridge, outbound `send()` path, Hermes policy hooks. |
+| `ack_state.py` | `AckTracker` — ACK/NACK state machine (real vs implicit ACKs, waiters, retries). |
+| `transport.py` | Daemon transport executor, serial/TCP target resolution, interface construction, lazy `meshtastic`/`pubsub` imports. |
+| `chunking.py` | UTF-8-byte message chunking (`[i/n]` prefixes, 233-byte ceiling). |
+| `node_freshness.py` | Live per-node `last_heard`/`snr`/`rssi` overlay. |
+| `mock_interface.py` | Fallback mock node/interface when no hardware or deps are present. |
+| `tools.py` | The seven `mesh_*` tool handlers (loaded as module `meshtastic_tools`). |
+| `schemas.py` | JSON function schemas for the tools. |
+| `telemetry_db.py` | SQLite persistence for telemetry/positions/signal quality. |
+| `__init__.py` | `register(ctx)` plugin entry point. |
+
+Tests: `test_meshtastic.py` holds integration tests against the assembled adapter; `test_chunking.py`, `test_node_freshness.py`, `test_transport.py`, and `test_ack_state.py` hold per-domain unit tests.
 
 ## Known Limitations
 
