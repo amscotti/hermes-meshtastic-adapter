@@ -584,7 +584,33 @@ class MeshtasticAdapter(BasePlatformAdapter):
         ).start()
         await self._await_concurrent_future(close_fut, timeout)
 
+    async def _close_interfaces_via_executor(
+        self,
+        executor: _DaemonTransportExecutor,
+        interfaces: list[Any],
+        timeout: float,
+    ) -> None:
+        """Close on the transport worker; drain-then-close if it is mid-shutdown."""
+        try:
+            close_fut = executor.submit(self._close_interfaces_serialized, interfaces)
+        except RuntimeError:
+            # Executor shut down between the read and submit. Wait for its
+            # accepted work to drain before closing, preserving the
+            # no-concurrent-sendText/close transport invariant.
+            await self._close_interfaces_after_executor(executor, interfaces, timeout)
+            return
+        await self._await_concurrent_future(close_fut, timeout)
+
     async def _close_interfaces(self, interfaces: list[Any]) -> None:
+        """Close interfaces off the event-loop thread, time-bounded.
+
+        Dispatch (each path never runs close on the caller's loop):
+          1. ``_close_interfaces_via_executor`` — the lifecycle transport worker
+             (normal path, serialized against sendText).
+          2. ``_close_interfaces_on_daemon_thread`` — short-lived daemon thread
+             when no worker exists (never connected / already torn down).
+        A TimeoutError only abandons the *await*; the daemon close still runs.
+        """
         if not interfaces:
             return
         timeout = self._executor_shutdown_timeout()
@@ -592,18 +618,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
             executor = self._transport_executor
         try:
             if executor is not None:
-                try:
-                    close_fut = executor.submit(self._close_interfaces_serialized, interfaces)
-                except RuntimeError:
-                    # Executor shut down between the read and submit. Wait for
-                    # its accepted work to drain before closing, preserving the
-                    # no-concurrent-sendText/close transport invariant.
-                    await self._close_interfaces_after_executor(executor, interfaces, timeout)
-                    return
-                else:
-                    await self._await_concurrent_future(close_fut, timeout)
-                    return
-            if executor is None:
+                await self._close_interfaces_via_executor(executor, interfaces, timeout)
+            else:
                 await self._close_interfaces_on_daemon_thread(interfaces, timeout)
         except TimeoutError:
             logger.warning(
@@ -1407,7 +1423,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
         completion.result()
 
     async def _disconnect_impl(self, completion: ConcurrentFuture) -> None:
-        """Teardown implementation; always owned by the platform loop when live."""
+        """Teardown implementation; always owned by the platform loop when live.
+
+        Ownership-gate pattern: this task can be superseded at any time by a
+        follower caller that takes over teardown (see ``_start_disconnect_task``).
+        So every stage boundary re-checks, under one ``_lifecycle_lock`` hold,
+        that ALL of the following still hold before touching shared state:
+          1. ``self._disconnecting`` is still set (no completed teardown);
+          2. ``self._disconnect_future is completion`` (same teardown epoch);
+          3. ``self._disconnect_task is current_task`` (this task is the owner).
+        Failing any gate means a newer owner exists, so this task returns
+        ``superseded`` without mutating the newer lifecycle's state. The
+        ``finally`` block only settles ``completion`` and clears flags when the
+        same three checks pass, so a stale task can never advertise completion
+        or wipe a successor's bookkeeping.
+        """
         failure: BaseException | None = None
         cancelled = False
         superseded = False
