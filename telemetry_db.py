@@ -227,50 +227,68 @@ def log_signal(
     maybe_prune()
 
 
-def get_telemetry_history(node_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def _history_query(
+    table: str,
+    columns: str,
+    node_id: str,
+    limit: int,
+    since: float | None,
+    error_label: str,
+) -> list[dict[str, Any]]:
+    """Read the newest rows for a node, optionally bounded to a time window.
+
+    ``since`` is a unix timestamp: pass it to ask "the last N days" rather than
+    "the last N rows", which is the only way to request a period without
+    guessing how chatty a node is. Rows still come back newest-first and capped
+    by ``limit``, so a period denser than the cap is truncated — callers report
+    that rather than presenting a partial window as complete.
+    """
+    clauses = "WHERE node_id = ?"
+    params: list[Any] = [node_id]
+    if since is not None:
+        clauses += " AND timestamp >= ?"
+        params.append(since)
+    params.append(limit)
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT {columns} FROM {table} {clauses} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Error reading {error_label}: {e}")
+        return []
+
+
+def get_telemetry_history(
+    node_id: str, limit: int = 50, since: float | None = None
+) -> list[dict[str, Any]]:
     """Retrieve historical telemetry for a specific node."""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT timestamp, battery_level, voltage, temperature, humidity, pressure, uptime
-                FROM telemetry
-                WHERE node_id = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """,
-                (node_id, limit),
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-    except Exception as e:
-        logger.error(f"Error reading telemetry history: {e}")
-        return []
+    return _history_query(
+        "telemetry",
+        "timestamp, battery_level, voltage, temperature, humidity, pressure, uptime",
+        node_id,
+        limit,
+        since,
+        "telemetry history",
+    )
 
 
-def get_position_history(node_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def get_position_history(
+    node_id: str, limit: int = 50, since: float | None = None
+) -> list[dict[str, Any]]:
     """Retrieve historical positions for a node."""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT timestamp, latitude, longitude, altitude
-                FROM positions
-                WHERE node_id = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """,
-                (node_id, limit),
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-    except Exception as e:
-        logger.error(f"Error reading position history: {e}")
-        return []
+    return _history_query(
+        "positions",
+        "timestamp, latitude, longitude, altitude",
+        node_id,
+        limit,
+        since,
+        "position history",
+    )
 
 
 def get_latest_signal_by_node(direct_only: bool = False) -> dict[str, dict[str, Any]]:
@@ -307,24 +325,15 @@ def get_latest_signal_by_node(direct_only: bool = False) -> dict[str, dict[str, 
         return {}
 
 
-def get_signal_history(node_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def get_signal_history(
+    node_id: str, limit: int = 50, since: float | None = None
+) -> list[dict[str, Any]]:
     """Retrieve historical signal quality for a node."""
-    try:
-        with closing(sqlite3.connect(DB_PATH)) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT timestamp, snr, rssi, hop_count
-                FROM signal_quality
-                WHERE node_id = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """,
-                (node_id, limit),
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-    except Exception as e:
-        logger.error(f"Error reading signal history: {e}")
-        return []
+    return _history_query(
+        "signal_quality",
+        "timestamp, snr, rssi, hop_count",
+        node_id,
+        limit,
+        since,
+        "signal history",
+    )

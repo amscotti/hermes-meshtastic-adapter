@@ -81,6 +81,13 @@ DIRECT_RANGE_WINDOW_SECS = 24 * 3600
 # told the fix is old rather than left to assume it is current.
 POSITION_STALE_AFTER_SECS = 6 * 3600
 
+# Ceiling for a time-windowed history request. The window may exceed the
+# retention period harmlessly (there is simply nothing older), but the row cap
+# keeps one busy node's month of fixes from flooding a reply: the chattiest node
+# here logs ~53 positions a day, so 500 rows is still well over a week.
+HISTORY_MAX_WINDOW_HOURS = 30 * 24
+HISTORY_WINDOW_ROW_CAP = 500
+
 
 def set_adapter(adapter: Any) -> None:
     """Set the active Meshtastic adapter instance."""
@@ -595,10 +602,30 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
     """Query historical telemetry, positions, or signal qualities."""
     node_id_query = args.get("node_id")
     metric_type = args.get("metric_type", "telemetry")
+
+    # A period ("the last 3 days") and a count ("the last 10 rows") answer
+    # different questions, and a count cannot stand in for a period: how far
+    # back N rows reach depends entirely on how chatty the node is — 100 rows
+    # is five days for one node here and a month for another. Asking by time
+    # therefore raises the cap, since the window, not the number, is the ask.
+    since_hours = args.get("since_hours")
+    since = None
+    if since_hours is not None:
+        try:
+            hours = float(since_hours)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "Parameter 'since_hours' must be a number."})
+        if hours <= 0:
+            return json.dumps({"error": "Parameter 'since_hours' must be positive."})
+        hours = min(hours, HISTORY_MAX_WINDOW_HOURS)
+        since = time.time() - hours * 3600
+
+    default_limit = HISTORY_WINDOW_ROW_CAP if since is not None else 10
+    row_cap = HISTORY_WINDOW_ROW_CAP if since is not None else 100
     try:
-        limit = min(max(1, int(args.get("limit", 10))), 100)
+        limit = min(max(1, int(args.get("limit", default_limit))), row_cap)
     except (TypeError, ValueError):
-        limit = 10
+        limit = default_limit
 
     if not node_id_query:
         return json.dumps({"error": "Parameter 'node_id' is required."})
@@ -611,11 +638,11 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
     node_id = info.get("user", {}).get("id") if info else node_id_query
 
     if metric_type == "telemetry":
-        history = telemetry_db.get_telemetry_history(node_id, limit=limit)
+        history = telemetry_db.get_telemetry_history(node_id, limit=limit, since=since)
     elif metric_type == "positions":
-        history = telemetry_db.get_position_history(node_id, limit=limit)
+        history = telemetry_db.get_position_history(node_id, limit=limit, since=since)
     elif metric_type == "signal_quality":
-        history = telemetry_db.get_signal_history(node_id, limit=limit)
+        history = telemetry_db.get_signal_history(node_id, limit=limit, since=since)
     else:
         return json.dumps({"error": f"Invalid metric_type '{metric_type}'."})
 
@@ -624,15 +651,24 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
         if "timestamp" in h:
             h["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["timestamp"]))
 
-    return json.dumps(
-        {
-            "node_id": node_id,
-            "name": info.get("user", {}).get("longName", "Unknown") if info else "Unknown",
-            "metric_type": metric_type,
-            "history": history,
-        },
-        indent=2,
-    )
+    result = {
+        "node_id": node_id,
+        "name": info.get("user", {}).get("longName", "Unknown") if info else "Unknown",
+        "metric_type": metric_type,
+        "returned": len(history),
+        "history": history,
+    }
+    if since is not None:
+        # Say what was actually covered. Hitting the cap means the oldest rows
+        # of the requested window are missing, and a truncated window read as a
+        # complete one is how "no data before X" gets asserted wrongly.
+        result["window_requested_from"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+        oldest = history[-1]["timestamp"] if history else None
+        result["oldest_returned"] = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(oldest)) if oldest else None
+        )
+        result["truncated"] = len(history) >= limit
+    return json.dumps(result, indent=2)
 
 
 # --- Solicited requests ------------------------------------------------------

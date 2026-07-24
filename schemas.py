@@ -144,7 +144,14 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_telemetry_history",
-        "description": "Query historical telemetry, position, or signal quality records from the persistent SQLite database for analysis.",
+        "description": (
+            "Query historical telemetry, position, or signal quality records from the "
+            "persistent SQLite database (retained ~30 days) for analysis. To ask for a "
+            "PERIOD — 'where was this node over the last few days' — use 'since_hours'; "
+            "a row count cannot express a period, because how far back N rows reach "
+            "depends on how often that node transmits. The reply reports 'oldest_returned' "
+            "and 'truncated' so a partial window is never mistaken for a complete one."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -157,9 +164,20 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
                     "enum": ["telemetry", "positions", "signal_quality"],
                     "description": "The type of historical records to fetch. Default is 'telemetry'.",
                 },
+                "since_hours": {
+                    "type": "number",
+                    "description": (
+                        "Return records from the last N hours (e.g. 72 for three days). "
+                        "Capped at 720 (30 days, the retention period). When set, up to "
+                        "500 records are returned instead of 100."
+                    ),
+                },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of historical records to return (default: 10, max: 100).",
+                    "description": (
+                        "Maximum number of records to return (default: 10, max: 100; with "
+                        "'since_hours' the default and cap are 500)."
+                    ),
                 },
             },
             "required": ["node_id"],

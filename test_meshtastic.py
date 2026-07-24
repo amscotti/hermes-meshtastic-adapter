@@ -6,12 +6,14 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3262,6 +3264,67 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         result = json.loads(await handle_mesh_telemetry({"node_id": "!cc001122"}))
         self.assertEqual(result["battery_level"], 77)
         self.assertEqual(result["temperature"], 19.5)
+
+    async def test_history_window_selects_by_time_not_row_count(self):
+        """since_hours asks for a period; rows outside it are excluded."""
+        now = time.time()
+        for age_hours, lat in ((1, 55.1), (10, 55.2), (100, 55.3)):
+            telemetry_db.log_position("!ab12cd34", latitude=lat, longitude=61.0, altitude=1)
+            with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE positions SET timestamp = ? WHERE latitude = ?",
+                    (now - age_hours * 3600, lat),
+                )
+                conn.commit()
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "positions", "since_hours": 24}
+            )
+        )
+        lats = {h["latitude"] for h in res["history"]}
+        self.assertEqual(lats, {55.1, 55.2})  # the 100h-old fix is outside the window
+        self.assertEqual(res["returned"], 2)
+        self.assertFalse(res["truncated"])
+        self.assertIsNotNone(res["oldest_returned"])
+
+    async def test_history_window_reports_truncation(self):
+        """A window denser than the cap must say so, not look complete."""
+        for i in range(5):
+            telemetry_db.log_position(
+                "!ab12cd34", latitude=40.0 + i / 100, longitude=61.0, altitude=1
+            )
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "positions", "since_hours": 24, "limit": 3}
+            )
+        )
+        self.assertEqual(res["returned"], 3)
+        self.assertTrue(res["truncated"])
+
+    async def test_history_window_rejects_nonsense_and_caps_range(self):
+        """A bad since_hours errors out; an absurd one clamps to the retention period."""
+        res = json.loads(
+            await handle_mesh_telemetry_history({"node_id": "!ab12cd34", "since_hours": "soon"})
+        )
+        self.assertIn("error", res)
+        res = json.loads(
+            await handle_mesh_telemetry_history({"node_id": "!ab12cd34", "since_hours": -5})
+        )
+        self.assertIn("error", res)
+
+        telemetry_db.log_signal("!ab12cd34", snr=1.0, rssi=-90)
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {
+                    "node_id": "!ab12cd34",
+                    "metric_type": "signal_quality",
+                    "since_hours": 99999,  # far beyond retention
+                }
+            )
+        )
+        self.assertEqual(res["returned"], 1)  # clamped, not rejected
 
     async def test_telemetry_history_metric_types_and_limits(self):
         """telemetry_history serves all metric types, rejects bad ones, clamps limits."""

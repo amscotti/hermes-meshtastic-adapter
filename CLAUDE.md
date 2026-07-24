@@ -157,6 +157,8 @@ Signal and position history is retained for 30 days, so anything derived from it
 - **`heard_directly` expires** after `DIRECT_RANGE_WINDOW_SECS` (24h). Live observations and a *live* 0-hop reading (`obs`/node DB) assert direct range on their own, since both describe now; a persisted 0-hop row only counts inside the window. That split is why `live_hops` exists separately from `hops_away` — the reported distance may come from an old row, but direct range may not.
 - **Position fixes are dated** by `_position_age()`: `position_time`, `position_age_hours`, and `position_is_stale` past `POSITION_STALE_AFTER_SECS` (6h). Coordinates from the node DB carry no age, and an old fix plots on a coverage map exactly like a fresh one — confidently, and in the wrong place.
 
+- **History is queryable by period**, not just by row count: `mesh_telemetry_history` takes `since_hours` (capped at 720 = the retention period), which raises the row cap from 100 to `HISTORY_WINDOW_ROW_CAP` (500) because the window is the ask. A count cannot express a period — 100 rows reaches back five days for a node logging ~53 fixes/day and a month for a quiet one. The reply carries `returned`, `oldest_returned` and `truncated`, so a window cut short by the cap is never read as "nothing older exists". This distinction is not academic: `!2bcb38f2` returns 100 fixes to `limit=100` and *nothing at all* to `since_hours=24`, because it stopped reporting four days ago.
+
 Do not "clean" the database to deal with staleness. It is ~0.3 MB, `maybe_prune()` already enforces `MESHTASTIC_TELEMETRY_RETENTION_DAYS`, and the persisted history is the only hop source that outlives a restart — wiping it blinds the agent for hours. Express age in the payload instead.
 
 ### Chat ID / session scoping
