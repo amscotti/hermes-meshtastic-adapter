@@ -10,6 +10,7 @@ import importlib
 import logging
 import os
 import queue
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -116,6 +117,22 @@ except ImportError:
 
 # Default Meshtastic TCP API port exposed by WiFi/Ethernet-capable nodes.
 DEFAULT_TCP_PORT = 4403
+
+# TCP keepalive probing for node links. The library's own heartbeat runs every
+# 300s, so without this a link that dies silently (WiFi drop, node reboot, RST
+# we never see) stays "connected" for up to five minutes — or until our next
+# send fails. These settings surface it in ~KEEPALIVE_IDLE + COUNT*INTERVAL
+# seconds instead, at the cost of a probe packet a node would otherwise never
+# receive. Kept modest for that reason: LoRa nodes are not chatty peers.
+KEEPALIVE_IDLE_SECS = 30
+KEEPALIVE_INTERVAL_SECS = 10
+KEEPALIVE_FAIL_COUNT = 3
+
+# A link that comes back within this many seconds was reset by a node that
+# stayed up (a socket-level RST); anything longer means the node itself was
+# gone — a reboot, a WiFi drop, or a power cycle. Worth separating in the log:
+# the first is a transport hiccup, the second is the node's own health.
+SOCKET_RESET_MAX_OUTAGE_SECS = 6.0
 
 
 class AckStatus(StrEnum):
@@ -440,6 +457,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # (including disconnect on another loop). Awaiters use asyncio.wrap_future.
         self._ack_futures: dict[str, ConcurrentFuture] = {}
         self._ack_lock = threading.Lock()
+
+        # Link health: which socket already has keepalive armed (the library
+        # replaces it on self-heal), when each target went down, and a running
+        # tally that separates socket resets from the node actually being away.
+        self._keepalive_socket_id: int | None = None
+        self._link_down_since: dict[str, float] = {}
+        self._link_drop_counts: dict[str, int] = {"socket_reset": 0, "node_absent": 0}
 
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
@@ -1131,6 +1155,80 @@ class MeshtasticAdapter(BasePlatformAdapter):
             ports.extend(glob.glob(pat))
         return ports
 
+    def _apply_tcp_keepalive(self, iface: Any) -> None:
+        """Arm OS-level TCP keepalive on a node socket, re-arming after self-heal.
+
+        ``TCPInterface._reconnect()`` silently swaps in a brand-new socket when a
+        read or write fails, and socket options do not survive that — so this is
+        called from the liveness poll too, and tracks which socket object it has
+        already configured (by identity) to stay a no-op the rest of the time.
+
+        Best-effort by design: an unsupported platform or a socket closing under
+        us must not take the link down, so failures are logged at debug and the
+        library's 300s heartbeat remains the backstop.
+        """
+        sock = getattr(iface, "socket", None)
+        if sock is None or not hasattr(sock, "setsockopt"):
+            return
+        if self._keepalive_socket_id == id(sock):
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):  # Linux, and Windows on 3.13+
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE_SECS)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_SECS)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_FAIL_COUNT)
+            elif hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows: idle/interval only
+                sock.ioctl(
+                    socket.SIO_KEEPALIVE_VALS,
+                    (1, KEEPALIVE_IDLE_SECS * 1000, KEEPALIVE_INTERVAL_SECS * 1000),
+                )
+            elif hasattr(socket, "TCP_KEEPALIVE"):  # macOS spells idle this way
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, KEEPALIVE_IDLE_SECS)
+        except OSError as e:
+            logger.debug("Could not arm TCP keepalive on the node socket: %s", e)
+            return
+        self._keepalive_socket_id = id(sock)
+        logger.info(
+            "TCP keepalive armed on node socket (idle=%ds, interval=%ds, probes=%d)",
+            KEEPALIVE_IDLE_SECS,
+            KEEPALIVE_INTERVAL_SECS,
+            KEEPALIVE_FAIL_COUNT,
+        )
+
+    def _note_link_drop(self, target: str) -> None:
+        """Timestamp a drop so the recovery log can classify what happened."""
+        self._link_down_since[target] = time.time()
+
+    def _report_link_recovery(self, target: str) -> None:
+        """Log how long *target* was gone, and what that says about the node.
+
+        A short outage means the node stayed up and only the socket died; a long
+        one means the node itself was away. Reported together with running
+        counts, because the ratio is the diagnosis: a handful of resets is
+        normal for an ESP32 over WiFi, while repeated long absences point at the
+        node's power, WiFi signal, or reboots.
+        """
+        dropped_at = self._link_down_since.pop(target, None)
+        if dropped_at is None:
+            return
+        outage = time.time() - dropped_at
+        if outage <= SOCKET_RESET_MAX_OUTAGE_SECS:
+            self._link_drop_counts["socket_reset"] += 1
+            verdict = "socket reset, node stayed up"
+        else:
+            self._link_drop_counts["node_absent"] += 1
+            verdict = "node was unreachable (reboot, WiFi drop, or power loss)"
+        logger.info(
+            "Meshtastic link to %s restored after %.1fs — %s "
+            "(session totals: %d socket resets, %d node absences)",
+            target,
+            outage,
+            verdict,
+            self._link_drop_counts["socket_reset"],
+            self._link_drop_counts["node_absent"],
+        )
+
     async def _reconnect_loop(self, target: str, lifecycle_id: int):
         """Exponential backoff reconnect loop for one connection target."""
         backoff = 1.0
@@ -1199,6 +1297,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         break
                     backoff = 1.0  # Reset backoff on success
                     logger.info(f"Successfully connected to Meshtastic on {target}")
+                    self._apply_tcp_keepalive(iface)
+                    self._report_link_recovery(target)
 
                     # Security warnings for local node
                     my_node = getattr(iface, "localNode", None)
@@ -1245,8 +1345,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     break
                 if not alive:
                     logger.warning(f"Meshtastic target {target} dropped connection!")
+                    # Timestamp the drop; #14's outer loop owns the serialized
+                    # close (interfaces must not be closed on the loop thread).
+                    self._note_link_drop(target)
                     break
 
+                # The library swaps the socket out from under us when it
+                # self-heals a failed read/write, so re-arm on the new one.
+                self._apply_tcp_keepalive(iface)
                 await asyncio.sleep(2.0)
 
     def _interface_is_alive(self, iface: Any) -> bool:
