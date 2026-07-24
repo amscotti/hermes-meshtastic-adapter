@@ -3043,6 +3043,93 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(node["snr"], 2.5)
         self.assertEqual(node["rssi"], -110)
 
+    async def test_list_nodes_marks_relayed_signal_as_not_direct(self):
+        """A relayed reading must not read as direct range — the original bug.
+
+        Asked which nodes were in direct line of sight, the agent had no hop
+        data in this payload and answered by listing everything with an RSSI,
+        which included nodes 1-5 hops out.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd001122"] = {
+            "num": 2,
+            "user": {"id": "!dd001122", "longName": "Far Relayed", "shortName": "FAR"},
+        }
+        telemetry_db.log_signal("!dd001122", snr=6.0, rssi=-100, hop_count=3)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd001122")
+        self.assertEqual(node["hops_away"], 3)
+        self.assertFalse(node["heard_directly"])
+        self.assertEqual(node["signal_source"], "relayed")
+        self.assertIsNone(node["last_direct_heard"])
+
+    async def test_list_nodes_reports_direct_node_and_prefers_direct_signal(self):
+        """A 0-hop node is flagged direct, and its signal comes from a direct packet."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd003344"] = {
+            "num": 3,
+            "user": {"id": "!dd003344", "longName": "Neighbour", "shortName": "NBR"},
+        }
+        # Heard directly first, then via a relay: the direct reading is the one
+        # that describes this node's own link, regardless of which is newer.
+        telemetry_db.log_signal("!dd003344", snr=4.0, rssi=-95, hop_count=0)
+        telemetry_db.log_signal("!dd003344", snr=-2.0, rssi=-115, hop_count=2)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd003344")
+        self.assertEqual(node["signal_source"], "direct")
+        self.assertEqual(node["snr"], 4.0)
+        self.assertEqual(node["rssi"], -95)
+        self.assertIsNotNone(node["last_direct_heard"])
+
+    async def test_hops_survive_a_restart_via_persisted_history(self):
+        """Hop data outlives the in-memory observations a restart clears."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd005566"] = {
+            "num": 4,
+            "user": {"id": "!dd005566", "longName": "Persisted", "shortName": "PST"},
+        }
+        telemetry_db.log_signal("!dd005566", snr=3.0, rssi=-99, hop_count=0)
+        self.adapter._node_freshness._observed.clear()  # what a gateway restart leaves behind
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd005566")
+        self.assertEqual(node["hops_away"], 0)
+        self.assertTrue(node["heard_directly"])
+
+    async def test_unknown_hops_are_not_claimed_as_direct(self):
+        """No hop information anywhere means unknown, never 'direct'."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd007788"] = {
+            "num": 5,
+            "user": {"id": "!dd007788", "longName": "Unknown Hops", "shortName": "UNK"},
+            "snr": 5.0,  # library node DB reading, origin unknown
+        }
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd007788")
+        self.assertIsNone(node["hops_away"])
+        self.assertFalse(node["heard_directly"])
+        self.assertEqual(node["signal_source"], "unknown")
+
+    async def test_signal_quality_reports_hops_per_trend_sample(self):
+        """The trend must say which samples were direct — mixing links reads as noise."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd009900"] = {
+            "num": 6,
+            "user": {"id": "!dd009900", "longName": "Trended", "shortName": "TRD"},
+        }
+        telemetry_db.log_signal("!dd009900", snr=5.0, rssi=-90, hop_count=0)
+        telemetry_db.log_signal("!dd009900", snr=-1.0, rssi=-118, hop_count=4)
+
+        res = json.loads(await handle_mesh_signal_quality({"node_id": "!dd009900"}))
+        self.assertEqual(res["current"]["signal_source"], "direct")
+        # Still in direct range even though the newest packet came via 4 relays.
+        self.assertTrue(res["current"]["heard_directly"])
+        self.assertEqual(res["current"]["hops_away"], 4)
+        self.assertEqual({s["hops_away"] for s in res["trend_history"]}, {0, 4})
+
     async def test_list_nodes_dedupes_across_interfaces(self):
         """The same node seen on two interfaces appears once."""
         iface = self.adapter.get_interfaces()[0]

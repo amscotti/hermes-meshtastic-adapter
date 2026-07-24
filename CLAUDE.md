@@ -140,6 +140,16 @@ This is the subtlest part of the code. Meshtastic's `pubsub` delivers packets on
 
 Any new packet-handling work must respect this boundary — do not touch loop state from the pubsub thread except via `call_soon_threadsafe`.
 
+### Direct range vs signal strength — never conflate them
+
+`_link_facts()` in `tools.py` is the single place that answers "how far is this node, and does this reading describe it". Every node-reporting tool goes through it.
+
+**Signal strength says nothing about distance.** A relayed packet's SNR/RSSI belong to the last hop, not the origin. In live data, directly-heard nodes span −60 to −122 dBm and fully overlap the relayed ones: `!0b477a00` at −122 dBm is direct, `!a6963ec4` at −98 dBm is two hops out. `_update_observed` gets this right (it records `snr`/`rssi` only off 0-hop packets), but `mesh_list_nodes` used to publish neither hops nor provenance, and its fallbacks pulled SNR from the library node DB and from unfiltered SQLite history. Asked which nodes were in direct range, the agent had nothing else to go on and answered by listing everything with an RSSI — nodes 1 to 5 hops away included.
+
+So the payload now carries: **`heard_directly`** (at least one 0-hop packet ever arrived), **`last_direct_heard`** (when — how the caller judges whether that still holds), **`hops_away`** (distance of the *latest* packet, which legitimately varies as the mesh reroutes), and **`signal_source`** (`direct` / `relayed` / `unknown`). Note that `heard_directly` is deliberately NOT `hops_away == 0`: packets from one node routinely arrive both ways, and keying off the newest alone flips a neighbour in and out of range packet by packet.
+
+Hops resolve through live observations → the library's `hopsAway` (what the official app shows) → `telemetry_db.get_latest_signal_by_node()`. Only that last source survives a gateway restart, which wipes `_node_freshness._observed` — before it existed, every restart left the agent blind to hops entirely.
+
 ### Chat ID / session scoping
 
 `_on_receive` decides DM vs broadcast and forms the chat_id that becomes the Hermes session key:

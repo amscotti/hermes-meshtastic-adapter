@@ -273,6 +273,40 @@ def get_position_history(node_id: str, limit: int = 50) -> list[dict[str, Any]]:
         return []
 
 
+def get_latest_signal_by_node(direct_only: bool = False) -> dict[str, dict[str, Any]]:
+    """Latest signal reading per node, in one query, as ``{node_id: row}``.
+
+    Callers listing the whole mesh need this per node, so a per-node query would
+    be one round trip per node on every call. ``direct_only`` restricts to
+    0-hop packets — the readings that actually describe the link to *that* node
+    rather than to whichever relay forwarded it.
+
+    Persisted, so unlike the adapter's in-memory observations this survives a
+    gateway restart, which is the only reason hop data outlives a reconnect.
+    """
+    where = "WHERE hop_count = 0" if direct_only else ""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT node_id, timestamp, snr, rssi, hop_count
+                FROM (
+                    SELECT node_id, timestamp, snr, rssi, hop_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY node_id ORDER BY timestamp DESC
+                           ) AS rn
+                    FROM signal_quality
+                    {where}
+                )
+                WHERE rn = 1
+            """)
+            return {row["node_id"]: dict(row) for row in cursor.fetchall()}
+    except Exception as e:
+        logger.error(f"Error reading latest signal readings: {e}")
+        return {}
+
+
 def get_signal_history(node_id: str, limit: int = 50) -> list[dict[str, Any]]:
     """Retrieve historical signal quality for a node."""
     try:

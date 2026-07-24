@@ -6,7 +6,18 @@ MESH_LIST_NODES_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_list_nodes",
-        "description": "Get a formatted list of all visible Meshtastic nodes in the mesh network with their IDs, names, signal metrics, and status.",
+        "description": (
+            "Get a formatted list of all visible Meshtastic nodes in the mesh network with "
+            "their IDs, names, signal metrics, and status. Whether a node is heard DIRECTLY "
+            "(in radio range, no relay) is given by 'heard_directly' — never infer it from "
+            "signal strength: a relayed packet's SNR/RSSI describe the last hop, so a strong "
+            "reading can belong to a node many hops away. 'heard_directly' means at least "
+            "one packet arrived with 0 hops; 'last_direct_heard' says when, which is how you "
+            "judge whether it still holds. 'hops_away' is the distance of the LATEST packet "
+            "and legitimately varies as the mesh reroutes. 'signal_source' says whether the "
+            "reading came off a direct packet ('direct'), a relayed one ('relayed'), or is "
+            "of unknown origin."
+        ),
         "parameters": {
             "type": "object",
             "properties": {},
@@ -38,7 +49,12 @@ MESH_SIGNAL_QUALITY_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_signal_quality",
-        "description": "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, Fair, Poor) for a specific node.",
+        "description": (
+            "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, "
+            "Fair, Poor) for a specific node. The reading only describes the link to this "
+            "node when 'signal_source' is 'direct'; when it is 'relayed' the numbers belong "
+            "to the last hop, not to this node."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

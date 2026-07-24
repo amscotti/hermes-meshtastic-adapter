@@ -164,6 +164,66 @@ def _device_uptime(metrics: dict[str, Any] | None) -> Any:
 # --- Tool Handlers ---
 
 
+def _link_facts(
+    info: dict,
+    obs: dict,
+    latest: dict | None = None,
+    latest_direct: dict | None = None,
+) -> dict[str, Any]:
+    """Resolve how far a node is and whether its signal actually describes it.
+
+    **Hops** come from the freshest source that knows: live observations, then
+    the library node DB (``hopsAway`` — what the official app shows), then our
+    persisted history. That last fallback is the only one that survives a
+    gateway restart, which wipes the in-memory observations.
+
+    **Signal** is attributed to the node itself only when it came off a 0-hop
+    packet. A relayed packet's SNR/RSSI describe the last hop, not the origin,
+    so presenting them as the node's own signal is actively misleading: asked
+    which nodes were in direct range, the agent had no hop data in this payload
+    and answered by picking the ones with an RSSI — listing nodes 1 to 5 hops
+    out as directly audible. Signal strength cannot stand in for distance;
+    locally heard nodes here span −60 to −112 dBm, fully overlapping the
+    relayed ones.
+    """
+    hops = _first_not_none(
+        obs.get("hops_away"),
+        info.get("hopsAway"),
+        (latest or {}).get("hop_count"),
+    )
+
+    snr = rssi = None
+    source = "unknown"
+    if obs.get("snr") is not None or obs.get("rssi") is not None:
+        # _update_observed records these off direct packets only.
+        snr, rssi, source = obs.get("snr"), obs.get("rssi"), "direct"
+    elif latest_direct:
+        snr, rssi, source = latest_direct.get("snr"), latest_direct.get("rssi"), "direct"
+    else:
+        snr = _first_not_none(info.get("snr"), (latest or {}).get("snr"))
+        rssi = _first_not_none(info.get("rssi"), (latest or {}).get("rssi"))
+        if snr is not None or rssi is not None:
+            source = "direct" if hops == 0 else ("relayed" if hops is not None else "unknown")
+
+    # "In direct range" is about having heard the node over the air at all, not
+    # about the path the newest packet happened to take: successive packets from
+    # one node routinely arrive direct and relayed as the mesh reroutes, so
+    # keying this off the latest hop count alone would flip a neighbour in and
+    # out of range packet by packet. hops_away stays the *latest* distance;
+    # last_direct_heard is how the caller judges whether "direct" is still true.
+    last_direct = (latest_direct or {}).get("timestamp")
+    return {
+        "snr": snr,
+        "rssi": rssi,
+        "hops_away": hops,
+        "heard_directly": source == "direct" or hops == 0,
+        "signal_source": source,
+        "last_direct_heard": (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_direct)) if last_direct else None
+        ),
+    }
+
+
 async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     """Get a formatted list of all visible Meshtastic nodes in the mesh."""
     adapter_inst = _get_adapter()
@@ -173,6 +233,10 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     results = []
     interfaces = adapter_inst.get_interfaces()
     seen_nodes = set()
+
+    # Two batch reads instead of a per-node query inside the loop.
+    latest_by_node = telemetry_db.get_latest_signal_by_node()
+    latest_direct_by_node = telemetry_db.get_latest_signal_by_node(direct_only=True)
 
     for iface in interfaces:
         nodes = getattr(iface, "nodes", {}) or {}
@@ -187,15 +251,7 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
             # Live-observed overlay (fresher than the library node DB, which only
             # refreshes lastHeard/signal from periodic NodeInfo packets).
             obs = adapter_inst.get_observed_node(nid)
-
-            # Prefer observed signal, then library, then persisted history.
-            snr = obs.get("snr", info.get("snr"))
-            rssi = obs.get("rssi", info.get("rssi"))
-            if snr is None or rssi is None:
-                history = telemetry_db.get_signal_history(nid, limit=1)
-                if history:
-                    snr = snr if snr is not None else history[0].get("snr")
-                    rssi = rssi if rssi is not None else history[0].get("rssi")
+            link = _link_facts(info, obs, latest_by_node.get(nid), latest_direct_by_node.get(nid))
 
             # last_heard: freshest of the library value and what we've observed.
             last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
@@ -211,9 +267,13 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
                     "hw_model": user.get("hwModel", "Unknown"),
                     "role": user.get("role", "Unknown"),
                     "battery_level": metrics.get("batteryLevel", "N/A"),
-                    "snr": snr if snr is not None else "N/A",
-                    "rssi": rssi if rssi is not None else "N/A",
-                    "signal_quality": assess_signal_quality(snr),
+                    "snr": link["snr"] if link["snr"] is not None else "N/A",
+                    "rssi": link["rssi"] if link["rssi"] is not None else "N/A",
+                    "signal_quality": assess_signal_quality(link["snr"]),
+                    "signal_source": link["signal_source"],
+                    "hops_away": link["hops_away"],
+                    "heard_directly": link["heard_directly"],
+                    "last_direct_heard": link["last_direct_heard"],
                     "last_heard": last_heard_str,
                 }
             )
@@ -244,7 +304,11 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     has_public_key = bool(user.get("publicKey"))
 
     # Live-observed overlay (fresher than the library node DB).
-    obs = adapter_inst.get_observed_node(info.get("user", {}).get("id", ""))
+    node_id = info.get("user", {}).get("id", "")
+    obs = adapter_inst.get_observed_node(node_id)
+    history = telemetry_db.get_signal_history(node_id, limit=1)
+    direct_history = telemetry_db.get_latest_signal_by_node(direct_only=True)
+    link = _link_facts(info, obs, history[0] if history else None, direct_history.get(node_id))
     last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
 
     details = {
@@ -263,9 +327,12 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         "latitude": pos.get("latitude"),
         "longitude": pos.get("longitude"),
         "altitude": pos.get("altitude"),
-        "snr": obs.get("snr", info.get("snr")),
-        "rssi": obs.get("rssi", info.get("rssi")),
-        "hops_away": obs.get("hops_away", info.get("hopsAway")),
+        "snr": link["snr"],
+        "rssi": link["rssi"],
+        "signal_source": link["signal_source"],
+        "hops_away": link["hops_away"],
+        "heard_directly": link["heard_directly"],
+        "last_direct_heard": link["last_direct_heard"],
         "last_heard": (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_heard))
             if last_heard
@@ -292,18 +359,15 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     _, info = resolve_node(node_id_query, adapter_inst)
     node_id = info.get("user", {}).get("id") if info else node_id_query
 
-    # Prefer live-observed SNR/RSSI (fresher than the library node DB), then the
-    # library value, then persisted history below.
-    obs = adapter_inst.get_observed_node(node_id) if node_id else {}
-    snr = obs.get("snr", info.get("snr") if info else None)
-    rssi = obs.get("rssi", info.get("rssi") if info else None)
-
     # Look up historic trend if available
     history = telemetry_db.get_signal_history(node_id, limit=5)
 
-    if snr is None and history:
-        snr = history[0].get("snr")
-        rssi = history[0].get("rssi")
+    obs = adapter_inst.get_observed_node(node_id) if node_id else {}
+    direct_history = telemetry_db.get_latest_signal_by_node(direct_only=True)
+    link = _link_facts(
+        info or {}, obs, history[0] if history else None, direct_history.get(node_id)
+    )
+    snr, rssi = link["snr"], link["rssi"]
 
     if snr is None:
         return json.dumps(
@@ -316,7 +380,11 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     trend = []
     for h in history:
         t_str = time.strftime("%H:%M:%S", time.localtime(h["timestamp"]))
-        trend.append({"time": t_str, "snr": h["snr"], "rssi": h["rssi"]})
+        # hop_count per reading: a trend that mixes direct and relayed samples
+        # is not a trend of one link, and reads as fluctuation that isn't there.
+        trend.append(
+            {"time": t_str, "snr": h["snr"], "rssi": h["rssi"], "hops_away": h.get("hop_count")}
+        )
 
     quality_label = assess_signal_quality(snr)
 
@@ -327,6 +395,10 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
             "snr": snr,
             "rssi": rssi,
             "quality": quality_label,
+            "signal_source": link["signal_source"],
+            "hops_away": link["hops_away"],
+            "heard_directly": link["heard_directly"],
+            "last_direct_heard": link["last_direct_heard"],
         },
         "trend_history": trend,
     }
