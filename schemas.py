@@ -11,9 +11,10 @@ MESH_LIST_NODES_SCHEMA = {
             "their IDs, names, signal metrics, and status. Whether a node is heard DIRECTLY "
             "(in radio range, no relay) is given by 'heard_directly' — never infer it from "
             "signal strength: a relayed packet's SNR/RSSI describe the last hop, so a strong "
-            "reading can belong to a node many hops away. 'heard_directly' means at least "
-            "one packet arrived with 0 hops; 'last_direct_heard' says when, which is how you "
-            "judge whether it still holds. 'hops_away' is the distance of the LATEST packet "
+            "reading can belong to a node many hops away. 'heard_directly' means a 0-hop "
+            "packet arrived within the last 24h (older receptions expire, since a node may "
+            "have moved or gone quiet); 'last_direct_heard' and 'last_direct_heard_age_hours' "
+            "say when. 'hops_away' is the distance of the LATEST packet "
             "and legitimately varies as the mesh reroutes. 'signal_source' says whether the "
             "reading came off a direct packet ('direct'), a relayed one ('relayed'), or is "
             "of unknown origin."
@@ -30,7 +31,12 @@ MESH_NODE_INFO_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_node_info",
-        "description": "Retrieve detailed configuration and hardware status for a specific node in the mesh network.",
+        "description": (
+            "Retrieve detailed configuration and hardware status for a specific node in the "
+            "mesh network. Coordinates are the node's LAST KNOWN fix, not necessarily its "
+            "current position: check 'position_age_hours' / 'position_is_stale' before "
+            "presenting them as where the node is now, especially when plotting a map."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

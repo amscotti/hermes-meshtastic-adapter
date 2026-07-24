@@ -69,6 +69,16 @@ handle_mesh_request_position = meshtastic_tools.handle_mesh_request_position
 handle_mesh_traceroute = meshtastic_tools.handle_mesh_traceroute
 
 
+def _backdate_signal(node_id: str, when: float) -> None:
+    """Age a node's signal rows, to exercise the direct-range expiry window."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+        conn.execute("UPDATE signal_quality SET timestamp = ? WHERE node_id = ?", (when, node_id))
+        conn.commit()
+
+
 class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._env_patcher = patch.dict(
@@ -3112,6 +3122,86 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(node["hops_away"])
         self.assertFalse(node["heard_directly"])
         self.assertEqual(node["signal_source"], "unknown")
+
+    async def test_stale_direct_reception_expires(self):
+        """A node heard directly weeks ago is no longer 'in direct range'.
+
+        Signal history is kept for 30 days, so without a window a node that has
+        since moved or gone quiet would report as a neighbour forever.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee001122"] = {
+            "num": 7,
+            "user": {"id": "!ee001122", "longName": "Long Gone", "shortName": "GON"},
+        }
+        telemetry_db.log_signal("!ee001122", snr=5.0, rssi=-90, hop_count=0)
+        _backdate_signal("!ee001122", time.time() - 20 * 86400)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!ee001122")
+        self.assertFalse(node["heard_directly"])
+        # The evidence is still reported — it just no longer counts as current.
+        self.assertIsNotNone(node["last_direct_heard"])
+        self.assertGreater(node["last_direct_heard_age_hours"], 24)
+
+    async def test_recent_direct_reception_still_counts(self):
+        """Just inside the window, a direct reception is still direct range."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee003344"] = {
+            "num": 8,
+            "user": {"id": "!ee003344", "longName": "Recent", "shortName": "RCT"},
+        }
+        telemetry_db.log_signal("!ee003344", snr=5.0, rssi=-90, hop_count=0)
+        _backdate_signal("!ee003344", time.time() - 6 * 3600)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!ee003344")
+        self.assertTrue(node["heard_directly"])
+
+    async def test_node_info_dates_the_position_fix(self):
+        """Coordinates carry their age, so a stale fix can't pass for current."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee005566"] = {
+            "num": 9,
+            "user": {"id": "!ee005566", "longName": "Mapped", "shortName": "MAP"},
+            "position": {
+                "latitude": 55.1,
+                "longitude": 61.4,
+                "time": time.time() - 48 * 3600,
+            },
+        }
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee005566"}))
+        self.assertAlmostEqual(res["position_age_hours"], 48.0, delta=0.5)
+        self.assertTrue(res["position_is_stale"])
+        self.assertIsNotNone(res["position_time"])
+
+    async def test_node_info_falls_back_to_recorded_position_time(self):
+        """A node DB fix with no timestamp is dated from our own history."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee007788"] = {
+            "num": 10,
+            "user": {"id": "!ee007788", "longName": "Undated", "shortName": "UND"},
+            "position": {"latitude": 55.2, "longitude": 61.5},  # no time field
+        }
+        telemetry_db.log_position("!ee007788", latitude=55.2, longitude=61.5, altitude=200)
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee007788"}))
+        self.assertIsNotNone(res["position_time"])
+        self.assertFalse(res["position_is_stale"])  # just logged
+
+    async def test_node_info_without_position_reports_unknown_age(self):
+        """No coordinates at all means no age claim either."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee009900"] = {
+            "num": 11,
+            "user": {"id": "!ee009900", "longName": "Nowhere", "shortName": "NOW"},
+        }
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee009900"}))
+        self.assertIsNone(res["position_time"])
+        self.assertIsNone(res["position_age_hours"])
+        self.assertIsNone(res["position_is_stale"])
 
     async def test_signal_quality_reports_hops_per_trend_sample(self):
         """The trend must say which samples were direct — mixing links reads as noise."""

@@ -70,6 +70,17 @@ __all__ = [
 _adapter_instance: Any | None = None
 _adapter_lock = threading.RLock()
 
+# How long a 0-hop reception keeps counting as "in direct range". Signal history
+# is kept for 30 days, so without a bound a node heard directly weeks ago would
+# still report as a neighbour. A day comfortably covers nodes that only speak up
+# occasionally, while a node that has moved or gone quiet drops out on its own.
+DIRECT_RANGE_WINDOW_SECS = 24 * 3600
+
+# Position fixes age the same way, but far more consequentially: a stale fix
+# still plots as a confident dot on a coverage map. Beyond this, callers are
+# told the fix is old rather than left to assume it is current.
+POSITION_STALE_AFTER_SECS = 6 * 3600
+
 
 def set_adapter(adapter: Any) -> None:
     """Set the active Meshtastic adapter instance."""
@@ -161,6 +172,30 @@ def _device_uptime(metrics: dict[str, Any] | None) -> Any:
     return _first_not_none(metrics.get("uptimeSeconds"), metrics.get("uptime"))
 
 
+def _position_age(pos: dict[str, Any] | None, node_id: str) -> dict[str, Any]:
+    """Date a position fix, so an old one can't pass for the node's current spot.
+
+    Coordinates from the node DB carry no age of their own, and a fix from last
+    week plots on a coverage map exactly like one from a minute ago — confident,
+    and wrong. The library's ``position.time`` is preferred; our persisted
+    history fills in when the node DB has coordinates but no timestamp.
+    """
+    pos = pos or {}
+    fix_time = _first_not_none(pos.get("time"), pos.get("timestamp"))
+    if fix_time is None and node_id:
+        recorded = telemetry_db.get_position_history(node_id, limit=1)
+        if recorded:
+            fix_time = recorded[0].get("timestamp")
+    if not fix_time:
+        return {"position_time": None, "position_age_hours": None, "position_is_stale": None}
+    age = time.time() - float(fix_time)
+    return {
+        "position_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(fix_time))),
+        "position_age_hours": round(age / 3600, 1),
+        "position_is_stale": age > POSITION_STALE_AFTER_SECS,
+    }
+
+
 # --- Tool Handlers ---
 
 
@@ -186,11 +221,11 @@ def _link_facts(
     locally heard nodes here span −60 to −112 dBm, fully overlapping the
     relayed ones.
     """
-    hops = _first_not_none(
-        obs.get("hops_away"),
-        info.get("hopsAway"),
-        (latest or {}).get("hop_count"),
-    )
+    # Live hops describe the node *now* (this session's packets, and the node DB
+    # the library keeps current); the persisted fallback may be weeks old, so it
+    # fills in the reported distance but cannot by itself assert direct range.
+    live_hops = _first_not_none(obs.get("hops_away"), info.get("hopsAway"))
+    hops = _first_not_none(live_hops, (latest or {}).get("hop_count"))
 
     snr = rssi = None
     source = "unknown"
@@ -205,21 +240,32 @@ def _link_facts(
         if snr is not None or rssi is not None:
             source = "direct" if hops == 0 else ("relayed" if hops is not None else "unknown")
 
-    # "In direct range" is about having heard the node over the air at all, not
-    # about the path the newest packet happened to take: successive packets from
-    # one node routinely arrive direct and relayed as the mesh reroutes, so
-    # keying this off the latest hop count alone would flip a neighbour in and
-    # out of range packet by packet. hops_away stays the *latest* distance;
-    # last_direct_heard is how the caller judges whether "direct" is still true.
+    # "In direct range" is about having heard the node over the air, not about
+    # the path the newest packet happened to take: successive packets from one
+    # node routinely arrive direct and relayed as the mesh reroutes, so keying
+    # this off the latest hop count alone would flip a neighbour in and out of
+    # range packet by packet. hops_away stays the *latest* distance.
+    #
+    # It does expire, though. The signal history is retained for 30 days, and
+    # without a window a node heard directly three weeks ago — since moved, or
+    # switched off — would report as in direct range forever. Live observations
+    # and a current 0-hop reading need no window: both describe now.
     last_direct = (latest_direct or {}).get("timestamp")
+    observed_live = obs.get("snr") is not None or obs.get("rssi") is not None
+    direct_recently = (
+        last_direct is not None and (time.time() - last_direct) <= DIRECT_RANGE_WINDOW_SECS
+    )
     return {
         "snr": snr,
         "rssi": rssi,
         "hops_away": hops,
-        "heard_directly": source == "direct" or hops == 0,
+        "heard_directly": bool(observed_live or live_hops == 0 or direct_recently),
         "signal_source": source,
         "last_direct_heard": (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_direct)) if last_direct else None
+        ),
+        "last_direct_heard_age_hours": (
+            round((time.time() - last_direct) / 3600, 1) if last_direct else None
         ),
     }
 
@@ -274,6 +320,7 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
                     "hops_away": link["hops_away"],
                     "heard_directly": link["heard_directly"],
                     "last_direct_heard": link["last_direct_heard"],
+                    "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
                     "last_heard": last_heard_str,
                 }
             )
@@ -327,12 +374,14 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         "latitude": pos.get("latitude"),
         "longitude": pos.get("longitude"),
         "altitude": pos.get("altitude"),
+        **_position_age(pos, node_id),
         "snr": link["snr"],
         "rssi": link["rssi"],
         "signal_source": link["signal_source"],
         "hops_away": link["hops_away"],
         "heard_directly": link["heard_directly"],
         "last_direct_heard": link["last_direct_heard"],
+        "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
         "last_heard": (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_heard))
             if last_heard
@@ -399,6 +448,7 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
             "hops_away": link["hops_away"],
             "heard_directly": link["heard_directly"],
             "last_direct_heard": link["last_direct_heard"],
+            "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
         },
         "trend_history": trend,
     }

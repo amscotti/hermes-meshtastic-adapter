@@ -150,6 +150,15 @@ So the payload now carries: **`heard_directly`** (at least one 0-hop packet ever
 
 Hops resolve through live observations → the library's `hopsAway` (what the official app shows) → `telemetry_db.get_latest_signal_by_node()`. Only that last source survives a gateway restart, which wipes `_node_freshness._observed` — before it existed, every restart left the agent blind to hops entirely.
 
+### Aged data must not read as current
+
+Signal and position history is retained for 30 days, so anything derived from it needs an explicit age or a window — otherwise the tools state three-week-old facts in the present tense.
+
+- **`heard_directly` expires** after `DIRECT_RANGE_WINDOW_SECS` (24h). Live observations and a *live* 0-hop reading (`obs`/node DB) assert direct range on their own, since both describe now; a persisted 0-hop row only counts inside the window. That split is why `live_hops` exists separately from `hops_away` — the reported distance may come from an old row, but direct range may not.
+- **Position fixes are dated** by `_position_age()`: `position_time`, `position_age_hours`, and `position_is_stale` past `POSITION_STALE_AFTER_SECS` (6h). Coordinates from the node DB carry no age, and an old fix plots on a coverage map exactly like a fresh one — confidently, and in the wrong place.
+
+Do not "clean" the database to deal with staleness. It is ~0.3 MB, `maybe_prune()` already enforces `MESHTASTIC_TELEMETRY_RETENTION_DAYS`, and the persisted history is the only hop source that outlives a restart — wiping it blinds the agent for hours. Express age in the payload instead.
+
 ### Chat ID / session scoping
 
 `_on_receive` decides DM vs broadcast and forms the chat_id that becomes the Hermes session key:
