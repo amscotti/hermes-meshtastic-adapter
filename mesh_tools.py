@@ -645,8 +645,14 @@ async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
         return json.dumps({"node_id": node_id, "answered": False, "error": result.get("error")})
 
     route = result.get("data") or {}
+    logger.info("Meshtastic traceroute raw reply for %s: %s", node_id, route)
     towards = _format_route(route.get("route", []), route.get("snrTowards", []))
     back = _format_route(route.get("routeBack", []), route.get("snrBack", []))
+    # Per-segment SNR (dB), one more value than there are relays — for a 0-hop
+    # direct trace these carry the direct link's SNR each way (the relay lists
+    # are empty then). -128 is the firmware's "unknown" sentinel.
+    snr_towards = [None if v == -128 else v / 4.0 for v in (route.get("snrTowards") or [])]
+    snr_back = [None if v == -128 else v / 4.0 for v in (route.get("snrBack") or [])]
     return json.dumps(
         {
             "node_id": node_id,
@@ -654,10 +660,14 @@ async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
             "hops_towards": len(towards),
             "route_towards": towards,
             "route_back": back,
+            "snr_towards_db": snr_towards,
+            "snr_back_db": snr_back,
             "note": (
-                "route_towards lists the relays carrying traffic to the node; "
-                "route_back is the return path. Asymmetry between them explains "
-                "messages that arrive but are never confirmed."
+                "route_towards/route_back list the relays each way (empty = direct). "
+                "snr_towards_db is per-segment SNR toward the node, snr_back_db back to "
+                "us; for a direct (0-hop) trace each holds the direct link's SNR. "
+                "Asymmetry between the two directions explains messages that arrive but "
+                "are never confirmed."
             ),
         },
         ensure_ascii=False,
