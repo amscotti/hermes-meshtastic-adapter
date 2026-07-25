@@ -1702,12 +1702,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # allowed to talk to Hermes (e.g. a node the user just wants to watch).
             self._update_observed(from_id, packet.get("rxTime"), snr, rssi, hop_count)
 
-            # Restriction check BEFORE any further processing
-            if not self._is_authorized_node(from_id):
-                logger.warning(f"Unauthorized node ID {from_id} skipped.")
-                return
+            decoded = packet.get("decoded", {})
+            portnum = decoded.get("portnum")
 
-            # echo filtering (avoid bot replying to itself)
+            # Echo filtering (avoid bot replying to itself) BEFORE the auth gate:
+            # the local node is normally NOT in the allowlist, so checking auth
+            # first logged every self-echo as "Unauthorized" and made this filter
+            # unreachable dead code.
             my_node_id = None
             if interface:
                 my_node_id = self._get_interface_node_id(interface)
@@ -1715,10 +1716,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if my_node_id and from_id == my_node_id:
                 return
 
-            decoded = packet.get("decoded", {})
-            portnum = decoded.get("portnum")
-
-            # Log signal qualities immediately if present
+            # Observability (signal / telemetry / position) is recorded for EVERY
+            # heard node, BEFORE the auth gate — same rationale as _update_observed
+            # above. The allowlist controls who may *talk to the agent* (the
+            # prompt-injection surface), not what the agent may see of the mesh;
+            # gating these writes left the DB holding data for the single
+            # allowlisted node only, so mesh_telemetry / mesh_signal_quality /
+            # position history were empty for every other node. Safe pre-auth:
+            # these handlers persist numeric fields only (battery/voltage/temp/
+            # humidity/pressure/uptime, lat/lon/alt, snr/rssi/hops) — no
+            # attacker-controlled text is stored or surfaced.
             if snr is not None or rssi is not None:
                 self._run_db_write(lambda: telemetry_db.log_signal(from_id, snr, rssi, hop_count))
 
@@ -1736,6 +1743,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             # We only bridge TEXT messages (TEXT_MESSAGE_APP == 1)
             if portnum not in ("TEXT_MESSAGE_APP", 1, "TEXT_MESSAGE"):
+                return
+
+            # Restriction check — guards the message path into the agent, which
+            # is the only path carrying attacker-controlled text.
+            if not self._is_authorized_node(from_id):
+                logger.warning(f"Unauthorized node ID {from_id} skipped.")
                 return
 
             # Library may expose decoded text and/or raw payload bytes.

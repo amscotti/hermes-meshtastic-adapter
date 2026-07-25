@@ -368,6 +368,78 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(obs.get("last_heard", 0), 0)  # but its freshness IS recorded
         self.assertEqual(obs.get("snr"), 6.0)
 
+    async def test_observability_persisted_for_unauthorized_nodes(self):
+        """Telemetry/position/signal are written to SQLite for EVERY heard node.
+
+        The allowlist controls who may talk to the agent, not what the agent can
+        see of the mesh. Gating these writes left the DB holding data for the one
+        allowlisted node only, so the agent could report nothing current about
+        any other node.
+        """
+        stranger = "!bad55555"  # deliberately not allowlisted
+        self.assertFalse(self.adapter._is_authorized_node(stranger))
+        iface = self.adapter.get_interfaces()[0]
+
+        self.adapter._on_receive(
+            {
+                "fromId": stranger,
+                "toId": "^all",
+                "rxSnr": 5.5,
+                "rxRssi": -95,
+                "hopStart": 3,
+                "hopLimit": 2,
+                "decoded": {
+                    "portnum": "TELEMETRY_APP",
+                    "telemetry": {"deviceMetrics": {"batteryLevel": 77, "voltage": 4.01}},
+                },
+            },
+            iface,
+        )
+        self.adapter._on_receive(
+            {
+                "fromId": stranger,
+                "toId": "^all",
+                "decoded": {
+                    "portnum": "POSITION_APP",
+                    "position": {"latitude": 55.75, "longitude": 37.61, "altitude": 150},
+                },
+            },
+            iface,
+        )
+        await asyncio.sleep(0.15)
+
+        self.assertTrue(telemetry_db.get_telemetry_history(stranger, limit=1))
+        self.assertTrue(telemetry_db.get_position_history(stranger, limit=1))
+        self.assertTrue(telemetry_db.get_signal_history(stranger, limit=1))
+        # ...but its text still never reaches the agent.
+        self.adapter.handle_message.assert_not_called()
+
+    async def test_self_echo_skipped_before_auth_gate(self):
+        """Our own node's packets drop silently, not as "Unauthorized" warnings.
+
+        The local node is normally absent from the allowlist, so running the auth
+        gate first logged every self-echo as unauthorized and left the echo
+        filter unreachable.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        own_id = iface.getMyNodeId()  # !da1b1613
+        # Production shape: the gateway's own node is NOT in the allowlist.
+        self.adapter.allowed_nodes = {"!ab12cd34"}
+        self.assertFalse(self.adapter._is_authorized_node(own_id))
+
+        with self.assertNoLogs("adapter", level="WARNING"):
+            self.adapter._on_receive(
+                {
+                    "fromId": own_id,
+                    "toId": "!ab12cd34",
+                    "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"echo of our reply"},
+                    "id": 6001,
+                },
+                iface,
+            )
+            await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_not_called()
+
     async def test_mesh_list_nodes_prefers_fresh_last_heard(self):
         """mesh_list_nodes overlays observed last_heard over the stale library value."""
         fresher = int(time.time() - 10)  # newer than mock !ab12cd34's lastHeard (now-300)
