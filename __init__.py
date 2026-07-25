@@ -5,7 +5,7 @@ Registers the platform adapter and the meshtastic toolset.
 """
 
 from .adapter import register as register_platform
-from .tools import (
+from .mesh_tools import (
     MESH_LIST_NODES_SCHEMA,
     MESH_NODE_INFO_SCHEMA,
     MESH_SEND_BROADCAST_SCHEMA,
