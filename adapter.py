@@ -2182,10 +2182,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _is_retriable_failure(self, result: SendResult) -> bool:
         """Decide whether a failed chunk send is worth re-sending.
 
-        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
-        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
-        interface, missing pubkey, bad chat_id) carry no ACK record and are
-        never retried — re-sending can't fix them.
+        Retry only on **evidence of non-delivery**, so a lost message gets
+        another chance without flooding the mesh with duplicates:
+
+        * ``TIMEOUT`` — nothing came back at all.
+        * non-permanent ``NAK`` — e.g. ``MAX_RETRANSMIT``, the firmware's own
+          "reliable send failed" verdict after its ``NUM_RELIABLE_RETX`` tries.
+
+        An ``IMPLICIT_ACK`` is deliberately **not** retried: a relay rebroadcast
+        our packet, so the mesh carried it and non-delivery is not established —
+        the destination's real ACK may still arrive. Retrying on implicit is
+        what re-sent one reply many times on a relayed path, since every copy
+        actually reached the user (each app attempt is ~3 radio transmissions).
+
+        Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
+        record and are never retried — re-sending can't fix them.
         """
         ack = (result.raw_response or {}).get("ack")
         if not isinstance(ack, dict):
@@ -2201,8 +2212,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Fail safe and leave delivery to the (already sent) original packet.
         if reason == "DUPLICATE_PACKET_ID":
             return False
-        # No confirmation, or only a relay confirmed — both warrant a retry.
-        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
+        if status == AckStatus.TIMEOUT:
             return True
         if status == AckStatus.NAK:
             return reason not in self.PERMANENT_NAK_REASONS

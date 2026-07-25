@@ -974,7 +974,17 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 f"{reason} should be permanent",
             )
         self.assertFalse(self.adapter._is_retriable_failure(r({"status": AckStatus.ACK})))
-        self.assertTrue(self.adapter._is_retriable_failure(r({"status": AckStatus.IMPLICIT_ACK})))
+        # MAX_RETRANSMIT is the firmware's own "reliable send failed" verdict —
+        # evidence of non-delivery, so worth another attempt.
+        self.assertTrue(
+            self.adapter._is_retriable_failure(
+                r({"status": AckStatus.NAK, "error_reason": "MAX_RETRANSMIT"})
+            )
+        )
+        # An implicit ACK is NOT retried: the mesh carried the packet, so
+        # non-delivery isn't established, and _maybe_record_pubsub_ack can still
+        # upgrade it to a real ACK from the destination's later routing packet.
+        self.assertFalse(self.adapter._is_retriable_failure(r({"status": AckStatus.IMPLICIT_ACK})))
         # Plain strings still match (StrEnum + public JSON surface).
         self.assertTrue(self.adapter._is_retriable_failure(r({"status": "timeout"})))
         self.assertFalse(self.adapter._is_retriable_failure(r(None)))  # pre-send error
@@ -2619,35 +2629,37 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
         self.assertIn("implicit ACK only", res.error or "")
 
-    async def test_implicit_ack_retries_until_real_ack(self):
-        """With retries on, an implicit-only ACK is re-sent; a later real ACK delivers."""
+    async def test_implicit_ack_is_not_retried(self):
+        """An implicit-only ACK must NOT trigger a re-send.
+
+        A relay rebroadcast our packet, so the mesh carried it and non-delivery
+        isn't established. Retrying here re-sent one reply many times on a
+        relayed path — every copy actually reached the user ("answered 10 times"
+        spam). The destination's real ACK, if it comes, is picked up separately
+        by _maybe_record_pubsub_ack, so no retry is needed to notice delivery.
+        """
         iface = self.adapter.get_interfaces()[0]
-        calls = {"n": 0}
 
         def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
-            calls["n"] += 1
-            pid = 92000 + calls["n"]
-            # Attempt 1 gets only a relay (implicit) ACK; attempt 2 the real one.
-            ack_from = "!9e77edec" if calls["n"] == 1 else "!ab12cd34"
             onResponse(
                 {
-                    "fromId": ack_from,
-                    "decoded": {"requestId": pid, "routing": {"errorReason": "NONE"}},
+                    "fromId": "!9e77edec",  # a relay, not the destination
+                    "decoded": {"requestId": 92001, "routing": {"errorReason": "NONE"}},
                 }
             )
-            return SimpleNamespace(id=pid)
+            return SimpleNamespace(id=92001)
 
         iface.sendText = MagicMock(side_effect=send_text)
         with patch.dict(
-            os.environ, {"MESHTASTIC_SEND_RETRIES": "2", "MESHTASTIC_ACK_TIMEOUT": "0.3"}
+            os.environ, {"MESHTASTIC_SEND_RETRIES": "3", "MESHTASTIC_ACK_TIMEOUT": "0.3"}
         ):
             res = await self.adapter.send(
-                chat_id="meshtastic:!ab12cd34", content="retry on implicit"
+                chat_id="meshtastic:!ab12cd34", content="no retry on implicit"
             )
 
-        self.assertTrue(res.success)
-        self.assertEqual(iface.sendText.call_count, 2)  # implicit -> retry -> real ack
-        self.assertEqual(res.raw_response["chunks"][0]["attempts"], 2)
+        self.assertFalse(res.success)  # not confirmed by the destination
+        self.assertEqual(iface.sendText.call_count, 1)  # sent ONCE despite retries=3
+        self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
 
     def test_retry_backoff_defensive_parsing(self):
         """_retry_backoff falls back to the default on non-numeric input."""
