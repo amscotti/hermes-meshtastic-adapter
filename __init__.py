@@ -8,8 +8,10 @@ from .adapter import register as register_platform
 from .mesh_tools import (
     MESH_LIST_NODES_SCHEMA,
     MESH_NODE_INFO_SCHEMA,
+    MESH_PAUSE_SCHEMA,
     MESH_REQUEST_POSITION_SCHEMA,
     MESH_REQUEST_TELEMETRY_SCHEMA,
+    MESH_RESUME_SCHEMA,
     MESH_SEND_BROADCAST_SCHEMA,
     MESH_SEND_DM_SCHEMA,
     MESH_SIGNAL_QUALITY_SCHEMA,
@@ -18,8 +20,10 @@ from .mesh_tools import (
     MESH_TRACEROUTE_SCHEMA,
     handle_mesh_list_nodes,
     handle_mesh_node_info,
+    handle_mesh_pause,
     handle_mesh_request_position,
     handle_mesh_request_telemetry,
+    handle_mesh_resume,
     handle_mesh_send_broadcast,
     handle_mesh_send_dm,
     handle_mesh_signal_quality,
@@ -118,4 +122,20 @@ def register(ctx):
         handler=handle_mesh_traceroute,
         is_async=True,
         emoji="🛰️",
+    )
+    ctx.register_tool(
+        name="mesh_pause",
+        toolset="meshtastic",
+        schema=MESH_PAUSE_SCHEMA,
+        handler=handle_mesh_pause,
+        is_async=True,
+        emoji="⏸️",
+    )
+    ctx.register_tool(
+        name="mesh_resume",
+        toolset="meshtastic",
+        schema=MESH_RESUME_SCHEMA,
+        handler=handle_mesh_resume,
+        is_async=True,
+        emoji="▶️",
     )

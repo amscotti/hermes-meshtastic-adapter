@@ -435,6 +435,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._response_waiters: dict[tuple[str, str], list[ConcurrentFuture]] = {}
         self._response_lock = threading.Lock()
 
+        # Pause state: when set, the reconnect loop releases the node's socket
+        # and stops reconnecting so another client (phone / web UI) can take the
+        # node's limited TCP slot. _pause_until arms an auto-resume.
+        self._paused = False
+        self._pause_until: float | None = None
+
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
         # a *different* loop (agent session). ACK completion uses
@@ -1139,11 +1145,78 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._link_drop_counts["node_absent"],
         )
 
+    def pause_link(self, minutes: float | None = None) -> dict[str, Any]:
+        """Release the radio while leaving the rest of the gateway running.
+
+        The node accepts a limited number of TCP clients, so working with it
+        from a phone or the web UI means the gateway has to let go first.
+        Stopping the whole gateway for that is a blunt instrument — it drops
+        every platform and every in-flight conversation — and an agent cannot do
+        it at all without killing the process it is running in. Pausing keeps the
+        process, the queues and the other platforms up; only the interface is
+        closed and the reconnect loop parked.
+        """
+        self._paused = True
+        self._pause_until = time.time() + minutes * 60 if minutes else None
+        logger.info(
+            "Meshtastic link paused%s",
+            f" for {minutes:g} minute(s)" if minutes else " until resumed",
+        )
+        return self.pause_state()
+
+    def resume_link(self) -> dict[str, Any]:
+        """Re-arm the reconnect loop; it reconnects on its own within ~1s."""
+        was_paused = self._paused
+        self._paused = False
+        self._pause_until = None
+        if was_paused:
+            logger.info("Meshtastic link resumed")
+        return self.pause_state()
+
+    def pause_state(self) -> dict[str, Any]:
+        """Current pause status, for tools to report instead of guessing."""
+        return {
+            "paused": self._paused,
+            "resumes_at": (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._pause_until))
+                if self._pause_until
+                else None
+            ),
+            "resumes_in_minutes": (
+                round((self._pause_until - time.time()) / 60, 1) if self._pause_until else None
+            ),
+        }
+
+    def _pause_expired(self) -> bool:
+        """Auto-resume once a timed pause runs out.
+
+        Polled from the reconnect loop rather than armed as a timer: the loop
+        already ticks, and a timed pause exists so that "switch it off for a bit"
+        cannot silently become "the mesh was down all night".
+        """
+        if self._paused and self._pause_until and time.time() >= self._pause_until:
+            logger.info("Meshtastic pause expired — resuming link")
+            self.resume_link()
+            return True
+        return False
+
     async def _reconnect_loop(self, target: str, lifecycle_id: int):
         """Exponential backoff reconnect loop for one connection target."""
         backoff = 1.0
         while self._lifecycle_is_active(lifecycle_id):
             try:
+                # Paused: release the node's socket (via the serialized close)
+                # and don't reconnect, so another client can take its TCP slot.
+                self._pause_expired()
+                if self._paused:
+                    active, dropped = self._pop_interface_for_lifecycle(target, lifecycle_id)
+                    if not active:
+                        break
+                    if dropped is not None:
+                        logger.info("Releasing Meshtastic interface %s while paused", target)
+                        await self._close_interfaces([dropped])
+                    await asyncio.sleep(1.0)
+                    continue
                 with self._iface_lock:
                     needs_connect = target not in self._interfaces
                 if needs_connect:
