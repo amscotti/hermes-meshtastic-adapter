@@ -51,7 +51,7 @@ and `coverage`+`unittest` — all four must pass. Pyrefly hides warnings unless
 Five source modules, no package nesting:
 
 - **`adapter.py`** — `MeshtasticAdapter(BasePlatformAdapter)`, the heart of the plugin. Handles serial connection, the inbound→Hermes bridge, and the outbound chunked send path.
-- **`tools.py`** — the seven `mesh_*` async tool handlers exposed to the agent.
+- **`mesh_tools.py`** — the `mesh_*` async tool handlers exposed to the agent. Named `mesh_tools`, **not** `tools`, so it can't shadow Hermes' own top-level `tools` package (see the collision note under Conventions).
 - **`schemas.py`** — JSON function schemas for those tools.
 - **`telemetry_db.py`** — SQLite persistence (`telemetry`, `positions`, `signal_quality` tables) at `~/.hermes/meshtastic_telemetry.db`.
 - **`__init__.py`** — `register(ctx)` plugin entry point.
@@ -116,7 +116,7 @@ The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, ol
 
 ## Conventions and gotchas
 
-- **`tools.py` is loaded as the module `meshtastic_tools`**, not `tools`, to avoid colliding with Hermes' own `tools` package. `adapter._load_tools_module` and `test_meshtastic.py` both do this dynamic load; preserve it.
+- **The tool module is `mesh_tools.py`, loaded under the logical name `meshtastic_tools`.** It must NOT be named `tools.py`: Hermes' own code imports `tools.registry` transitively while `gateway` is imported, and a top-level `tools.py` in this repo (which sits first on `sys.path` in the flat test/CI layout) shadows Hermes' `tools` package and breaks the whole import. Loading it dynamically as `meshtastic_tools` was not enough — the collision is at *Hermes'* import site, not ours — hence the distinct filename. `adapter._load_tools_module` and `test_meshtastic.py` both load `mesh_tools.py`; preserve the naming.
 - **The adapter↔tools link is a module-level singleton.** `connect()` calls `tools.set_adapter(self)`; handlers reach it via `_get_adapter()`. Tools return `{"error": ...}` JSON when no adapter is active.
 - **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` to work both as a package (in Hermes) and as flat modules (in tests/CI). Keep this pattern when adding modules.
 - Node IDs are `!`-prefixed 8-hex (`!da1b1613`); the allowlist matches with and without the `!`.

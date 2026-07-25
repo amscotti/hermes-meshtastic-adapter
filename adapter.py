@@ -961,8 +961,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if "meshtastic_tools" in sys.modules:
             return sys.modules["meshtastic_tools"]
         if __package__:
-            return importlib.import_module(f"{__package__}.tools")
-        return importlib.import_module("tools")
+            return importlib.import_module(f"{__package__}.mesh_tools")
+        return importlib.import_module("mesh_tools")
 
     def _tools_set_adapter_fn(self) -> Callable[[object | None], None]:
         """Return the companion tools module's set_adapter function."""
