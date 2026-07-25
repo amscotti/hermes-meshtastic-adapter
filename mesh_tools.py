@@ -530,7 +530,11 @@ def _requested_node(args: dict, adapter_inst: Any) -> tuple[str | None, str | No
     """Resolve the target node id from args. Returns (node_id, error)."""
     query = args.get("node_id")
     if not query:
-        return None, "Parameter 'node_id' is required."
+        return None, (
+            "node_id is required — retry this call with the target node's ID "
+            "(e.g. node_id='!9eabacac') or its name (e.g. node_id='Цаца'). "
+            "Use mesh_list_nodes if you need the ID."
+        )
     _iface, info = resolve_node(query, adapter_inst)
     if info:
         resolved = (info.get("user", {}) or {}).get("id")
@@ -540,7 +544,10 @@ def _requested_node(args: dict, adapter_inst: Any) -> tuple[str | None, str | No
     # not have broadcast NodeInfo to us yet.
     if isinstance(query, str) and query.startswith("!"):
         return query, None
-    return None, f"Node '{query}' was not found in the mesh database."
+    return None, (
+        f"No node matched '{query}'. Pass an exact node ID (e.g. '!9eabacac') "
+        "or a name from mesh_list_nodes."
+    )
 
 
 async def handle_mesh_request_telemetry(args: dict, **kwargs) -> str:
