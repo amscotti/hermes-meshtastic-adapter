@@ -93,5 +93,13 @@ class MockSerialInterface:
         )
         return SimpleNamespace(id=int(time.time() * 1000) & 0xFFFFFFFF)
 
+    def sendData(self, data, destinationId=None, portNum=None, wantResponse=False, **kwargs):
+        logger.info(
+            f"[Mock] sendData portNum={portNum} to {destinationId} (wantResponse={wantResponse})"
+        )
+
+    def getMyNodeInfo(self):
+        return {"deviceMetrics": {"batteryLevel": 50, "voltage": 3.8}}
+
     def close(self):
         logger.info("[Mock] Closed connection")

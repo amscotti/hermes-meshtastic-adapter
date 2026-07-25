@@ -393,6 +393,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._link_down_since: dict[str, float] = {}
         self._link_drop_counts: dict[str, int] = {"socket_reset": 0, "node_absent": 0}
 
+        # Waiters for *solicited* replies (telemetry / position / traceroute
+        # requested with wantResponse). Keyed (kind, node_id) -> ConcurrentFuture
+        # list; _on_receive resolves them when the matching packet arrives. Same
+        # thread-safe storage/resolution model as _ack_futures.
+        self._response_waiters: dict[tuple[str, str], list[ConcurrentFuture]] = {}
+        self._response_lock = threading.Lock()
+
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
         # a *different* loop (agent session). ACK completion uses
@@ -1613,6 +1620,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if not from_id:
                 return
 
+            # Resolve any solicited-request waiter for this node. Done here,
+            # before the auth gate — a reply is protocol data addressed to us,
+            # so the allowlist (which gates who may talk to the agent) must not
+            # drop it. The normal telemetry/position DB logging still runs later.
+            self._maybe_resolve_solicited(from_id, packet.get("decoded", {}) or {})
+
             # Link metadata from the packet envelope.
             # Prefer rx* keys from the radio envelope; use is-not-None so a
             # legitimate 0.0 SNR (or 0 RSSI) is not treated as missing.
@@ -1925,6 +1938,135 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 logger.debug(f"Logged position for node {node_id}")
         except Exception as e:
             logger.error(f"Error logging position packet: {e}")
+
+    # ------------------------------------------------------------------
+    # Solicited requests (agent actively asks a node for data)
+    #
+    # Unlike the read-only tools that serve already-heard data, these put a
+    # packet on the shared LoRa channel. Each is addressed to ONE node and is
+    # never retried — a silent node just reports "no response". Waiters use the
+    # same ConcurrentFuture model as ACK waiters; the transmit goes through the
+    # lifecycle transport executor so it can't race close.
+    # ------------------------------------------------------------------
+
+    def _register_response_waiter(self, kind: str, node_id: str) -> ConcurrentFuture:
+        """Arm a waiter for a solicited reply of *kind* from *node_id*."""
+        future: ConcurrentFuture = ConcurrentFuture()
+        with self._response_lock:
+            self._response_waiters.setdefault((kind, node_id), []).append(future)
+        return future
+
+    def _resolve_response_waiters(self, kind: str, node_id: str, payload: dict) -> None:
+        """Hand *payload* to anyone waiting on a *kind* reply from *node_id*."""
+        with self._response_lock:
+            futures = self._response_waiters.pop((kind, node_id), [])
+        for future in futures:
+            if not future.done():
+                self._set_ack_future_result(future, payload)
+
+    def _maybe_resolve_solicited(self, from_id: str, decoded: dict) -> None:
+        """Feed a telemetry/position/traceroute packet to any matching waiter."""
+        if not isinstance(decoded, dict):
+            return
+        portnum = decoded.get("portnum")
+        if portnum in ("TELEMETRY_APP", 67):
+            self._resolve_response_waiters("telemetry", from_id, decoded.get("telemetry", decoded))
+        elif portnum in ("POSITION_APP", 3):
+            self._resolve_response_waiters("position", from_id, decoded.get("position", decoded))
+        elif portnum in ("TRACEROUTE_APP", 70):
+            route = decoded.get("traceroute") or decoded.get("routeDiscovery") or {}
+            self._resolve_response_waiters("traceroute", from_id, route)
+
+    def _discard_response_waiter(self, kind: str, node_id: str, future: ConcurrentFuture) -> None:
+        """Drop a waiter that timed out so the registry can't grow unbounded."""
+        with self._response_lock:
+            pending = self._response_waiters.get((kind, node_id))
+            if not pending:
+                return
+            if future in pending:
+                pending.remove(future)
+            if not pending:
+                self._response_waiters.pop((kind, node_id), None)
+
+    async def _solicit(
+        self,
+        kind: str,
+        node_id: str,
+        send: Callable[[Any], Any],
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Send a request to one node and await its reply.
+
+        Returns ``{"ok": True, "data": ...}`` or ``{"ok": False, "error": ...}``
+        — never raises for an unanswered request, since silence is the normal
+        outcome for a distant node.
+        """
+        dest = self._normalize_node_id(node_id) or node_id
+        ifaces = self.get_interfaces()
+        with self._lifecycle_lock:
+            executor = self._transport_executor
+        if not ifaces or executor is None:
+            return {"ok": False, "error": "No active Meshtastic interfaces connected"}
+        iface = ifaces[0]
+
+        future = self._register_response_waiter(kind, dest)
+        try:
+            await asyncio.wrap_future(executor.submit(lambda: send(iface)))
+        except Exception as e:
+            self._discard_response_waiter(kind, dest, future)
+            logger.error("Meshtastic %s request to %s failed to send: %s", kind, dest, e)
+            return {"ok": False, "error": f"Could not send {kind} request: {e}"}
+
+        logger.info("Meshtastic %s requested from %s (timeout=%.0fs)", kind, dest, timeout)
+        try:
+            data = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            self._discard_response_waiter(kind, dest, future)
+            logger.info("Meshtastic %s request to %s timed out", kind, dest)
+            return {
+                "ok": False,
+                "error": (
+                    f"{dest} did not answer the {kind} request within {timeout:.0f}s. "
+                    "The node may be out of range, asleep, or the reply was lost."
+                ),
+            }
+        logger.info("Meshtastic %s reply received from %s", kind, dest)
+        return {"ok": True, "data": data}
+
+    async def request_telemetry(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for fresh device metrics (battery, voltage, uptime)."""
+        return await self._solicit(
+            "telemetry",
+            node_id,
+            lambda iface: iface.sendTelemetry(
+                destinationId=self._normalize_node_id(node_id) or node_id, wantResponse=True
+            ),
+            timeout,
+        )
+
+    async def request_position(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for its current position."""
+        return await self._solicit(
+            "position",
+            node_id,
+            lambda iface: iface.sendPosition(
+                destinationId=self._normalize_node_id(node_id) or node_id, wantResponse=True
+            ),
+            timeout,
+        )
+
+    async def request_traceroute(
+        self, node_id: str, hop_limit: int = 5, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Discover the actual route to a node, with per-hop SNR."""
+        return await self._solicit(
+            "traceroute",
+            node_id,
+            lambda iface: iface.sendTraceRoute(
+                self._normalize_node_id(node_id) or node_id, hop_limit
+            ),
+            timeout,
+        )
 
     async def send(
         self,
