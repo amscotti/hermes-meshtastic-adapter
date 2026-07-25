@@ -34,9 +34,10 @@ platform_registry.register(
 
 import importlib.util
 
-# Load local tools.py dynamically to prevent name collision with Hermes core tools package
+# Load local mesh_tools.py dynamically, exposing it under the logical name
+# "meshtastic_tools" (kept for back-compat with the module singleton).
 tools_spec = importlib.util.spec_from_file_location(
-    "meshtastic_tools", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools.py")
+    "meshtastic_tools", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mesh_tools.py")
 )
 meshtastic_tools = importlib.util.module_from_spec(tools_spec)
 sys.modules["meshtastic_tools"] = meshtastic_tools
