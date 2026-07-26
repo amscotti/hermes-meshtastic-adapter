@@ -156,6 +156,7 @@ MESH_REQUEST_TELEMETRY_SCHEMA = {
     "function": {
         "name": "mesh_request_telemetry",
         "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
             "Actively ask ONE node over the air for its current device metrics "
             "(battery, voltage, uptime) and wait for the reply. This transmits on the "
             "shared LoRa channel, so use it only when the user asks about a specific "
@@ -185,6 +186,7 @@ MESH_REQUEST_POSITION_SCHEMA = {
     "function": {
         "name": "mesh_request_position",
         "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
             "Actively ask ONE node over the air for its current position and wait for "
             "the reply. This transmits on the shared LoRa channel — use it only when "
             "the user asks where a specific node is right now; prefer mesh_node_info "
@@ -213,6 +215,7 @@ MESH_TRACEROUTE_SCHEMA = {
     "function": {
         "name": "mesh_traceroute",
         "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
             "Discover the actual radio route to ONE node: which relay nodes carry the "
             "traffic and the SNR of each hop, in both directions. The best tool for "
             "diagnosing why messages to a node are slow, unconfirmed, or lost. "
