@@ -615,11 +615,29 @@ async def handle_mesh_request_position(args: dict, **kwargs) -> str:
     )
 
 
-def _format_route(route: list, snr: list) -> list[dict[str, Any]]:
-    """Pair route hops with their SNR readings. SNR is sent scaled by 4."""
+def _node_display_name(adapter_inst: Any, node_id: str | None) -> str:
+    """Resolve a node id to a human name (long → short), falling back to the id.
+
+    IDs like '!6982b824' are hard to read; the agent should report the name the
+    user knows the node by whenever the node DB has one.
+    """
+    if not node_id:
+        return node_id or ""
+    _iface, info = resolve_node(node_id, adapter_inst)
+    user = (info or {}).get("user", {}) or {}
+    name = user.get("longName") or user.get("shortName")
+    return str(name) if name else node_id
+
+
+def _format_route(route: list, snr: list, adapter_inst: Any) -> list[dict[str, Any]]:
+    """Pair route hops (as readable names) with their SNR. SNR is scaled by 4."""
     hops: list[dict[str, Any]] = []
     for i, num in enumerate(route or []):
-        entry: dict[str, Any] = {"node_id": f"!{num:08x}" if isinstance(num, int) else num}
+        node_id = f"!{num:08x}" if isinstance(num, int) else str(num)
+        entry: dict[str, Any] = {
+            "name": _node_display_name(adapter_inst, node_id),
+            "node_id": node_id,
+        }
         if i < len(snr or []):
             raw = snr[i]
             if isinstance(raw, (int, float)):
@@ -646,8 +664,8 @@ async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
 
     route = result.get("data") or {}
     logger.info("Meshtastic traceroute raw reply for %s: %s", node_id, route)
-    towards = _format_route(route.get("route", []), route.get("snrTowards", []))
-    back = _format_route(route.get("routeBack", []), route.get("snrBack", []))
+    towards = _format_route(route.get("route", []), route.get("snrTowards", []), adapter_inst)
+    back = _format_route(route.get("routeBack", []), route.get("snrBack", []), adapter_inst)
     # Per-segment SNR (dB), one more value than there are relays — for a 0-hop
     # direct trace these carry the direct link's SNR each way (the relay lists
     # are empty then). -128 is the firmware's "unknown" sentinel.
@@ -656,6 +674,7 @@ async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
     return json.dumps(
         {
             "node_id": node_id,
+            "name": _node_display_name(adapter_inst, node_id),
             "answered": True,
             "hops_towards": len(towards),
             "route_towards": towards,
