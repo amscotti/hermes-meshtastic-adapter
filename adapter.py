@@ -3050,15 +3050,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         raw_response=raw_response,
                     )
                 if status == AckStatus.IMPLICIT_ACK:
-                    return SendResult(
-                        success=False,
-                        message_id=pkt_id,
-                        error=(
-                            f"Meshtastic implicit ACK only for packet {pkt_id} "
-                            f"(relayed by {ack_record.get('ack_from')}; destination not confirmed)"
-                        ),
-                        raw_response=raw_response,
-                    )
+                    # A relay rebroadcast our packet — the mesh is carrying it.
+                    # Treat that as a successful send (the official client's
+                    # DELIVERED, vs RECEIVED for a real end-to-end ACK): the
+                    # destination's real ACK, if it arrives later, is picked up
+                    # by _maybe_record_pubsub_ack and upgrades the record. Not a
+                    # failure — so the gateway does not fire a duplicate
+                    # plain-text fallback, and (implicit not being retriable)
+                    # no re-send either. raw_response keeps status=implicit_ack
+                    # so callers can still tell relay- from end-to-end-confirmed.
+                    return SendResult(success=True, message_id=pkt_id, raw_response=raw_response)
                 # TIMEOUT (including DISCONNECTED from _fail_pending_acks).
                 err_reason = ack_record.get("error_reason")
                 if err_reason == "DISCONNECTED":

@@ -2609,8 +2609,14 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_implicit_ack_from_relay_is_not_delivery(self):
-        """A routing ACK relayed by another node is implicit — not confirmed delivery."""
+    async def test_implicit_ack_is_delivered_but_marked_relay_only(self):
+        """A relay (implicit) ACK counts as a successful send — the mesh carried it.
+
+        Matches the official client's DELIVERED (relay) vs RECEIVED (end-to-end):
+        success is True so the gateway fires no duplicate plain-text fallback,
+        but raw_response keeps status=IMPLICIT_ACK so callers can still tell a
+        relay confirmation from a destination one.
+        """
         iface = self.adapter.get_interfaces()[0]
 
         def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
@@ -2626,9 +2632,8 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "0.3"}):
             res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="implicit ack")
 
-        self.assertFalse(res.success)  # relay heard it, destination did not confirm
+        self.assertTrue(res.success)  # mesh carried it → success (no fallback)
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
-        self.assertIn("implicit ACK only", res.error or "")
 
     async def test_implicit_ack_is_not_retried(self):
         """An implicit-only ACK must NOT trigger a re-send.
@@ -2658,7 +2663,7 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
                 chat_id="meshtastic:!ab12cd34", content="no retry on implicit"
             )
 
-        self.assertFalse(res.success)  # not confirmed by the destination
+        self.assertTrue(res.success)  # mesh carried it (relay) → success, no retry
         self.assertEqual(iface.sendText.call_count, 1)  # sent ONCE despite retries=3
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
 
