@@ -51,7 +51,7 @@ and `coverage`+`unittest` — all four must pass. Pyrefly hides warnings unless
 Five source modules, no package nesting:
 
 - **`adapter.py`** — `MeshtasticAdapter(BasePlatformAdapter)`, the heart of the plugin. Handles serial connection, the inbound→Hermes bridge, and the outbound chunked send path.
-- **`tools.py`** — the seven `mesh_*` async tool handlers exposed to the agent.
+- **`mesh_tools.py`** — the `mesh_*` async tool handlers exposed to the agent. Named `mesh_tools`, **not** `tools`, so it can't shadow Hermes' own top-level `tools` package (see the collision note under Conventions).
 - **`schemas.py`** — JSON function schemas for those tools.
 - **`telemetry_db.py`** — SQLite persistence (`telemetry`, `positions`, `signal_quality` tables) at `~/.hermes/meshtastic_telemetry.db`.
 - **`__init__.py`** — `register(ctx)` plugin entry point.
@@ -100,7 +100,7 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 **Real vs implicit ACK.** ACK lifecycle is the `AckStatus` `StrEnum` (`pending` / `ack` / `implicit_ack` / `nak` / `timeout`). `_record_ack_response` distinguishes a **real** end-to-end ACK (routing ACK sender IS the destination → `AckStatus.ACK`) from an **implicit** ACK relayed by another node (sender ≠ destination → `AckStatus.IMPLICIT_ACK` — packet reached the mesh but dest did not confirm). Mirrors the official client's RECEIVED vs DELIVERED. Only a real ACK (or a NAK) resolves `_wait_for_ack`; an implicit ACK keeps the wait open so a real ACK can still arrive; timeout with only implicit ACKs is retriable. Applies to DMs only (dest is a `!node` id). Values remain plain strings on `raw_response` / `get_ack_status`.
 
-**Optional delivery retry.** `MESHTASTIC_SEND_RETRIES > 0` makes `send()` re-send un-confirmed **DM** chunks up to N times (implies ACK-waiting). `_is_retriable_failure` retries transient failures — `AckStatus.TIMEOUT`, `AckStatus.IMPLICIT_ACK` (relay-only), or a non-permanent NAK; `PERMANENT_NAK_REASONS` (e.g. `TOO_LARGE`) and broadcasts are never retried. Backoff is `MESHTASTIC_RETRY_BACKOFF`; the per-chunk attempt count lands in `raw_response["chunks"][i]["attempts"]`.
+**Optional delivery retry.** `MESHTASTIC_SEND_RETRIES > 0` makes `send()` re-send un-confirmed **DM** chunks up to N times (implies ACK-waiting). `_is_retriable_failure` retries only on **evidence of non-delivery**: `AckStatus.TIMEOUT` (nothing came back) or a NAK whose reason isn't in `PERMANENT_NAK_REASONS` — notably `MAX_RETRANSMIT`, the firmware's own "reliable send failed" verdict after its `NUM_RELIABLE_RETX` (3) attempts. `AckStatus.IMPLICIT_ACK` is **not** retried: a relay rebroadcast the packet, so the mesh carried it and non-delivery isn't established — and `_maybe_record_pubsub_ack` upgrades the record to a real ACK if the destination's routing ACK arrives later. Retrying on implicit re-sent one reply many times on a relayed path (each app attempt is ~3 radio transmissions), and every copy reached the user. `PERMANENT_NAK_REASONS` (e.g. `TOO_LARGE`) and broadcasts are never retried. Backoff is `MESHTASTIC_RETRY_BACKOFF`; the per-chunk attempt count lands in `raw_response["chunks"][i]["attempts"]`.
 
 `edit_message` deliberately returns unsupported — LoRa has no edit primitive, and emulating it would flood the mesh.
 
@@ -116,7 +116,7 @@ The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, ol
 
 ## Conventions and gotchas
 
-- **`tools.py` is loaded as the module `meshtastic_tools`**, not `tools`, to avoid colliding with Hermes' own `tools` package. `adapter._load_tools_module` and `test_meshtastic.py` both do this dynamic load; preserve it.
+- **The tool module is `mesh_tools.py`, loaded under the logical name `meshtastic_tools`.** It must NOT be named `tools.py`: Hermes' own code imports `tools.registry` transitively while `gateway` is imported, and a top-level `tools.py` in this repo (which sits first on `sys.path` in the flat test/CI layout) shadows Hermes' `tools` package and breaks the whole import. Loading it dynamically as `meshtastic_tools` was not enough — the collision is at *Hermes'* import site, not ours — hence the distinct filename. `adapter._load_tools_module` and `test_meshtastic.py` both load `mesh_tools.py`; preserve the naming.
 - **The adapter↔tools link is a module-level singleton.** `connect()` calls `tools.set_adapter(self)`; handlers reach it via `_get_adapter()`. Tools return `{"error": ...}` JSON when no adapter is active.
 - **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` to work both as a package (in Hermes) and as flat modules (in tests/CI). Keep this pattern when adding modules.
 - Node IDs are `!`-prefixed 8-hex (`!da1b1613`); the allowlist matches with and without the `!`.

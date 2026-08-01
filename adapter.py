@@ -961,8 +961,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if "meshtastic_tools" in sys.modules:
             return sys.modules["meshtastic_tools"]
         if __package__:
-            return importlib.import_module(f"{__package__}.tools")
-        return importlib.import_module("tools")
+            return importlib.import_module(f"{__package__}.mesh_tools")
+        return importlib.import_module("mesh_tools")
 
     def _tools_set_adapter_fn(self) -> Callable[[object | None], None]:
         """Return the companion tools module's set_adapter function."""
@@ -2182,10 +2182,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _is_retriable_failure(self, result: SendResult) -> bool:
         """Decide whether a failed chunk send is worth re-sending.
 
-        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
-        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
-        interface, missing pubkey, bad chat_id) carry no ACK record and are
-        never retried — re-sending can't fix them.
+        Retry only on **evidence of non-delivery**, so a lost message gets
+        another chance without flooding the mesh with duplicates:
+
+        * ``TIMEOUT`` — nothing came back at all.
+        * non-permanent ``NAK`` — e.g. ``MAX_RETRANSMIT``, the firmware's own
+          "reliable send failed" verdict after its ``NUM_RELIABLE_RETX`` tries.
+
+        An ``IMPLICIT_ACK`` is deliberately **not** retried: a relay rebroadcast
+        our packet, so the mesh carried it and non-delivery is not established —
+        the destination's real ACK may still arrive. Retrying on implicit is
+        what re-sent one reply many times on a relayed path, since every copy
+        actually reached the user (each app attempt is ~3 radio transmissions).
+
+        Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
+        record and are never retried — re-sending can't fix them.
         """
         ack = (result.raw_response or {}).get("ack")
         if not isinstance(ack, dict):
@@ -2201,8 +2212,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Fail safe and leave delivery to the (already sent) original packet.
         if reason == "DUPLICATE_PACKET_ID":
             return False
-        # No confirmation, or only a relay confirmed — both warrant a retry.
-        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
+        if status == AckStatus.TIMEOUT:
             return True
         if status == AckStatus.NAK:
             return reason not in self.PERMANENT_NAK_REASONS
@@ -3040,15 +3050,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         raw_response=raw_response,
                     )
                 if status == AckStatus.IMPLICIT_ACK:
-                    return SendResult(
-                        success=False,
-                        message_id=pkt_id,
-                        error=(
-                            f"Meshtastic implicit ACK only for packet {pkt_id} "
-                            f"(relayed by {ack_record.get('ack_from')}; destination not confirmed)"
-                        ),
-                        raw_response=raw_response,
-                    )
+                    # A relay rebroadcast our packet — the mesh is carrying it.
+                    # Treat that as a successful send (the official client's
+                    # DELIVERED, vs RECEIVED for a real end-to-end ACK): the
+                    # destination's real ACK, if it arrives later, is picked up
+                    # by _maybe_record_pubsub_ack and upgrades the record. Not a
+                    # failure — so the gateway does not fire a duplicate
+                    # plain-text fallback, and (implicit not being retriable)
+                    # no re-send either. raw_response keeps status=implicit_ack
+                    # so callers can still tell relay- from end-to-end-confirmed.
+                    return SendResult(success=True, message_id=pkt_id, raw_response=raw_response)
                 # TIMEOUT (including DISCONNECTED from _fail_pending_acks).
                 err_reason = ack_record.get("error_reason")
                 if err_reason == "DISCONNECTED":
