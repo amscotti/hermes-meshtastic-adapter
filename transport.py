@@ -331,7 +331,14 @@ def open_interface(target: str) -> Any:
             "(MESHTASTIC_AUTOINSTALL=0 disables the automatic attempt; "
             "MESHTASTIC_MOCK=1 explicitly runs against the mock interface.)"
         )
-    assert meshtastic is not None  # HAS_MESHTASTIC implies the import succeeded
+    # HAS_MESHTASTIC implies the import succeeded; a typed check (not an
+    # assert, which vanishes under python -O) keeps pyrefly narrowing and is
+    # robust regardless of optimization level.
+    if meshtastic is None:
+        raise RuntimeError(
+            "meshtastic import state is inconsistent (HAS_MESHTASTIC=True but "
+            "the module is missing); restart the gateway to re-import."
+        )
     if target.startswith("tcp://"):
         host, port = parse_tcp_target(target)
         return meshtastic.tcp_interface.TCPInterface(hostname=host, portNumber=port)
