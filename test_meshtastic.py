@@ -5,6 +5,7 @@ Unit and Integration Test Suite for Meshtastic Platform Adapter.
 import asyncio
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -733,6 +734,71 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
     def test_keepalive_mock_interface_defaults_alive(self):
         """An interface with no known liveness handle is treated as alive."""
         self.assertTrue(self.adapter._interface_is_alive(self.adapter.get_interfaces()[0]))
+
+    def test_tcp_keepalive_armed_once_per_socket(self):
+        """SO_KEEPALIVE is set on connect and re-armed only when the socket changes."""
+
+        class FakeSocket:
+            def __init__(self):
+                self.opts = []
+                self.ioctls = []
+
+            def setsockopt(self, level, opt, value):
+                self.opts.append((level, opt, value))
+
+            def ioctl(self, control, args):
+                self.ioctls.append((control, args))
+
+        sock = FakeSocket()
+        iface = SimpleNamespace(socket=sock)
+        self.adapter._apply_tcp_keepalive(iface)
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), sock.opts)
+        # Idle/interval tuning goes through whichever knob the platform exposes.
+        self.assertTrue(len(sock.opts) > 1 or sock.ioctls)
+
+        # A second poll on the same socket must not re-issue the options.
+        before = len(sock.opts) + len(sock.ioctls)
+        self.adapter._apply_tcp_keepalive(iface)
+        self.assertEqual(len(sock.opts) + len(sock.ioctls), before)
+
+        # ...but the library's self-heal swaps the socket, which must re-arm.
+        iface.socket = FakeSocket()
+        self.adapter._apply_tcp_keepalive(iface)
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), iface.socket.opts)
+
+    def test_tcp_keepalive_survives_unsupported_socket(self):
+        """A socket that rejects the options must not break the connection."""
+
+        class RejectingSocket:
+            def setsockopt(self, *args):
+                raise OSError("not supported here")
+
+        # Serial interfaces have no socket at all — also a no-op, not a crash.
+        self.adapter._apply_tcp_keepalive(SimpleNamespace(socket=None))
+        self.adapter._apply_tcp_keepalive(SimpleNamespace(socket=RejectingSocket()))
+        self.assertIsNone(self.adapter._keepalive_socket_id)
+
+    def test_link_recovery_separates_socket_resets_from_absent_nodes(self):
+        """A drop is classified by how long the node stayed unreachable."""
+        target = "tcp://192.168.1.69:4403"
+
+        # Back within seconds: the node stayed up, only the socket died.
+        self.adapter._note_link_drop(target)
+        self.adapter._report_link_recovery(target)
+        self.assertEqual(self.adapter._link_drop_counts["socket_reset"], 1)
+        self.assertEqual(self.adapter._link_drop_counts["node_absent"], 0)
+
+        # Gone for minutes: the node itself was away (reboot / WiFi / power).
+        self.adapter._note_link_drop(target)
+        self.adapter._link_down_since[target] -= 120
+        self.adapter._report_link_recovery(target)
+        self.assertEqual(self.adapter._link_drop_counts["socket_reset"], 1)
+        self.assertEqual(self.adapter._link_drop_counts["node_absent"], 1)
+
+        # A connect that never followed a drop (first ever) reports nothing.
+        self.adapter._report_link_recovery(target)
+        self.assertEqual(sum(self.adapter._link_drop_counts.values()), 2)
+        self.assertFalse(self.adapter._link_down_since)
 
     async def test_send_without_queueing_fails_when_disconnected(self):
         """Verify cron-style sends do not silently queue on disconnected adapters."""

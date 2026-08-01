@@ -110,6 +110,10 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, oldest-first eviction; messages queued during a disconnect are lost if the gateway restarts before draining.
 
+**TCP keepalive is armed by us, not the library.** `_apply_tcp_keepalive()` sets `SO_KEEPALIVE` plus idle/interval/count (30s/10s/3) on the node socket, through whichever knob the platform exposes — `TCP_KEEPIDLE` on Linux, `SIO_KEEPALIVE_VALS` via ioctl on Windows, `TCP_KEEPALIVE` on macOS. Without it a silently dead link stays "connected" until the library's **300s** heartbeat or our next failing send, whichever comes first. `TCPInterface._reconnect()` swaps in a fresh socket on any read/write failure and socket options do not survive that, so the liveness poll re-arms whenever the socket identity changes (`_keepalive_socket_id`); it is a cheap no-op otherwise.
+
+**Drops are classified in the log.** `_note_link_drop` timestamps the outage and `_report_link_recovery` reports it on reconnect, splitting **socket resets** (back within `SOCKET_RESET_MAX_OUTAGE_SECS`, i.e. the node stayed up) from **node absences** (longer — reboot, WiFi drop, power loss), with running session totals. The distinction is the whole diagnosis: a handful of resets is normal for an ESP32 over WiFi, while repeated long absences are the node's own health and not something the adapter can fix. Log forensics of 2026-07-24 turned 16 apparent "drops" into 11 absences (user-initiated reboots) and 5 genuine resets — the counters exist so that analysis doesn't have to be redone by hand.
+
 ### Cron / standalone delivery
 
 `_standalone_send` (wired via `cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL"`) spins up a **short-lived** adapter connection with `allow_queueing=False` so cron failures surface. It does not reuse the live gateway adapter.
