@@ -10,6 +10,7 @@ import importlib
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -60,8 +61,11 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Value snapshots re-exported so existing imports/tests keep resolving.
-# transport reads its own module attributes at call time, so tests must
-# patch transport.HAS_MESHTASTIC / transport.pub, not these adapter copies.
+# transport reads its own module attributes at call time (the library can be
+# pip-installed and re-imported after this module loads — see
+# transport.ensure_meshtastic_library), so tests must patch
+# transport.HAS_MESHTASTIC / transport.pub, not these adapter copies, and the
+# adapter's subscription path reads transport.* itself.
 HAS_MESHTASTIC = transport.HAS_MESHTASTIC
 pub = transport.pub
 DEFAULT_TCP_PORT = transport.DEFAULT_TCP_PORT
@@ -366,6 +370,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # (no case fold, no bang-normalization). Expand the env so its second
         # gate accepts the same forms we accept at intake. See authz_mixin.
         self._expand_allowlist_env_for_gateway()
+        # Cron/notification delivery passes MESHTASTIC_HOME_CHANNEL through as
+        # the chat id; fix the all-too-common missing-prefix misconfiguration.
+        self._expand_home_channel_env_for_gateway()
+
+        if not transport.HAS_MESHTASTIC:
+            logger.error(
+                "meshtastic library is NOT installed in the gateway's Python "
+                "environment — the radio will NOT work and connections fail. "
+                "The adapter attempts one automatic install "
+                "(MESHTASTIC_AUTOINSTALL=0 to disable), or run manually:\n"
+                "  %s -m pip install -r %s",
+                sys.executable,
+                transport._requirements_path(),
+            )
 
         # Live-observed per-node overlay (last_heard / signal learned from the
         # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
@@ -683,17 +701,24 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return None
 
     def _subscribe_pubsub(self) -> None:
-        """Subscribe once per adapter lifecycle, independent of interface count."""
-        if not HAS_MESHTASTIC or not pub or self._pubsub_subscribed:
+        """Subscribe once per adapter lifecycle, independent of interface count.
+
+        Reads transport.HAS_MESHTASTIC / transport.pub at call time (not the
+        module-level snapshots): ensure_meshtastic_library() may pip-install
+        and re-import the library after this module was imported.
+        """
+        if not transport.HAS_MESHTASTIC or not transport.pub or self._pubsub_subscribed:
             return
+        pub = transport.pub
         pub.subscribe(self._on_receive_pubsub, "meshtastic.receive")
         pub.subscribe(self._on_connection_lost, "meshtastic.connection.lost")
         pub.subscribe(self._on_connection_established, "meshtastic.connection.established")
         self._pubsub_subscribed = True
 
     def _unsubscribe_pubsub(self) -> None:
-        if not HAS_MESHTASTIC or not pub or not self._pubsub_subscribed:
+        if not transport.HAS_MESHTASTIC or not transport.pub or not self._pubsub_subscribed:
             return
+        pub = transport.pub
         pub.unsubscribe(self._on_receive_pubsub, "meshtastic.receive")
         pub.unsubscribe(self._on_connection_lost, "meshtastic.connection.lost")
         pub.unsubscribe(self._on_connection_established, "meshtastic.connection.established")
@@ -835,6 +860,42 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 expanded.add(bare)
                 expanded.add(f"!{bare}")
         os.environ["MESHTASTIC_ALLOWED_NODES"] = ",".join(sorted(expanded))
+
+    @staticmethod
+    def _expand_home_channel_env_for_gateway() -> None:
+        """Normalize MESHTASTIC_HOME_CHANNEL so cron delivery reaches the adapter.
+
+        Hermes cron/notification delivery passes the value of
+        MESHTASTIC_HOME_CHANNEL straight through as the chat id, and the
+        adapter's send path requires the ``meshtastic:`` prefix (chat ids are
+        ``meshtastic:!aabbccdd`` DMs or ``meshtastic:channel:0`` broadcasts).
+        A bare node id or ``channel:N`` silently fails with "Invalid chat_id
+        format" — warn and rewrite the env so the misconfiguration fixes
+        itself. Mirrors _expand_allowlist_env_for_gateway.
+        """
+        raw = os.getenv("MESHTASTIC_HOME_CHANNEL", "").strip()
+        if not raw or raw.startswith("meshtastic:"):
+            return
+        low = raw.lower()
+        if low.startswith("channel:"):
+            fixed = f"meshtastic:{raw}"
+        elif low.startswith("!") or (len(low) == 8 and all(c in "0123456789abcdef" for c in low)):
+            # Bare node id, with or without the leading '!' — normalize the same
+            # way the allowlist expansion does.
+            fixed = f"meshtastic:{MeshtasticAdapter._normalize_node_id(raw) or raw}"
+        else:
+            logger.warning(
+                "MESHTASTIC_HOME_CHANNEL=%r is not a meshtastic chat id; expected "
+                "'meshtastic:!aabbccdd' (node DM) or 'meshtastic:channel:0' (broadcast).",
+                raw,
+            )
+            return
+        os.environ["MESHTASTIC_HOME_CHANNEL"] = fixed
+        logger.warning(
+            "MESHTASTIC_HOME_CHANNEL=%r is missing the 'meshtastic:' prefix — using %r instead.",
+            raw,
+            fixed,
+        )
 
     def _create_node_freshness(self) -> node_freshness.NodeFreshness:
         """Factory seam so tests/subclasses can substitute a bounded overlay."""
@@ -2779,7 +2840,9 @@ def register(ctx):
         name="meshtastic",
         label="Meshtastic",
         adapter_factory=lambda cfg: MeshtasticAdapter(cfg),
-        check_fn=lambda: True,  # Fallback to mock logic guarantees loading
+        check_fn=lambda: True,  # Always load: connect() fails loudly with
+        # install instructions when the meshtastic lib is missing, instead of
+        # silently falling back to the mock interface.
         # No strictly-required env var: the adapter connects over serial (auto
         # discovery) OR TCP (MESHTASTIC_TCP_HOST). required_env only drives setup
         # UI display, and listing one transport's var would mislabel the other as
