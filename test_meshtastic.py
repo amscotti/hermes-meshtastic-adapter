@@ -2650,6 +2650,34 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.success)  # mesh carried it → success (no fallback)
         self.assertEqual(res.raw_response["chunks"][0]["ack"]["status"], AckStatus.IMPLICIT_ACK)
 
+    async def test_implicit_ack_log_names_origin_not_a_relay(self):
+        """The implicit-ACK log calls the sender the ORIGINATOR, not the relay.
+
+        ack_from is our own node hearing its packet rebroadcast — the old
+        "relayed_by=<us>" wording was misleading. The rebroadcaster hint is the
+        packet's relayNode.
+        """
+        iface = self.adapter.get_interfaces()[0]
+
+        def send_text(text, destinationId=None, wantAck=False, onResponse=None, **kwargs):
+            onResponse(
+                {
+                    "fromId": "!9e77edec",  # our own node, hearing the rebroadcast
+                    "relayNode": 242,
+                    "decoded": {"requestId": 91011, "routing": {"errorReason": "NONE"}},
+                }
+            )
+            return SimpleNamespace(id=91011)
+
+        iface.sendText = MagicMock(side_effect=send_text)
+        with self.assertLogs("adapter", level="INFO") as cm:
+            with patch.dict(os.environ, {"MESHTASTIC_ACK_TIMEOUT": "0.3"}):
+                await self.adapter.send(chat_id="meshtastic:!ab12cd34", content="implicit ack")
+        joined = "\n".join(cm.output)
+        self.assertIn("our packet was rebroadcast", joined)
+        self.assertNotIn("relayed_by", joined)
+        self.assertIn("relay_node=242", joined)
+
     async def test_implicit_ack_is_not_retried(self):
         """An implicit-only ACK must NOT trigger a re-send.
 

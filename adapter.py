@@ -1695,6 +1695,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
             else:
                 text = str(text_field)
 
+            # RF path of this inbound text, logged next to the message itself so
+            # the forward route (mesh -> us) can be correlated with the ACK path
+            # of our reply without cross-referencing SQLite. hops=0 means direct;
+            # >0 means it came via that many relays.
+            logger.info(
+                "Meshtastic inbound text: from=%s hops=%s snr=%s rssi=%s bytes=%d text=%r",
+                from_id,
+                hop_count,
+                snr,
+                rssi,
+                len(text.encode("utf-8")),
+                text[:80],
+            )
+
             # Determine scopes (DM vs Channel)
             to_id = packet.get("toId") or packet.get("to")
             is_broadcast = False
