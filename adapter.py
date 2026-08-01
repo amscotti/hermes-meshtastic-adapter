@@ -115,6 +115,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
     ACK_RECORD_LIMIT = ack_state.ACK_RECORD_LIMIT
 
     # Upper bound on the per-node "observed" overlay (live last_heard / signal
+    # freshness). Aliases node_freshness.OBSERVED_NODE_LIMIT (single source of
+    # truth); kept as a class attribute so tests/subclasses can override it
+    # (the factory seam _create_node_freshness passes it through).
+    OBSERVED_NODE_LIMIT = node_freshness.OBSERVED_NODE_LIMIT
+
     @property
     def message_len_fn(self):
         return lambda text: len(str(text).encode("utf-8"))

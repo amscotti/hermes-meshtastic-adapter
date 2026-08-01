@@ -73,8 +73,10 @@ all together for an accurate number.
   `ack_state.AckTracker._make_ack_callback_for_send`. Renaming it silently
   breaks ACK tracking on real hardware — mock tests still pass because they
   invoke the callback directly.
-- **`tools.py` is imported as module `meshtastic_tools`, never `tools`** — it
-  collides with Hermes' own `tools` package. Set up by dynamic load in
+- **The tool module is `mesh_tools.py`, imported as module `meshtastic_tools`,
+  never `tools`** — the filename must not collide with Hermes' own `tools`
+  package (Hermes imports `tools.registry` transitively; a top-level `tools.py`
+  here shadows it and breaks the whole import). Set up by dynamic load in
   `adapter._load_tools_module` and `test_meshtastic.py`; preserve it.
 - **Threading boundary**: meshtastic `pubsub` delivers on a background thread;
   all asyncio-loop state is touched only via `_schedule_on_loop` /
@@ -115,9 +117,9 @@ all together for an accurate number.
     tasks via `call_soon_threadsafe`).
 - **Dual imports everywhere**: `try: from . import x / except ImportError: import x`
   so the plugin works both as a package (in Hermes) and flat modules (in tests).
-  Now covers nine modules — `adapter`, `tools`, `schemas`, `telemetry_db`,
+  Now covers nine modules — `adapter`, `mesh_tools`, `schemas`, `telemetry_db`,
   `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`.
-- **Adapter↔tools link is a module-level singleton** (`tools.set_adapter` /
+- **Adapter↔tools link is a module-level singleton** (`mesh_tools.set_adapter` /
   `_get_adapter`). Handlers return `{"error": ...}` JSON when no adapter is
   active. Node IDs are `!`-prefixed 8-hex; the allowlist matches with/without
   the `!`.

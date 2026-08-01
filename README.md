@@ -280,7 +280,7 @@ Flat modules, no package nesting (the plugin is loaded by Hermes both as a packa
 | `chunking.py` | UTF-8-byte message chunking (`[i/n]` prefixes, 233-byte ceiling). |
 | `node_freshness.py` | Live per-node `last_heard`/`snr`/`rssi` overlay. |
 | `mock_interface.py` | Fallback mock node/interface when no hardware or deps are present. |
-| `tools.py` | The seven `mesh_*` tool handlers (loaded as module `meshtastic_tools`). |
+| `mesh_tools.py` | The seven `mesh_*` tool handlers (loaded as module `meshtastic_tools`). |
 | `schemas.py` | JSON function schemas for the tools. |
 | `telemetry_db.py` | SQLite persistence for telemetry/positions/signal quality. |
 | `__init__.py` | `register(ctx)` plugin entry point. |
