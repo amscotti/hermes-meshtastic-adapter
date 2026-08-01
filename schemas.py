@@ -6,7 +6,19 @@ MESH_LIST_NODES_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_list_nodes",
-        "description": "Get a formatted list of all visible Meshtastic nodes in the mesh network with their IDs, names, signal metrics, and status.",
+        "description": (
+            "Get a formatted list of all visible Meshtastic nodes in the mesh network with "
+            "their IDs, names, signal metrics, and status. Whether a node is heard DIRECTLY "
+            "(in radio range, no relay) is given by 'heard_directly' — never infer it from "
+            "signal strength: a relayed packet's SNR/RSSI describe the last hop, so a strong "
+            "reading can belong to a node many hops away. 'heard_directly' means a 0-hop "
+            "packet arrived within the last 24h (older receptions expire, since a node may "
+            "have moved or gone quiet); 'last_direct_heard' and 'last_direct_heard_age_hours' "
+            "say when. 'hops_away' is the distance of the LATEST packet "
+            "and legitimately varies as the mesh reroutes. 'signal_source' says whether the "
+            "reading came off a direct packet ('direct'), a relayed one ('relayed'), or is "
+            "of unknown origin."
+        ),
         "parameters": {
             "type": "object",
             "properties": {},
@@ -19,7 +31,12 @@ MESH_NODE_INFO_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_node_info",
-        "description": "Retrieve detailed configuration and hardware status for a specific node in the mesh network.",
+        "description": (
+            "Retrieve detailed configuration and hardware status for a specific node in the "
+            "mesh network. Coordinates are the node's LAST KNOWN fix, not necessarily its "
+            "current position: check 'position_age_hours' / 'position_is_stale' before "
+            "presenting them as where the node is now, especially when plotting a map."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -38,7 +55,12 @@ MESH_SIGNAL_QUALITY_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_signal_quality",
-        "description": "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, Fair, Poor) for a specific node.",
+        "description": (
+            "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, "
+            "Fair, Poor) for a specific node. The reading only describes the link to this "
+            "node when 'signal_source' is 'direct'; when it is 'relayed' the numbers belong "
+            "to the last hop, not to this node."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -122,7 +144,14 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
     "type": "function",
     "function": {
         "name": "mesh_telemetry_history",
-        "description": "Query historical telemetry, position, or signal quality records from the persistent SQLite database for analysis.",
+        "description": (
+            "Query historical telemetry, position, or signal quality records from the "
+            "persistent SQLite database (retained ~30 days) for analysis. To ask for a "
+            "PERIOD — 'where was this node over the last few days' — use 'since_hours'; "
+            "a row count cannot express a period, because how far back N rows reach "
+            "depends on how often that node transmits. The reply reports 'oldest_returned' "
+            "and 'truncated' so a partial window is never mistaken for a complete one."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -135,9 +164,20 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
                     "enum": ["telemetry", "positions", "signal_quality"],
                     "description": "The type of historical records to fetch. Default is 'telemetry'.",
                 },
+                "since_hours": {
+                    "type": "number",
+                    "description": (
+                        "Return records from the last N hours (e.g. 72 for three days). "
+                        "Capped at 720 (30 days, the retention period). When set, up to "
+                        "500 records are returned instead of 100."
+                    ),
+                },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of historical records to return (default: 10, max: 100).",
+                    "description": (
+                        "Maximum number of records to return (default: 10, max: 100; with "
+                        "'since_hours' the default and cap are 500)."
+                    ),
                 },
             },
             "required": ["node_id"],

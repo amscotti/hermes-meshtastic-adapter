@@ -70,6 +70,24 @@ __all__ = [
 _adapter_instance: Any | None = None
 _adapter_lock = threading.RLock()
 
+# How long a 0-hop reception keeps counting as "in direct range". Signal history
+# is kept for 30 days, so without a bound a node heard directly weeks ago would
+# still report as a neighbour. A day comfortably covers nodes that only speak up
+# occasionally, while a node that has moved or gone quiet drops out on its own.
+DIRECT_RANGE_WINDOW_SECS = 24 * 3600
+
+# Position fixes age the same way, but far more consequentially: a stale fix
+# still plots as a confident dot on a coverage map. Beyond this, callers are
+# told the fix is old rather than left to assume it is current.
+POSITION_STALE_AFTER_SECS = 6 * 3600
+
+# Ceiling for a time-windowed history request. The window may exceed the
+# retention period harmlessly (there is simply nothing older), but the row cap
+# keeps one busy node's month of fixes from flooding a reply: the chattiest node
+# here logs ~53 positions a day, so 500 rows is still well over a week.
+HISTORY_MAX_WINDOW_HOURS = 30 * 24
+HISTORY_WINDOW_ROW_CAP = 500
+
 
 def set_adapter(adapter: Any) -> None:
     """Set the active Meshtastic adapter instance."""
@@ -161,7 +179,102 @@ def _device_uptime(metrics: dict[str, Any] | None) -> Any:
     return _first_not_none(metrics.get("uptimeSeconds"), metrics.get("uptime"))
 
 
+def _position_age(pos: dict[str, Any] | None, node_id: str) -> dict[str, Any]:
+    """Date a position fix, so an old one can't pass for the node's current spot.
+
+    Coordinates from the node DB carry no age of their own, and a fix from last
+    week plots on a coverage map exactly like one from a minute ago — confident,
+    and wrong. The library's ``position.time`` is preferred; our persisted
+    history fills in when the node DB has coordinates but no timestamp.
+    """
+    pos = pos or {}
+    fix_time = _first_not_none(pos.get("time"), pos.get("timestamp"))
+    if fix_time is None and node_id:
+        recorded = telemetry_db.get_position_history(node_id, limit=1)
+        if recorded:
+            fix_time = recorded[0].get("timestamp")
+    if not fix_time:
+        return {"position_time": None, "position_age_hours": None, "position_is_stale": None}
+    age = time.time() - float(fix_time)
+    return {
+        "position_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(fix_time))),
+        "position_age_hours": round(age / 3600, 1),
+        "position_is_stale": age > POSITION_STALE_AFTER_SECS,
+    }
+
+
 # --- Tool Handlers ---
+
+
+def _link_facts(
+    info: dict,
+    obs: dict,
+    latest: dict | None = None,
+    latest_direct: dict | None = None,
+) -> dict[str, Any]:
+    """Resolve how far a node is and whether its signal actually describes it.
+
+    **Hops** come from the freshest source that knows: live observations, then
+    the library node DB (``hopsAway`` — what the official app shows), then our
+    persisted history. That last fallback is the only one that survives a
+    gateway restart, which wipes the in-memory observations.
+
+    **Signal** is attributed to the node itself only when it came off a 0-hop
+    packet. A relayed packet's SNR/RSSI describe the last hop, not the origin,
+    so presenting them as the node's own signal is actively misleading: asked
+    which nodes were in direct range, the agent had no hop data in this payload
+    and answered by picking the ones with an RSSI — listing nodes 1 to 5 hops
+    out as directly audible. Signal strength cannot stand in for distance;
+    locally heard nodes here span −60 to −112 dBm, fully overlapping the
+    relayed ones.
+    """
+    # Live hops describe the node *now* (this session's packets, and the node DB
+    # the library keeps current); the persisted fallback may be weeks old, so it
+    # fills in the reported distance but cannot by itself assert direct range.
+    live_hops = _first_not_none(obs.get("hops_away"), info.get("hopsAway"))
+    hops = _first_not_none(live_hops, (latest or {}).get("hop_count"))
+
+    snr = rssi = None
+    source = "unknown"
+    if obs.get("snr") is not None or obs.get("rssi") is not None:
+        # _update_observed records these off direct packets only.
+        snr, rssi, source = obs.get("snr"), obs.get("rssi"), "direct"
+    elif latest_direct:
+        snr, rssi, source = latest_direct.get("snr"), latest_direct.get("rssi"), "direct"
+    else:
+        snr = _first_not_none(info.get("snr"), (latest or {}).get("snr"))
+        rssi = _first_not_none(info.get("rssi"), (latest or {}).get("rssi"))
+        if snr is not None or rssi is not None:
+            source = "direct" if hops == 0 else ("relayed" if hops is not None else "unknown")
+
+    # "In direct range" is about having heard the node over the air, not about
+    # the path the newest packet happened to take: successive packets from one
+    # node routinely arrive direct and relayed as the mesh reroutes, so keying
+    # this off the latest hop count alone would flip a neighbour in and out of
+    # range packet by packet. hops_away stays the *latest* distance.
+    #
+    # It does expire, though. The signal history is retained for 30 days, and
+    # without a window a node heard directly three weeks ago — since moved, or
+    # switched off — would report as in direct range forever. Live observations
+    # and a current 0-hop reading need no window: both describe now.
+    last_direct = (latest_direct or {}).get("timestamp")
+    observed_live = obs.get("snr") is not None or obs.get("rssi") is not None
+    direct_recently = (
+        last_direct is not None and (time.time() - last_direct) <= DIRECT_RANGE_WINDOW_SECS
+    )
+    return {
+        "snr": snr,
+        "rssi": rssi,
+        "hops_away": hops,
+        "heard_directly": bool(observed_live or live_hops == 0 or direct_recently),
+        "signal_source": source,
+        "last_direct_heard": (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_direct)) if last_direct else None
+        ),
+        "last_direct_heard_age_hours": (
+            round((time.time() - last_direct) / 3600, 1) if last_direct else None
+        ),
+    }
 
 
 async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
@@ -173,6 +286,10 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     results = []
     interfaces = adapter_inst.get_interfaces()
     seen_nodes = set()
+
+    # Two batch reads instead of a per-node query inside the loop.
+    latest_by_node = telemetry_db.get_latest_signal_by_node()
+    latest_direct_by_node = telemetry_db.get_latest_signal_by_node(direct_only=True)
 
     for iface in interfaces:
         nodes = getattr(iface, "nodes", {}) or {}
@@ -187,15 +304,7 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
             # Live-observed overlay (fresher than the library node DB, which only
             # refreshes lastHeard/signal from periodic NodeInfo packets).
             obs = adapter_inst.get_observed_node(nid)
-
-            # Prefer observed signal, then library, then persisted history.
-            snr = obs.get("snr", info.get("snr"))
-            rssi = obs.get("rssi", info.get("rssi"))
-            if snr is None or rssi is None:
-                history = telemetry_db.get_signal_history(nid, limit=1)
-                if history:
-                    snr = snr if snr is not None else history[0].get("snr")
-                    rssi = rssi if rssi is not None else history[0].get("rssi")
+            link = _link_facts(info, obs, latest_by_node.get(nid), latest_direct_by_node.get(nid))
 
             # last_heard: freshest of the library value and what we've observed.
             last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
@@ -211,9 +320,14 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
                     "hw_model": user.get("hwModel", "Unknown"),
                     "role": user.get("role", "Unknown"),
                     "battery_level": metrics.get("batteryLevel", "N/A"),
-                    "snr": snr if snr is not None else "N/A",
-                    "rssi": rssi if rssi is not None else "N/A",
-                    "signal_quality": assess_signal_quality(snr),
+                    "snr": link["snr"] if link["snr"] is not None else "N/A",
+                    "rssi": link["rssi"] if link["rssi"] is not None else "N/A",
+                    "signal_quality": assess_signal_quality(link["snr"]),
+                    "signal_source": link["signal_source"],
+                    "hops_away": link["hops_away"],
+                    "heard_directly": link["heard_directly"],
+                    "last_direct_heard": link["last_direct_heard"],
+                    "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
                     "last_heard": last_heard_str,
                 }
             )
@@ -244,7 +358,11 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     has_public_key = bool(user.get("publicKey"))
 
     # Live-observed overlay (fresher than the library node DB).
-    obs = adapter_inst.get_observed_node(info.get("user", {}).get("id", ""))
+    node_id = info.get("user", {}).get("id", "")
+    obs = adapter_inst.get_observed_node(node_id)
+    history = telemetry_db.get_signal_history(node_id, limit=1)
+    direct_history = telemetry_db.get_latest_signal_by_node(direct_only=True)
+    link = _link_facts(info, obs, history[0] if history else None, direct_history.get(node_id))
     last_heard = max(info.get("lastHeard") or 0, obs.get("last_heard") or 0) or None
 
     details = {
@@ -263,9 +381,14 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         "latitude": pos.get("latitude"),
         "longitude": pos.get("longitude"),
         "altitude": pos.get("altitude"),
-        "snr": obs.get("snr", info.get("snr")),
-        "rssi": obs.get("rssi", info.get("rssi")),
-        "hops_away": obs.get("hops_away", info.get("hopsAway")),
+        **_position_age(pos, node_id),
+        "snr": link["snr"],
+        "rssi": link["rssi"],
+        "signal_source": link["signal_source"],
+        "hops_away": link["hops_away"],
+        "heard_directly": link["heard_directly"],
+        "last_direct_heard": link["last_direct_heard"],
+        "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
         "last_heard": (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_heard))
             if last_heard
@@ -292,18 +415,15 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     _, info = resolve_node(node_id_query, adapter_inst)
     node_id = info.get("user", {}).get("id") if info else node_id_query
 
-    # Prefer live-observed SNR/RSSI (fresher than the library node DB), then the
-    # library value, then persisted history below.
-    obs = adapter_inst.get_observed_node(node_id) if node_id else {}
-    snr = obs.get("snr", info.get("snr") if info else None)
-    rssi = obs.get("rssi", info.get("rssi") if info else None)
-
     # Look up historic trend if available
     history = telemetry_db.get_signal_history(node_id, limit=5)
 
-    if snr is None and history:
-        snr = history[0].get("snr")
-        rssi = history[0].get("rssi")
+    obs = adapter_inst.get_observed_node(node_id) if node_id else {}
+    direct_history = telemetry_db.get_latest_signal_by_node(direct_only=True)
+    link = _link_facts(
+        info or {}, obs, history[0] if history else None, direct_history.get(node_id)
+    )
+    snr, rssi = link["snr"], link["rssi"]
 
     if snr is None:
         return json.dumps(
@@ -316,7 +436,11 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     trend = []
     for h in history:
         t_str = time.strftime("%H:%M:%S", time.localtime(h["timestamp"]))
-        trend.append({"time": t_str, "snr": h["snr"], "rssi": h["rssi"]})
+        # hop_count per reading: a trend that mixes direct and relayed samples
+        # is not a trend of one link, and reads as fluctuation that isn't there.
+        trend.append(
+            {"time": t_str, "snr": h["snr"], "rssi": h["rssi"], "hops_away": h.get("hop_count")}
+        )
 
     quality_label = assess_signal_quality(snr)
 
@@ -327,6 +451,11 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
             "snr": snr,
             "rssi": rssi,
             "quality": quality_label,
+            "signal_source": link["signal_source"],
+            "hops_away": link["hops_away"],
+            "heard_directly": link["heard_directly"],
+            "last_direct_heard": link["last_direct_heard"],
+            "last_direct_heard_age_hours": link["last_direct_heard_age_hours"],
         },
         "trend_history": trend,
     }
@@ -473,10 +602,30 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
     """Query historical telemetry, positions, or signal qualities."""
     node_id_query = args.get("node_id")
     metric_type = args.get("metric_type", "telemetry")
+
+    # A period ("the last 3 days") and a count ("the last 10 rows") answer
+    # different questions, and a count cannot stand in for a period: how far
+    # back N rows reach depends entirely on how chatty the node is — 100 rows
+    # is five days for one node here and a month for another. Asking by time
+    # therefore raises the cap, since the window, not the number, is the ask.
+    since_hours = args.get("since_hours")
+    since = None
+    if since_hours is not None:
+        try:
+            hours = float(since_hours)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "Parameter 'since_hours' must be a number."})
+        if hours <= 0:
+            return json.dumps({"error": "Parameter 'since_hours' must be positive."})
+        hours = min(hours, HISTORY_MAX_WINDOW_HOURS)
+        since = time.time() - hours * 3600
+
+    default_limit = HISTORY_WINDOW_ROW_CAP if since is not None else 10
+    row_cap = HISTORY_WINDOW_ROW_CAP if since is not None else 100
     try:
-        limit = min(max(1, int(args.get("limit", 10))), 100)
+        limit = min(max(1, int(args.get("limit", default_limit))), row_cap)
     except (TypeError, ValueError):
-        limit = 10
+        limit = default_limit
 
     if not node_id_query:
         return json.dumps({"error": "Parameter 'node_id' is required."})
@@ -489,11 +638,11 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
     node_id = info.get("user", {}).get("id") if info else node_id_query
 
     if metric_type == "telemetry":
-        history = telemetry_db.get_telemetry_history(node_id, limit=limit)
+        history = telemetry_db.get_telemetry_history(node_id, limit=limit, since=since)
     elif metric_type == "positions":
-        history = telemetry_db.get_position_history(node_id, limit=limit)
+        history = telemetry_db.get_position_history(node_id, limit=limit, since=since)
     elif metric_type == "signal_quality":
-        history = telemetry_db.get_signal_history(node_id, limit=limit)
+        history = telemetry_db.get_signal_history(node_id, limit=limit, since=since)
     else:
         return json.dumps({"error": f"Invalid metric_type '{metric_type}'."})
 
@@ -502,15 +651,24 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
         if "timestamp" in h:
             h["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["timestamp"]))
 
-    return json.dumps(
-        {
-            "node_id": node_id,
-            "name": info.get("user", {}).get("longName", "Unknown") if info else "Unknown",
-            "metric_type": metric_type,
-            "history": history,
-        },
-        indent=2,
-    )
+    result = {
+        "node_id": node_id,
+        "name": info.get("user", {}).get("longName", "Unknown") if info else "Unknown",
+        "metric_type": metric_type,
+        "returned": len(history),
+        "history": history,
+    }
+    if since is not None:
+        # Say what was actually covered. Hitting the cap means the oldest rows
+        # of the requested window are missing, and a truncated window read as a
+        # complete one is how "no data before X" gets asserted wrongly.
+        result["window_requested_from"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+        oldest = history[-1]["timestamp"] if history else None
+        result["oldest_returned"] = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(oldest)) if oldest else None
+        )
+        result["truncated"] = len(history) >= limit
+    return json.dumps(result, indent=2)
 
 
 # --- Solicited requests ------------------------------------------------------

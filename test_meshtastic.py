@@ -6,12 +6,14 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,6 +69,16 @@ handle_mesh_telemetry_history = meshtastic_tools.handle_mesh_telemetry_history
 handle_mesh_request_telemetry = meshtastic_tools.handle_mesh_request_telemetry
 handle_mesh_request_position = meshtastic_tools.handle_mesh_request_position
 handle_mesh_traceroute = meshtastic_tools.handle_mesh_traceroute
+
+
+def _backdate_signal(node_id: str, when: float) -> None:
+    """Age a node's signal rows, to exercise the direct-range expiry window."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+        conn.execute("UPDATE signal_quality SET timestamp = ? WHERE node_id = ?", (when, node_id))
+        conn.commit()
 
 
 class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
@@ -3043,6 +3055,173 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(node["snr"], 2.5)
         self.assertEqual(node["rssi"], -110)
 
+    async def test_list_nodes_marks_relayed_signal_as_not_direct(self):
+        """A relayed reading must not read as direct range — the original bug.
+
+        Asked which nodes were in direct line of sight, the agent had no hop
+        data in this payload and answered by listing everything with an RSSI,
+        which included nodes 1-5 hops out.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd001122"] = {
+            "num": 2,
+            "user": {"id": "!dd001122", "longName": "Far Relayed", "shortName": "FAR"},
+        }
+        telemetry_db.log_signal("!dd001122", snr=6.0, rssi=-100, hop_count=3)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd001122")
+        self.assertEqual(node["hops_away"], 3)
+        self.assertFalse(node["heard_directly"])
+        self.assertEqual(node["signal_source"], "relayed")
+        self.assertIsNone(node["last_direct_heard"])
+
+    async def test_list_nodes_reports_direct_node_and_prefers_direct_signal(self):
+        """A 0-hop node is flagged direct, and its signal comes from a direct packet."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd003344"] = {
+            "num": 3,
+            "user": {"id": "!dd003344", "longName": "Neighbour", "shortName": "NBR"},
+        }
+        # Heard directly first, then via a relay: the direct reading is the one
+        # that describes this node's own link, regardless of which is newer.
+        telemetry_db.log_signal("!dd003344", snr=4.0, rssi=-95, hop_count=0)
+        telemetry_db.log_signal("!dd003344", snr=-2.0, rssi=-115, hop_count=2)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd003344")
+        self.assertEqual(node["signal_source"], "direct")
+        self.assertEqual(node["snr"], 4.0)
+        self.assertEqual(node["rssi"], -95)
+        self.assertIsNotNone(node["last_direct_heard"])
+
+    async def test_hops_survive_a_restart_via_persisted_history(self):
+        """Hop data outlives the in-memory observations a restart clears."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd005566"] = {
+            "num": 4,
+            "user": {"id": "!dd005566", "longName": "Persisted", "shortName": "PST"},
+        }
+        telemetry_db.log_signal("!dd005566", snr=3.0, rssi=-99, hop_count=0)
+        self.adapter._node_freshness._observed.clear()  # what a gateway restart leaves behind
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd005566")
+        self.assertEqual(node["hops_away"], 0)
+        self.assertTrue(node["heard_directly"])
+
+    async def test_unknown_hops_are_not_claimed_as_direct(self):
+        """No hop information anywhere means unknown, never 'direct'."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd007788"] = {
+            "num": 5,
+            "user": {"id": "!dd007788", "longName": "Unknown Hops", "shortName": "UNK"},
+            "snr": 5.0,  # library node DB reading, origin unknown
+        }
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!dd007788")
+        self.assertIsNone(node["hops_away"])
+        self.assertFalse(node["heard_directly"])
+        self.assertEqual(node["signal_source"], "unknown")
+
+    async def test_stale_direct_reception_expires(self):
+        """A node heard directly weeks ago is no longer 'in direct range'.
+
+        Signal history is kept for 30 days, so without a window a node that has
+        since moved or gone quiet would report as a neighbour forever.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee001122"] = {
+            "num": 7,
+            "user": {"id": "!ee001122", "longName": "Long Gone", "shortName": "GON"},
+        }
+        telemetry_db.log_signal("!ee001122", snr=5.0, rssi=-90, hop_count=0)
+        _backdate_signal("!ee001122", time.time() - 20 * 86400)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!ee001122")
+        self.assertFalse(node["heard_directly"])
+        # The evidence is still reported — it just no longer counts as current.
+        self.assertIsNotNone(node["last_direct_heard"])
+        self.assertGreater(node["last_direct_heard_age_hours"], 24)
+
+    async def test_recent_direct_reception_still_counts(self):
+        """Just inside the window, a direct reception is still direct range."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee003344"] = {
+            "num": 8,
+            "user": {"id": "!ee003344", "longName": "Recent", "shortName": "RCT"},
+        }
+        telemetry_db.log_signal("!ee003344", snr=5.0, rssi=-90, hop_count=0)
+        _backdate_signal("!ee003344", time.time() - 6 * 3600)
+
+        res = json.loads(await handle_mesh_list_nodes({}))
+        node = next(n for n in res["nodes"] if n["node_id"] == "!ee003344")
+        self.assertTrue(node["heard_directly"])
+
+    async def test_node_info_dates_the_position_fix(self):
+        """Coordinates carry their age, so a stale fix can't pass for current."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee005566"] = {
+            "num": 9,
+            "user": {"id": "!ee005566", "longName": "Mapped", "shortName": "MAP"},
+            "position": {
+                "latitude": 55.1,
+                "longitude": 61.4,
+                "time": time.time() - 48 * 3600,
+            },
+        }
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee005566"}))
+        self.assertAlmostEqual(res["position_age_hours"], 48.0, delta=0.5)
+        self.assertTrue(res["position_is_stale"])
+        self.assertIsNotNone(res["position_time"])
+
+    async def test_node_info_falls_back_to_recorded_position_time(self):
+        """A node DB fix with no timestamp is dated from our own history."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee007788"] = {
+            "num": 10,
+            "user": {"id": "!ee007788", "longName": "Undated", "shortName": "UND"},
+            "position": {"latitude": 55.2, "longitude": 61.5},  # no time field
+        }
+        telemetry_db.log_position("!ee007788", latitude=55.2, longitude=61.5, altitude=200)
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee007788"}))
+        self.assertIsNotNone(res["position_time"])
+        self.assertFalse(res["position_is_stale"])  # just logged
+
+    async def test_node_info_without_position_reports_unknown_age(self):
+        """No coordinates at all means no age claim either."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!ee009900"] = {
+            "num": 11,
+            "user": {"id": "!ee009900", "longName": "Nowhere", "shortName": "NOW"},
+        }
+
+        res = json.loads(await handle_mesh_node_info({"node_id": "!ee009900"}))
+        self.assertIsNone(res["position_time"])
+        self.assertIsNone(res["position_age_hours"])
+        self.assertIsNone(res["position_is_stale"])
+
+    async def test_signal_quality_reports_hops_per_trend_sample(self):
+        """The trend must say which samples were direct — mixing links reads as noise."""
+        iface = self.adapter.get_interfaces()[0]
+        iface.nodes["!dd009900"] = {
+            "num": 6,
+            "user": {"id": "!dd009900", "longName": "Trended", "shortName": "TRD"},
+        }
+        telemetry_db.log_signal("!dd009900", snr=5.0, rssi=-90, hop_count=0)
+        telemetry_db.log_signal("!dd009900", snr=-1.0, rssi=-118, hop_count=4)
+
+        res = json.loads(await handle_mesh_signal_quality({"node_id": "!dd009900"}))
+        self.assertEqual(res["current"]["signal_source"], "direct")
+        # Still in direct range even though the newest packet came via 4 relays.
+        self.assertTrue(res["current"]["heard_directly"])
+        self.assertEqual(res["current"]["hops_away"], 4)
+        self.assertEqual({s["hops_away"] for s in res["trend_history"]}, {0, 4})
+
     async def test_list_nodes_dedupes_across_interfaces(self):
         """The same node seen on two interfaces appears once."""
         iface = self.adapter.get_interfaces()[0]
@@ -3085,6 +3264,67 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         result = json.loads(await handle_mesh_telemetry({"node_id": "!cc001122"}))
         self.assertEqual(result["battery_level"], 77)
         self.assertEqual(result["temperature"], 19.5)
+
+    async def test_history_window_selects_by_time_not_row_count(self):
+        """since_hours asks for a period; rows outside it are excluded."""
+        now = time.time()
+        for age_hours, lat in ((1, 55.1), (10, 55.2), (100, 55.3)):
+            telemetry_db.log_position("!ab12cd34", latitude=lat, longitude=61.0, altitude=1)
+            with closing(sqlite3.connect(telemetry_db.DB_PATH)) as conn:
+                conn.execute(
+                    "UPDATE positions SET timestamp = ? WHERE latitude = ?",
+                    (now - age_hours * 3600, lat),
+                )
+                conn.commit()
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "positions", "since_hours": 24}
+            )
+        )
+        lats = {h["latitude"] for h in res["history"]}
+        self.assertEqual(lats, {55.1, 55.2})  # the 100h-old fix is outside the window
+        self.assertEqual(res["returned"], 2)
+        self.assertFalse(res["truncated"])
+        self.assertIsNotNone(res["oldest_returned"])
+
+    async def test_history_window_reports_truncation(self):
+        """A window denser than the cap must say so, not look complete."""
+        for i in range(5):
+            telemetry_db.log_position(
+                "!ab12cd34", latitude=40.0 + i / 100, longitude=61.0, altitude=1
+            )
+
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {"node_id": "!ab12cd34", "metric_type": "positions", "since_hours": 24, "limit": 3}
+            )
+        )
+        self.assertEqual(res["returned"], 3)
+        self.assertTrue(res["truncated"])
+
+    async def test_history_window_rejects_nonsense_and_caps_range(self):
+        """A bad since_hours errors out; an absurd one clamps to the retention period."""
+        res = json.loads(
+            await handle_mesh_telemetry_history({"node_id": "!ab12cd34", "since_hours": "soon"})
+        )
+        self.assertIn("error", res)
+        res = json.loads(
+            await handle_mesh_telemetry_history({"node_id": "!ab12cd34", "since_hours": -5})
+        )
+        self.assertIn("error", res)
+
+        telemetry_db.log_signal("!ab12cd34", snr=1.0, rssi=-90)
+        res = json.loads(
+            await handle_mesh_telemetry_history(
+                {
+                    "node_id": "!ab12cd34",
+                    "metric_type": "signal_quality",
+                    "since_hours": 99999,  # far beyond retention
+                }
+            )
+        )
+        self.assertEqual(res["returned"], 1)  # clamped, not rejected
 
     async def test_telemetry_history_metric_types_and_limits(self):
         """telemetry_history serves all metric types, rejects bad ones, clamps limits."""

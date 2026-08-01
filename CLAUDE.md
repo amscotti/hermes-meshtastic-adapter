@@ -140,6 +140,27 @@ This is the subtlest part of the code. Meshtastic's `pubsub` delivers packets on
 
 Any new packet-handling work must respect this boundary — do not touch loop state from the pubsub thread except via `call_soon_threadsafe`.
 
+### Direct range vs signal strength — never conflate them
+
+`_link_facts()` in `tools.py` is the single place that answers "how far is this node, and does this reading describe it". Every node-reporting tool goes through it.
+
+**Signal strength says nothing about distance.** A relayed packet's SNR/RSSI belong to the last hop, not the origin. In live data, directly-heard nodes span −60 to −122 dBm and fully overlap the relayed ones: `!0b477a00` at −122 dBm is direct, `!a6963ec4` at −98 dBm is two hops out. `_update_observed` gets this right (it records `snr`/`rssi` only off 0-hop packets), but `mesh_list_nodes` used to publish neither hops nor provenance, and its fallbacks pulled SNR from the library node DB and from unfiltered SQLite history. Asked which nodes were in direct range, the agent had nothing else to go on and answered by listing everything with an RSSI — nodes 1 to 5 hops away included.
+
+So the payload now carries: **`heard_directly`** (at least one 0-hop packet ever arrived), **`last_direct_heard`** (when — how the caller judges whether that still holds), **`hops_away`** (distance of the *latest* packet, which legitimately varies as the mesh reroutes), and **`signal_source`** (`direct` / `relayed` / `unknown`). Note that `heard_directly` is deliberately NOT `hops_away == 0`: packets from one node routinely arrive both ways, and keying off the newest alone flips a neighbour in and out of range packet by packet.
+
+Hops resolve through live observations → the library's `hopsAway` (what the official app shows) → `telemetry_db.get_latest_signal_by_node()`. Only that last source survives a gateway restart, which wipes `_node_freshness._observed` — before it existed, every restart left the agent blind to hops entirely.
+
+### Aged data must not read as current
+
+Signal and position history is retained for 30 days, so anything derived from it needs an explicit age or a window — otherwise the tools state three-week-old facts in the present tense.
+
+- **`heard_directly` expires** after `DIRECT_RANGE_WINDOW_SECS` (24h). Live observations and a *live* 0-hop reading (`obs`/node DB) assert direct range on their own, since both describe now; a persisted 0-hop row only counts inside the window. That split is why `live_hops` exists separately from `hops_away` — the reported distance may come from an old row, but direct range may not.
+- **Position fixes are dated** by `_position_age()`: `position_time`, `position_age_hours`, and `position_is_stale` past `POSITION_STALE_AFTER_SECS` (6h). Coordinates from the node DB carry no age, and an old fix plots on a coverage map exactly like a fresh one — confidently, and in the wrong place.
+
+- **History is queryable by period**, not just by row count: `mesh_telemetry_history` takes `since_hours` (capped at 720 = the retention period), which raises the row cap from 100 to `HISTORY_WINDOW_ROW_CAP` (500) because the window is the ask. A count cannot express a period — 100 rows reaches back five days for a node logging ~53 fixes/day and a month for a quiet one. The reply carries `returned`, `oldest_returned` and `truncated`, so a window cut short by the cap is never read as "nothing older exists". This distinction is not academic: `!2bcb38f2` returns 100 fixes to `limit=100` and *nothing at all* to `since_hours=24`, because it stopped reporting four days ago.
+
+Do not "clean" the database to deal with staleness. It is ~0.3 MB, `maybe_prune()` already enforces `MESHTASTIC_TELEMETRY_RETENTION_DAYS`, and the persisted history is the only hop source that outlives a restart — wiping it blinds the agent for hours. Express age in the payload instead.
+
 ### Chat ID / session scoping
 
 `_on_receive` decides DM vs broadcast and forms the chat_id that becomes the Hermes session key:
