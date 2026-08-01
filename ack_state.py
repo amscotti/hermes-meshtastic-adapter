@@ -525,6 +525,37 @@ class AckTracker:
         else:
             status = AckStatus.ACK
 
+        # Diagnostic dump of the raw ACK packet, so the real-vs-implicit verdict
+        # can be checked against what the radio actually saw: who sent it, how
+        # far away, signal, and whether it came via a relay / MQTT.
+        if isinstance(packet, dict):
+            hop_start = packet.get("hopStart")
+            hop_limit = packet.get("hopLimit")
+            hops_away = (
+                hop_start - hop_limit
+                if isinstance(hop_start, int) and isinstance(hop_limit, int)
+                else None
+            )
+            logger.info(
+                "Meshtastic ACK packet: req=%s verdict=%s from=%s (raw=%r) dest=%s (norm=%s) "
+                "to=%s hops=%s (start=%s limit=%s) snr=%s rssi=%s relay=%s mqtt=%s error=%s",
+                pkt_id,
+                status,
+                ack_from,
+                ack_from_raw,
+                dest,
+                dest_norm,
+                packet.get("toId") or packet.get("to"),
+                hops_away,
+                hop_start,
+                hop_limit,
+                packet.get("rxSnr"),
+                packet.get("rxRssi"),
+                packet.get("relayNode"),
+                packet.get("viaMqtt"),
+                error_reason,
+            )
+
         # Hold lifecycle ownership through the ACK-store commit. This closes the
         # check-to-commit window where disconnect/reconnect could otherwise
         # advance the generation after validation but before _ack_lock.
@@ -616,11 +647,16 @@ class AckTracker:
         if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
         elif status == AckStatus.IMPLICIT_ACK and applied_status == AckStatus.IMPLICIT_ACK:
+            # NB: ack_from is the packet ORIGINATOR (our own node) — we heard our
+            # own packet rebroadcast. It is NOT the relay; the rebroadcaster hint
+            # is relayNode. Wording it "relayed_by=<us>" was misleading.
             logger.info(
-                "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
+                "Meshtastic implicit ACK: packet_id=%s dest=%s "
+                "(our packet was rebroadcast; dest did not confirm) origin=%s relay_node=%s",
                 pkt_id,
                 dest,
                 ack_from,
+                packet.get("relayNode") if isinstance(packet, dict) else None,
             )
         elif applied_status == AckStatus.NAK and status == AckStatus.NAK:
             logger.warning(
