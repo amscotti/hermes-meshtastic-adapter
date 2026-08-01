@@ -2923,6 +2923,18 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIn("did not answer", out["error"])
         self.assertFalse(self.adapter._response_waiters)
 
+    async def test_solicited_request_abandoned_on_link_lost(self):
+        """A link drop fails an in-flight request fast, not after the full timeout."""
+        loop = asyncio.get_running_loop()
+        # Drop the link shortly after the request goes out, well before its 30s timeout.
+        loop.call_later(0.05, lambda: self.adapter._on_connection_lost(interface="tcp"))
+        out = json.loads(
+            await handle_mesh_request_position({"node_id": "!ab12cd34", "timeout": 30})
+        )
+        self.assertFalse(out["answered"])
+        self.assertIn("link dropped", out["error"])
+        self.assertFalse(self.adapter._response_waiters)
+
     async def test_all_tools_error_when_no_adapter(self):
         """Every mesh_* handler returns a JSON error when no adapter is active."""
         meshtastic_tools.set_adapter(None)
