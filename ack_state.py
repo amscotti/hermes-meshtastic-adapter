@@ -653,7 +653,14 @@ class AckTracker:
         future: ConcurrentFuture,
         timeout: float,
     ) -> dict[str, Any]:
-        """Wait for ACK/NACK response or mark the packet timed out."""
+        """Wait for ACK/NACK response or mark the packet timed out.
+
+        An implicit ACK must NOT early-return this wait: the record stays
+        `implicit_ack` while the waiter stays open so a real end-to-end ACK can
+        still upgrade it (``_maybe_record_pubsub_ack`` needs the live waiter).
+        The cost is deliberate — an implicit-only reply waits out the full
+        ``timeout`` before ``_send_immediate`` reports it as delivered.
+        """
         try:
             wrapped = asyncio.wrap_future(future)
             return await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)

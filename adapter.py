@@ -976,6 +976,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         Best-effort by design: an unsupported platform or a socket closing under
         us must not take the link down, so failures are logged at debug and the
         library's 300s heartbeat remains the backstop.
+
+        Note: ``_keepalive_socket_id`` tracks ONE socket (a single TCP transport
+        is enforced — serial interfaces have no socket and the mock neither), so
+        two live TCP interfaces would ping-pong re-arming. Fine today; rework
+        into a per-interface map if multi-TCP ever lands.
         """
         sock = getattr(iface, "socket", None)
         if sock is None or not hasattr(sock, "setsockopt"):
@@ -1018,6 +1023,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         counts, because the ratio is the diagnosis: a handful of resets is
         normal for an ESP32 over WiFi, while repeated long absences point at the
         node's power, WiFi signal, or reboots.
+
+        The ``SOCKET_RESET_MAX_OUTAGE_SECS`` split is reconnect-latency
+        dependent: a genuine reset that takes longer than the threshold to
+        re-establish (backoff, DHCP) is logged as an absence. Heuristic by
+        design — the counts are approximate, not a contract.
         """
         dropped_at = self._link_down_since.pop(target, None)
         if dropped_at is None:
