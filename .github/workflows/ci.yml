@@ -51,7 +51,9 @@ jobs:
         env:
           HERMES_AGENT_PATH: ${{ github.workspace }}/_deps/hermes-agent
         run: |
-          coverage run -m unittest test_meshtastic.py
+          coverage run -m unittest \
+            test_meshtastic.py test_chunking.py test_node_freshness.py \
+            test_transport.py test_ack_state.py
           coverage report -m
           coverage html
 
