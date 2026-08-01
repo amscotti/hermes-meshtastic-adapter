@@ -2046,9 +2046,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _chunk_message(self, content: str) -> list[str]:
         return chunking.chunk_message(content)
 
-    def _split_utf8(self, text: str, limit: int) -> list[str]:
-        return chunking.split_utf8(text, limit)
-
     def _extract_packet_id(self, pkt: Any) -> str | None:
         """Return a Meshtastic packet ID from object or dict packet shapes."""
         pkt_id = getattr(pkt, "id", None)
