@@ -6,6 +6,7 @@ fallbacks, connection_targets' auto-discovery fallback, and open_interface's
 missing-library behavior (fail loud, mock opt-in, automatic install).
 """
 
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -150,6 +151,43 @@ class TestEnsureMeshtasticLibrary(unittest.TestCase):
         ):
             run.return_value.returncode = 1
             run.return_value.stdout = "some pip error"
+            run.return_value.stderr = ""
+            transport.ensure_meshtastic_library()
+            run.assert_called_once()
+            self.assertFalse(transport.HAS_MESHTASTIC)
+
+    def test_pip_timeout_logs_error_and_keeps_library_missing(self):
+        with (
+            patch("transport.HAS_MESHTASTIC", False),
+            patch("transport._autoinstall_enabled", return_value=True),
+            patch(
+                "transport.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pip", timeout=300),
+            ) as run,
+        ):
+            transport.ensure_meshtastic_library()
+            run.assert_called_once()
+            self.assertFalse(transport.HAS_MESHTASTIC)
+
+    def test_pip_oserror_logs_error_and_keeps_library_missing(self):
+        with (
+            patch("transport.HAS_MESHTASTIC", False),
+            patch("transport._autoinstall_enabled", return_value=True),
+            patch("transport.subprocess.run", side_effect=OSError("boom")) as run,
+        ):
+            transport.ensure_meshtastic_library()
+            run.assert_called_once()
+            self.assertFalse(transport.HAS_MESHTASTIC)
+
+    def test_pip_success_but_reimport_fails_keeps_library_missing(self):
+        with (
+            patch("transport.HAS_MESHTASTIC", False),
+            patch("transport._autoinstall_enabled", return_value=True),
+            patch("transport.subprocess.run") as run,
+            patch("transport._import_meshtastic_libs", return_value=False),
+        ):
+            run.return_value.returncode = 0
+            run.return_value.stdout = ""
             run.return_value.stderr = ""
             transport.ensure_meshtastic_library()
             run.assert_called_once()
