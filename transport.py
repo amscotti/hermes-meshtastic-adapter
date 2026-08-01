@@ -105,23 +105,25 @@ def ensure_meshtastic_library() -> None:
     then re-imports. Disable with MESHTASTIC_AUTOINSTALL=0.
     """
     global _autoinstall_attempted
-    if HAS_MESHTASTIC or _autoinstall_attempted:
-        return
-    if not _autoinstall_enabled():
-        _autoinstall_attempted = True
-        logger.error(
-            "meshtastic library is not installed in %s and MESHTASTIC_AUTOINSTALL=0; "
-            "install plugin dependencies manually, e.g.:\n"
-            "  %s -m pip install -r %s",
-            sys.executable,
-            sys.executable,
-            _requirements_path(),
-        )
+    if HAS_MESHTASTIC:
         return
     with _autoinstall_lock:
+        # Authoritative once-per-process gate: _autoinstall_attempted is only
+        # ever written under this lock (including the disabled path below), so
+        # concurrent callers can never double-run pip or double-log.
         if HAS_MESHTASTIC or _autoinstall_attempted:
             return
         _autoinstall_attempted = True
+        if not _autoinstall_enabled():
+            logger.error(
+                "meshtastic library is not installed in %s and MESHTASTIC_AUTOINSTALL=0; "
+                "install plugin dependencies manually, e.g.:\n"
+                "  %s -m pip install -r %s",
+                sys.executable,
+                sys.executable,
+                _requirements_path(),
+            )
+            return
         req = _requirements_path()
         logger.warning(
             "meshtastic library missing — installing plugin dependencies from %s "
