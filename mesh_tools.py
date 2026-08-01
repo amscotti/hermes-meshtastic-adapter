@@ -20,39 +20,51 @@ try:
     from .schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_REQUEST_POSITION_SCHEMA,
+        MESH_REQUEST_TELEMETRY_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
         MESH_TELEMETRY_HISTORY_SCHEMA,
         MESH_TELEMETRY_SCHEMA,
+        MESH_TRACEROUTE_SCHEMA,
     )
 except ImportError:
     from schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_REQUEST_POSITION_SCHEMA,
+        MESH_REQUEST_TELEMETRY_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
         MESH_TELEMETRY_HISTORY_SCHEMA,
         MESH_TELEMETRY_SCHEMA,
+        MESH_TRACEROUTE_SCHEMA,
     )
 
 __all__ = [
     "MESH_LIST_NODES_SCHEMA",
     "MESH_NODE_INFO_SCHEMA",
+    "MESH_REQUEST_POSITION_SCHEMA",
+    "MESH_REQUEST_TELEMETRY_SCHEMA",
     "MESH_SEND_BROADCAST_SCHEMA",
     "MESH_SEND_DM_SCHEMA",
     "MESH_SIGNAL_QUALITY_SCHEMA",
     "MESH_TELEMETRY_HISTORY_SCHEMA",
     "MESH_TELEMETRY_SCHEMA",
+    "MESH_TRACEROUTE_SCHEMA",
     "set_adapter",
     "handle_mesh_list_nodes",
     "handle_mesh_node_info",
+    "handle_mesh_request_position",
+    "handle_mesh_request_telemetry",
     "handle_mesh_send_broadcast",
     "handle_mesh_send_dm",
     "handle_mesh_signal_quality",
     "handle_mesh_telemetry",
     "handle_mesh_telemetry_history",
+    "handle_mesh_traceroute",
 ]
 
 _adapter_instance: Any | None = None
@@ -498,4 +510,184 @@ async def handle_mesh_telemetry_history(args: dict, **kwargs) -> str:
             "history": history,
         },
         indent=2,
+    )
+
+
+# --- Solicited requests ------------------------------------------------------
+# These transmit on the shared LoRa channel, unlike everything above which
+# serves already-heard data. Addressed to one node, never retried.
+
+
+def _clamp(value: Any, default: float, low: float, high: float) -> float:
+    """Coerce a model-supplied number into a sane range."""
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _requested_node(args: dict, adapter_inst: Any) -> tuple[str | None, str | None]:
+    """Resolve the target node id from args. Returns (node_id, error)."""
+    query = args.get("node_id")
+    if not query:
+        return None, (
+            "node_id is required — retry this call with the target node's ID "
+            "(e.g. node_id='!9eabacac') or its name (e.g. node_id='Цаца'). "
+            "Use mesh_list_nodes if you need the ID."
+        )
+    _iface, info = resolve_node(query, adapter_inst)
+    if info:
+        resolved = (info.get("user", {}) or {}).get("id")
+        if resolved:
+            return resolved, None
+    # Not in the node DB yet — still allow an explicit !id, the node may simply
+    # not have broadcast NodeInfo to us yet.
+    if isinstance(query, str) and query.startswith("!"):
+        return query, None
+    return None, (
+        f"No node matched '{query}'. Pass an exact node ID (e.g. '!9eabacac') "
+        "or a name from mesh_list_nodes."
+    )
+
+
+async def handle_mesh_request_telemetry(args: dict, **kwargs) -> str:
+    """Ask a node over the air for its current device metrics."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    node_id, err = _requested_node(args, adapter_inst)
+    if err:
+        return json.dumps({"error": err})
+
+    timeout = _clamp(args.get("timeout"), 45.0, 5.0, 120.0)
+    result = await adapter_inst.request_telemetry(node_id, timeout=timeout)
+    if not result.get("ok"):
+        return json.dumps({"node_id": node_id, "answered": False, "error": result.get("error")})
+
+    data = result.get("data") or {}
+    metrics = data.get("deviceMetrics", data) or {}
+    return json.dumps(
+        {
+            "node_id": node_id,
+            "answered": True,
+            "battery_level": metrics.get("batteryLevel"),
+            "voltage": metrics.get("voltage"),
+            "uptime_seconds": metrics.get("uptimeSeconds") or metrics.get("uptime"),
+            "channel_utilization": metrics.get("channelUtilization"),
+            "air_util_tx": metrics.get("airUtilTx"),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def handle_mesh_request_position(args: dict, **kwargs) -> str:
+    """Ask a node over the air for its current position."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    node_id, err = _requested_node(args, adapter_inst)
+    if err:
+        return json.dumps({"error": err})
+
+    timeout = _clamp(args.get("timeout"), 45.0, 5.0, 120.0)
+    result = await adapter_inst.request_position(node_id, timeout=timeout)
+    if not result.get("ok"):
+        return json.dumps({"node_id": node_id, "answered": False, "error": result.get("error")})
+
+    pos = result.get("data") or {}
+    lat, lon = pos.get("latitude"), pos.get("longitude")
+    # protobuf stores coordinates scaled by 1e7
+    if isinstance(lat, (int, float)) and abs(lat) > 90.0:
+        lat = lat / 1e7
+    if isinstance(lon, (int, float)) and abs(lon) > 180.0:
+        lon = lon / 1e7
+    return json.dumps(
+        {
+            "node_id": node_id,
+            "answered": True,
+            "latitude": lat,
+            "longitude": lon,
+            "altitude": pos.get("altitude"),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _node_display_name(adapter_inst: Any, node_id: str | None) -> str:
+    """Resolve a node id to a human name (long → short), falling back to the id.
+
+    IDs like '!6982b824' are hard to read; the agent should report the name the
+    user knows the node by whenever the node DB has one.
+    """
+    if not node_id:
+        return node_id or ""
+    _iface, info = resolve_node(node_id, adapter_inst)
+    user = (info or {}).get("user", {}) or {}
+    name = user.get("longName") or user.get("shortName")
+    return str(name) if name else node_id
+
+
+def _format_route(route: list, snr: list, adapter_inst: Any) -> list[dict[str, Any]]:
+    """Pair route hops (as readable names) with their SNR. SNR is scaled by 4."""
+    hops: list[dict[str, Any]] = []
+    for i, num in enumerate(route or []):
+        node_id = f"!{num:08x}" if isinstance(num, int) else str(num)
+        entry: dict[str, Any] = {
+            "name": _node_display_name(adapter_inst, node_id),
+            "node_id": node_id,
+        }
+        if i < len(snr or []):
+            raw = snr[i]
+            if isinstance(raw, (int, float)):
+                entry["snr"] = raw / 4.0
+        hops.append(entry)
+    return hops
+
+
+async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
+    """Discover the actual radio route to a node, with per-hop SNR."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    node_id, err = _requested_node(args, adapter_inst)
+    if err:
+        return json.dumps({"error": err})
+
+    hop_limit = int(_clamp(args.get("hop_limit"), 5, 1, 7))
+    timeout = _clamp(args.get("timeout"), 60.0, 5.0, 120.0)
+    result = await adapter_inst.request_traceroute(node_id, hop_limit=hop_limit, timeout=timeout)
+    if not result.get("ok"):
+        return json.dumps({"node_id": node_id, "answered": False, "error": result.get("error")})
+
+    route = result.get("data") or {}
+    logger.info("Meshtastic traceroute raw reply for %s: %s", node_id, route)
+    towards = _format_route(route.get("route", []), route.get("snrTowards", []), adapter_inst)
+    back = _format_route(route.get("routeBack", []), route.get("snrBack", []), adapter_inst)
+    # Per-segment SNR (dB), one more value than there are relays — for a 0-hop
+    # direct trace these carry the direct link's SNR each way (the relay lists
+    # are empty then). -128 is the firmware's "unknown" sentinel.
+    snr_towards = [None if v == -128 else v / 4.0 for v in (route.get("snrTowards") or [])]
+    snr_back = [None if v == -128 else v / 4.0 for v in (route.get("snrBack") or [])]
+    return json.dumps(
+        {
+            "node_id": node_id,
+            "name": _node_display_name(adapter_inst, node_id),
+            "answered": True,
+            "hops_towards": len(towards),
+            "route_towards": towards,
+            "route_back": back,
+            "snr_towards_db": snr_towards,
+            "snr_back_db": snr_back,
+            "note": (
+                "route_towards/route_back list the relays each way (empty = direct). "
+                "snr_towards_db is per-segment SNR toward the node, snr_back_db back to "
+                "us; for a direct (0-hop) trace each holds the direct link's SNR. "
+                "Asymmetry between the two directions explains messages that arrive but "
+                "are never confirmed."
+            ),
+        },
+        ensure_ascii=False,
     )

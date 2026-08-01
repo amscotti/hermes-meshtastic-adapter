@@ -67,6 +67,23 @@ pub = transport.pub
 DEFAULT_TCP_PORT = transport.DEFAULT_TCP_PORT
 _DaemonTransportExecutor = transport._DaemonTransportExecutor
 
+
+class MeshLinkLost(Exception):
+    """Raised into an in-flight solicited request when the transport drops.
+
+    Distinct from a timeout: the node never got the chance to answer over the
+    connection the request went out on, so we fail fast instead of waiting out
+    the full timeout.
+    """
+
+
+# Protobuf message types for solicited requests. Optional like the rest of the
+# meshtastic dependency — the tests exercise the request path with the mock.
+try:
+    from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2
+except ImportError:  # pragma: no cover - optional dependency in tests
+    mesh_pb2 = portnums_pb2 = telemetry_pb2 = cast(Any, None)
+
 # TCP keepalive probing for node links. The library's own heartbeat runs every
 # 300s, so without this a link that dies silently (WiFi drop, node reboot, RST
 # we never see) stays "connected" for up to five minutes — or until our next
@@ -392,6 +409,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._keepalive_socket_id: int | None = None
         self._link_down_since: dict[str, float] = {}
         self._link_drop_counts: dict[str, int] = {"socket_reset": 0, "node_absent": 0}
+
+        # Waiters for *solicited* replies (telemetry / position / traceroute
+        # requested with wantResponse). Keyed (kind, node_id) -> ConcurrentFuture
+        # list; _on_receive resolves them when the matching packet arrives. Same
+        # thread-safe storage/resolution model as _ack_futures.
+        self._response_waiters: dict[tuple[str, str], list[ConcurrentFuture]] = {}
+        self._response_lock = threading.Lock()
 
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
@@ -1547,6 +1571,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
         library's own TCP self-heal.
         """
         logger.warning("Meshtastic reported connection lost (interface=%s).", interface)
+        # A solicited reply can only return over the connection the request went
+        # out on, so once it drops the wait is dead time — up to a full 60s
+        # traceroute timeout of the agent sitting mute. Fail them now.
+        self._abandon_response_waiters("connection lost")
+
+    def _abandon_response_waiters(self, reason: str) -> None:
+        """Fail every in-flight solicited request when the link goes down."""
+        with self._response_lock:
+            pending = [f for futures in self._response_waiters.values() for f in futures]
+            self._response_waiters.clear()
+        if not pending:
+            return
+        logger.info("Abandoning %d in-flight Meshtastic request(s): %s", len(pending), reason)
+        for future in pending:
+            if future.done():
+                continue
+            try:
+                future.set_exception(MeshLinkLost(reason))
+            except ConcurrentInvalidStateError:
+                pass
 
     def _on_connection_established(self, interface=None):
         """Log Meshtastic-reported connection establishment (pubsub background thread)."""
@@ -1612,6 +1656,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
             from_id = self._normalize_node_id(packet.get("fromId") or packet.get("from"))
             if not from_id:
                 return
+
+            # Resolve any solicited-request waiter for this node. Done here,
+            # before the auth gate — a reply is protocol data addressed to us,
+            # so the allowlist (which gates who may talk to the agent) must not
+            # drop it. The normal telemetry/position DB logging still runs later.
+            self._maybe_resolve_solicited(from_id, packet.get("decoded", {}) or {})
 
             # Link metadata from the packet envelope.
             # Prefer rx* keys from the radio envelope; use is-not-None so a
@@ -1925,6 +1975,212 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 logger.debug(f"Logged position for node {node_id}")
         except Exception as e:
             logger.error(f"Error logging position packet: {e}")
+
+    # ------------------------------------------------------------------
+    # Solicited requests (agent actively asks a node for data)
+    #
+    # Unlike the read-only tools that serve already-heard data, these put a
+    # packet on the shared LoRa channel. Each is addressed to ONE node and is
+    # never retried — a silent node just reports "no response". Waiters use the
+    # same ConcurrentFuture model as ACK waiters; the transmit goes through the
+    # lifecycle transport executor so it can't race close.
+    # ------------------------------------------------------------------
+
+    def _register_response_waiter(self, kind: str, node_id: str) -> ConcurrentFuture:
+        """Arm a waiter for a solicited reply of *kind* from *node_id*."""
+        future: ConcurrentFuture = ConcurrentFuture()
+        with self._response_lock:
+            self._response_waiters.setdefault((kind, node_id), []).append(future)
+        return future
+
+    def _resolve_response_waiters(self, kind: str, node_id: str, payload: dict) -> None:
+        """Hand *payload* to anyone waiting on a *kind* reply from *node_id*."""
+        with self._response_lock:
+            futures = self._response_waiters.pop((kind, node_id), [])
+        for future in futures:
+            if not future.done():
+                self._set_ack_future_result(future, payload)
+
+    def _maybe_resolve_solicited(self, from_id: str, decoded: dict) -> None:
+        """Feed a telemetry/position/traceroute packet to any matching waiter."""
+        if not isinstance(decoded, dict):
+            return
+        portnum = decoded.get("portnum")
+        if portnum in ("TELEMETRY_APP", 67):
+            self._resolve_response_waiters("telemetry", from_id, decoded.get("telemetry", decoded))
+        elif portnum in ("POSITION_APP", 3):
+            self._resolve_response_waiters("position", from_id, decoded.get("position", decoded))
+        elif portnum in ("TRACEROUTE_APP", 70):
+            route = decoded.get("traceroute") or decoded.get("routeDiscovery") or {}
+            self._resolve_response_waiters("traceroute", from_id, route)
+
+    def _discard_response_waiter(self, kind: str, node_id: str, future: ConcurrentFuture) -> None:
+        """Drop a waiter that timed out so the registry can't grow unbounded."""
+        with self._response_lock:
+            pending = self._response_waiters.get((kind, node_id))
+            if not pending:
+                return
+            if future in pending:
+                pending.remove(future)
+            if not pending:
+                self._response_waiters.pop((kind, node_id), None)
+
+    async def _solicit(
+        self,
+        kind: str,
+        node_id: str,
+        send: Callable[[Any], Any],
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Send a request to one node and await its reply.
+
+        Returns ``{"ok": True, "data": ...}`` or ``{"ok": False, "error": ...}``
+        — never raises for an unanswered request, since silence is the normal
+        outcome for a distant node.
+        """
+        dest = self._normalize_node_id(node_id) or node_id
+        ifaces = self.get_interfaces()
+        with self._lifecycle_lock:
+            executor = self._transport_executor
+        if not ifaces or executor is None:
+            return {"ok": False, "error": "No active Meshtastic interfaces connected"}
+        iface = ifaces[0]
+
+        future = self._register_response_waiter(kind, dest)
+        try:
+            await asyncio.wrap_future(executor.submit(lambda: send(iface)))
+        except Exception as e:
+            self._discard_response_waiter(kind, dest, future)
+            logger.error("Meshtastic %s request to %s failed to send: %s", kind, dest, e)
+            return {"ok": False, "error": f"Could not send {kind} request: {e}"}
+
+        logger.info("Meshtastic %s requested from %s (timeout=%.0fs)", kind, dest, timeout)
+        try:
+            data = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            self._discard_response_waiter(kind, dest, future)
+            logger.info("Meshtastic %s request to %s timed out", kind, dest)
+            return {
+                "ok": False,
+                "error": (
+                    f"{dest} did not answer the {kind} request within {timeout:.0f}s. "
+                    "The node may be out of range, asleep, or the reply was lost."
+                ),
+            }
+        except MeshLinkLost as e:
+            # The link dropped mid-wait — the reply can't return, so fail fast
+            # instead of sitting out the full timeout.
+            logger.info("Meshtastic %s request to %s abandoned: %s", kind, dest, e)
+            return {
+                "ok": False,
+                "error": (
+                    f"The Meshtastic link dropped before {dest} answered the {kind} "
+                    f"request ({e}). The packet may have gone out; try again."
+                ),
+            }
+        logger.info("Meshtastic %s reply received from %s", kind, dest)
+        return {"ok": True, "data": data}
+
+    def _post_request(
+        self,
+        iface: Any,
+        dest: str,
+        payload: Any,
+        portnum: Any,
+        hop_limit: int | None = None,
+    ) -> None:
+        """Transmit a ``want_response`` packet WITHOUT the library's blocking wait.
+
+        ``sendPosition`` / ``sendTelemetry`` / ``sendTraceRoute`` each call their
+        own ``waitForX()`` helper when ``wantResponse=True``, which busy-waits on
+        the interface ``Timeout`` — 300s for TCP — inside our transport-executor
+        thread and raises on expiry. That stalled the whole tool call for five
+        minutes on a silent/unreachable node and surfaced as "failed to send",
+        while ``_solicit``'s own timeout never applied. We already resolve replies
+        on the pubsub receive path, so post via ``sendData`` (serialize + send
+        only, ``onResponse=None``) and let ``_solicit``'s timeout be the single
+        authority on the wait.
+        """
+        iface.sendData(
+            payload,
+            destinationId=dest,
+            portNum=portnum,
+            wantResponse=True,
+            onResponse=None,
+            hopLimit=hop_limit,
+        )
+
+    @staticmethod
+    def _telemetry_request(iface: Any) -> Any:
+        """Build the telemetry request the stock client sends — our own metrics.
+
+        Firmware answers any want_response telemetry packet, but the official
+        client fills the request with its OWN device metrics so the peer hears
+        our battery state too; mirroring that keeps us a well-behaved citizen
+        rather than a bare poller. An empty node DB just sends an empty one.
+        """
+        request = telemetry_pb2.Telemetry()
+        try:
+            metrics = (iface.getMyNodeInfo() or {}).get("deviceMetrics") or {}
+        except Exception:
+            metrics = {}
+        for field, key in (
+            ("battery_level", "batteryLevel"),
+            ("voltage", "voltage"),
+            ("channel_utilization", "channelUtilization"),
+            ("air_util_tx", "airUtilTx"),
+            ("uptime_seconds", "uptimeSeconds"),
+        ):
+            value = metrics.get(key)
+            if value is not None:
+                setattr(request.device_metrics, field, value)
+        return request
+
+    async def request_telemetry(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for fresh device metrics (battery, voltage, uptime)."""
+        dest = self._normalize_node_id(node_id) or node_id
+        return await self._solicit(
+            "telemetry",
+            node_id,
+            lambda iface: self._post_request(
+                iface, dest, self._telemetry_request(iface), portnums_pb2.PortNum.TELEMETRY_APP
+            ),
+            timeout,
+        )
+
+    async def request_position(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for its current position."""
+        dest = self._normalize_node_id(node_id) or node_id
+        return await self._solicit(
+            "position",
+            node_id,
+            # Empty Position — what the stock client sends when asking (not
+            # reporting); every field is optional.
+            lambda iface: self._post_request(
+                iface, dest, mesh_pb2.Position(), portnums_pb2.PortNum.POSITION_APP
+            ),
+            timeout,
+        )
+
+    async def request_traceroute(
+        self, node_id: str, hop_limit: int = 5, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Discover the actual route to a node, with per-hop SNR."""
+        dest = self._normalize_node_id(node_id) or node_id
+        return await self._solicit(
+            "traceroute",
+            node_id,
+            # Empty RouteDiscovery — each relay appends itself en route; the
+            # reply carries the assembled path.
+            lambda iface: self._post_request(
+                iface,
+                dest,
+                mesh_pb2.RouteDiscovery(),
+                portnums_pb2.PortNum.TRACEROUTE_APP,
+                hop_limit=hop_limit,
+            ),
+            timeout,
+        )
 
     async def send(
         self,

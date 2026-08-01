@@ -145,3 +145,100 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
         },
     },
 }
+
+# --- Solicited requests ------------------------------------------------------
+# Unlike the read-only tools above, these transmit on the shared LoRa channel.
+# Each is addressed to a single node and is never retried, so the agent cannot
+# turn a question into a mesh-wide sweep.
+
+MESH_REQUEST_TELEMETRY_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mesh_request_telemetry",
+        "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+            "Actively ask ONE node over the air for its current device metrics "
+            "(battery, voltage, uptime) and wait for the reply. This transmits on the "
+            "shared LoRa channel, so use it only when the user asks about a specific "
+            "node's live state; prefer mesh_telemetry for already-known data. A node "
+            "that is out of range or asleep simply will not answer."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the reply (default 45, max 120).",
+                },
+            },
+            "required": ["node_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+MESH_REQUEST_POSITION_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mesh_request_position",
+        "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+            "Actively ask ONE node over the air for its current position and wait for "
+            "the reply. This transmits on the shared LoRa channel — use it only when "
+            "the user asks where a specific node is right now; prefer mesh_node_info "
+            "or mesh_telemetry_history for the last known position."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the reply (default 45, max 120).",
+                },
+            },
+            "required": ["node_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+MESH_TRACEROUTE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mesh_traceroute",
+        "description": (
+            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+            "Discover the actual radio route to ONE node: which relay nodes carry the "
+            "traffic and the SNR of each hop, in both directions. The best tool for "
+            "diagnosing why messages to a node are slow, unconfirmed, or lost. "
+            "Transmits on the shared LoRa channel, so use it deliberately."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "The node ID (e.g. '!da1b1613') or name of the node to trace.",
+                },
+                "hop_limit": {
+                    "type": "integer",
+                    "description": "Maximum hops to traverse (default 5, max 7).",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the reply (default 60, max 120).",
+                },
+            },
+            "required": ["node_id"],
+            "additionalProperties": False,
+        },
+    },
+}

@@ -88,9 +88,11 @@ and as flat modules (in tests/CI).
 - **`mock_interface.py`** — `MockLocalNode` + `MockSerialInterface`, the
   fallback used when Meshtastic deps are missing or no port is found so the
   plugin always loads.
-- **`mesh_tools.py`** — the `mesh_*` async tool handlers exposed to the agent.
-  Named `mesh_tools`, **not** `tools`, so it can't shadow Hermes' own top-level
-  `tools` package (see the collision note under Conventions).
+- **`mesh_tools.py`** — the ten `mesh_*` async tool handlers exposed to the
+  agent. Seven are read-only (they serve already-heard data); three are
+  **solicited requests** that transmit — see below. Named `mesh_tools`, **not**
+  `tools`, so it can't shadow Hermes' own top-level `tools` package (see the
+  collision note under Conventions).
 - **`schemas.py`** — JSON function schemas for those tools.
 - **`telemetry_db.py`** — SQLite persistence (`telemetry`, `positions`,
   `signal_quality` tables) at `~/.hermes/meshtastic_telemetry.db`.
@@ -153,6 +155,14 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 **Optional delivery retry.** `MESHTASTIC_SEND_RETRIES > 0` makes `send()` re-send un-confirmed **DM** chunks up to N times (implies ACK-waiting). `ack_state.is_retriable_failure` (pure module function; the adapter delegates `_is_retriable_failure` to it) retries only on **evidence of non-delivery**: `AckStatus.TIMEOUT` (nothing came back) or a NAK whose reason isn't in `PERMANENT_NAK_REASONS` — notably `MAX_RETRANSMIT`, the firmware's own "reliable send failed" verdict after its `NUM_RELIABLE_RETX` (3) attempts. `AckStatus.IMPLICIT_ACK` is **not** retried: a relay rebroadcast the packet, so the mesh carried it and non-delivery isn't established — and `_maybe_record_pubsub_ack` upgrades the record to a real ACK if the destination's routing ACK arrives later. Retrying on implicit is what re-sent one reply many times on a relayed path (each app attempt is ~3 radio transmissions) — and every copy actually reached the user. `PERMANENT_NAK_REASONS` (e.g. `TOO_LARGE`) and broadcasts are never retried. Backoff is `MESHTASTIC_RETRY_BACKOFF`; the per-chunk attempt count lands in `raw_response["chunks"][i]["attempts"]`.
 
 `edit_message` deliberately returns unsupported — LoRa has no edit primitive, and emulating it would flood the mesh.
+
+### Solicited requests (agent asks a node for data)
+
+`mesh_request_telemetry`, `mesh_request_position` and `mesh_traceroute` are the only tools that **transmit**; everything else serves already-heard data. They map to the library's `sendTelemetry(wantResponse=True)` / `sendPosition(wantResponse=True)` / `sendTraceRoute`.
+
+`_solicit()` is the shared path: arm a `ConcurrentFuture` waiter via `_register_response_waiter(kind, node_id)`, submit the transmit through the lifecycle `_transport_executor` (so it can't race close), then `await asyncio.wait_for(asyncio.wrap_future(future), timeout)`. `_on_receive` calls `_maybe_resolve_solicited` **before the auth gate** — a reply is protocol data addressed to us, so the allowlist must not drop it — matching `TELEMETRY_APP` / `POSITION_APP` / `TRACEROUTE_APP` to any waiter and completing it with `_set_ack_future_result` (same thread-safe model as ACK waiters). A timeout drops the waiter (`_discard_response_waiter`) so the registry can't leak.
+
+**Airtime discipline is a design constraint.** LoRa bandwidth is shared, so each request targets exactly ONE node, is **never retried**, and a silent node returns `answered: false` rather than raising — the schemas say so to keep the model from sweeping the mesh. Traceroute reports the real relay chain and per-hop SNR in both directions (SNR arrives scaled by 4), which is what distinguishes a weak-direct path from a healthy relayed one.
 
 ### Connection lifecycle
 
