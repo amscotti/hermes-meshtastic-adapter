@@ -97,13 +97,15 @@ Environment variables:
 | `MESHTASTIC_ALLOWED_USERS` | No | Empty | Legacy alias for `MESHTASTIC_ALLOWED_NODES`. |
 | `MESHTASTIC_ALLOW_ALL_USERS` | No | `false` | If true, any mesh node may talk to Hermes. Use with caution. |
 | `MESHTASTIC_ALLOW_CHANNELS` | No | `false` | If true, the agent also answers **channel/broadcast** messages (replying into the shared channel). Off by default so the agent only responds to direct messages and never spams a public channel's airtime. |
-| `MESHTASTIC_HOME_CHANNEL` | No | Empty | Cron/default delivery target, such as `meshtastic:!da1b1613` or `meshtastic:channel:0`. |
+| `MESHTASTIC_HOME_CHANNEL` | No | Empty | Cron/default delivery target, such as `meshtastic:!da1b1613` or `meshtastic:channel:0`. A bare node id (`!da1b1613` or `da1b1613`) / `channel:N` value is auto-prefixed to `meshtastic:` with a warning. |
 | `MESHTASTIC_CHUNK_BYTES` | No | `170` | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and leaves headroom for encrypted-DM (PKI) overhead; the raw protocol payload ceiling (and the clamp for this value) is `233`. |
 | `MESHTASTIC_CHUNK_DELAY` | No | `4.0` | Delay in seconds between chunk sends. |
 | `MESHTASTIC_ACK_TIMEOUT` | No | `0` | Seconds to wait for ACK/NACK per outbound chunk. `0` is non-blocking. Set `30` to fail sends on NAK or timeout. |
 | `MESHTASTIC_SEND_RETRIES` | No | `0` | Extra delivery attempts for un-ACKed **direct-message** chunks. `> 0` implies waiting for the ACK; transient failures (timeout, no-route) are re-sent, permanent ones (e.g. `TOO_LARGE`) are not. Broadcasts are never retried. |
 | `MESHTASTIC_RETRY_BACKOFF` | No | `5.0` | Seconds to wait between delivery retries. |
 | `MESHTASTIC_TELEMETRY_RETENTION_DAYS` | No | `30` | Age (days) at which persisted telemetry/position/signal rows are pruned from SQLite. `0` disables pruning. Pruning runs at most hourly, lazily on writes. |
+| `MESHTASTIC_MOCK` | No | `false` | `true` runs the adapter against the mock interface (dry-run, no real radio traffic). Only relevant when the meshtastic library is missing; otherwise the adapter always opens the real serial/TCP interface. |
+| `MESHTASTIC_AUTOINSTALL` | No | `true` | When the meshtastic library is missing, the adapter runs `pip install -r requirements.txt` into the gateway's Python environment once per process (Hermes updates can wipe plugin deps). Set `0`/`false` to disable and fail with install instructions instead. |
 
 ## Connecting Over IP (TCP)
 
@@ -207,15 +209,27 @@ For a gateway/base station, configure power behavior on the node itself through 
 
 ### Plugin Uses Mock Serial Connection
 
-This usually means the Hermes Python environment is missing dependencies or no serial port was discovered.
+The mock interface is only ever used when you explicitly opt in or when serial
+auto-discovery finds nothing:
 
-Install dependencies into the Hermes venv:
+- **Meshtastic library missing** — the adapter now fails loudly instead of
+  silently pretending to work. The gateway log shows a `RuntimeError` with the
+  install command, and the adapter attempts **one automatic**
+  `pip install -r requirements.txt` into the running interpreter
+  (`MESHTASTIC_AUTOINSTALL=0` disables that). Hermes self-updates rebuild the
+  runtime venv and can drop the plugin's dependencies — after an update, check
+  the gateway log for this error or for `mock_interface` lines.
+- **`MESHTASTIC_MOCK=1`** — explicitly runs against the mock interface
+  (dry-run; no real radio traffic) even when the library is missing.
+- **No serial port found with `auto`** — a warning is logged and the adapter
+  falls back to `mock_port`. Set `MESHTASTIC_SERIAL_PORT` explicitly instead
+  of `auto`.
+
+Manual install into the Hermes venv:
 
 ```bash
 ~/.hermes/hermes-agent/venv/bin/python -m pip install -r ~/.hermes/plugins/meshtastic/requirements.txt
 ```
-
-Then set `MESHTASTIC_SERIAL_PORT` explicitly instead of `auto`.
 
 ### Serial Port Not Found
 

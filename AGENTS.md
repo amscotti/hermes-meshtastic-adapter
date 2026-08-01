@@ -16,6 +16,11 @@ Compact guidance for AI agents working in this repo. Deep architecture
   `sys.path` are expected, not a bug. The `.venv` resolves it locally via
   `~/.hermes/hermes-agent`; CI checks out `NousResearch/hermes-agent` into
   `_deps/`. Set `HERMES_AGENT_PATH` if Hermes lives elsewhere.
+- **Hermes self-updates can rebuild the runtime venv and drop the plugin's
+  pip deps** (meshtastic/pypubsub). The adapter auto-installs them once per
+  process on connect (`MESHTASTIC_AUTOINSTALL=0` disables); for diagnosis,
+  a real connection logs `SerialInterface(...)`, a missing library now raises
+  instead of silently using the mock.
 
 ## Commands (run with `.venv/bin/python`)
 
@@ -78,6 +83,23 @@ all together for an accurate number.
   package (Hermes imports `tools.registry` transitively; a top-level `tools.py`
   here shadows it and breaks the whole import). Set up by dynamic load in
   `adapter._load_tools_module` and `test_meshtastic.py`; preserve it.
+- **The mock interface must never masquerade as production.** `open_interface`
+  raises with install instructions when the meshtastic library is missing (real
+  serial/TCP target), after one automatic `pip install -r requirements.txt`
+  attempt per process (`transport.ensure_meshtastic_library`;
+  `MESHTASTIC_AUTOINSTALL=0` disables, `MESHTASTIC_MOCK=1` explicitly opts into
+  the dry-run mock). `mock_port` targets still return the mock — tests use it.
+- **Read `transport.HAS_MESHTASTIC` / `transport.pub` at call time**, never the
+  adapter's module-level snapshots (those are back-compat aliases only): the
+  library can be pip-installed and re-imported after import (see the bullet
+  above), and stale snapshots would silently skip pubsub subscription. Tests
+  must patch `transport.X`, not `adapter.X`.
+- **`MESHTASTIC_HOME_CHANNEL` is normalized in `__init__`**
+  (`_expand_home_channel_env_for_gateway`): a bare node id (`!node` or bare
+  8-hex) / `channel:N` value is rewritten to `meshtastic:!node` /
+  `meshtastic:channel:N` with a warning, because Hermes cron delivery passes
+  the env value through as the chat id and the send path requires the
+  `meshtastic:` prefix.
 - **Threading boundary**: meshtastic `pubsub` delivers on a background thread;
   all asyncio-loop state is touched only via `_schedule_on_loop` /
   `loop.call_soon_threadsafe`. `_on_receive` runs on the platform loop, not

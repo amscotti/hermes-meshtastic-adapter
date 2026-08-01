@@ -3188,6 +3188,75 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertIn("!ab12cd34", adapter.allowed_nodes)
         self.assertNotIn("bad55555", adapter.allowed_nodes)
 
+    def test_home_channel_expansion_normalizes_bare_node_id(self):
+        """A bare !node id in MESHTASTIC_HOME_CHANNEL must become meshtastic:!node."""
+        with patch.dict(os.environ, {"MESHTASTIC_HOME_CHANNEL": "!da1b1613"}):
+            config = MagicMock()
+            config.extra = {}
+            MeshtasticAdapter(config)
+            self.assertEqual(os.environ["MESHTASTIC_HOME_CHANNEL"], "meshtastic:!da1b1613")
+
+    def test_home_channel_expansion_normalizes_bare_hex_node_id(self):
+        """A bang-less 8-hex node id is a node id too — normalize it."""
+        with patch.dict(os.environ, {"MESHTASTIC_HOME_CHANNEL": "DA1B1613"}):
+            config = MagicMock()
+            config.extra = {}
+            MeshtasticAdapter(config)
+            self.assertEqual(os.environ["MESHTASTIC_HOME_CHANNEL"], "meshtastic:!da1b1613")
+
+    def test_home_channel_expansion_normalizes_channel(self):
+        with patch.dict(os.environ, {"MESHTASTIC_HOME_CHANNEL": "channel:0"}):
+            config = MagicMock()
+            config.extra = {}
+            MeshtasticAdapter(config)
+            self.assertEqual(os.environ["MESHTASTIC_HOME_CHANNEL"], "meshtastic:channel:0")
+
+    def test_home_channel_expansion_keeps_prefixed_value(self):
+        with patch.dict(os.environ, {"MESHTASTIC_HOME_CHANNEL": "meshtastic:channel:0"}):
+            config = MagicMock()
+            config.extra = {}
+            MeshtasticAdapter(config)
+            self.assertEqual(os.environ["MESHTASTIC_HOME_CHANNEL"], "meshtastic:channel:0")
+
+    def test_home_channel_expansion_keeps_unknown_value(self):
+        # Non-node, non-channel values are left untouched (warned about only).
+        with patch.dict(os.environ, {"MESHTASTIC_HOME_CHANNEL": "groupchat/42"}):
+            config = MagicMock()
+            config.extra = {}
+            MeshtasticAdapter(config)
+            self.assertEqual(os.environ["MESHTASTIC_HOME_CHANNEL"], "groupchat/42")
+
+    def test_subscribe_pubsub_reads_transport_pub_at_call_time(self):
+        """Subscription must use transport.pub at call time: the library can be
+        pip-installed and re-imported after this module was imported, and the
+        module-level snapshots would be stale."""
+        fake_pub = MagicMock()
+        config = MagicMock()
+        config.extra = {}
+        adapter = MeshtasticAdapter(config)
+        with (
+            patch("transport.HAS_MESHTASTIC", True),
+            patch("transport.pub", fake_pub),
+            patch.object(adapter, "_pubsub_subscribed", False),
+        ):
+            adapter._subscribe_pubsub()
+            self.assertTrue(fake_pub.subscribe.called)
+            self.assertTrue(adapter._pubsub_subscribed)
+
+    def test_subscribe_pubsub_skips_when_library_missing(self):
+        fake_pub = MagicMock()
+        config = MagicMock()
+        config.extra = {}
+        adapter = MeshtasticAdapter(config)
+        with (
+            patch("transport.HAS_MESHTASTIC", False),
+            patch("transport.pub", fake_pub),
+            patch.object(adapter, "_pubsub_subscribed", False),
+        ):
+            adapter._subscribe_pubsub()
+            fake_pub.subscribe.assert_not_called()
+            self.assertFalse(adapter._pubsub_subscribed)
+
     def test_normalize_node_id_forms(self):
         """_normalize_node_id produces stable ! + lowercase 8-hex ids."""
         norm = MeshtasticAdapter._normalize_node_id

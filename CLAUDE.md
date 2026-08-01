@@ -74,20 +74,26 @@ and as flat modules (in tests/CI).
   `AckStatus` enum, `PERMANENT_NAK_REASONS`, `ACK_RECORD_LIMIT`, and the pure
   `ack_wait_config` / `send_retries` / `retry_backoff` env readers.
 - **`transport.py`** — `_DaemonTransportExecutor` (single-worker daemon thread
-  that serializes blocking Meshtastic I/O off the event loop), the lazy
-  `meshtastic`/`pubsub`/`serial` imports (`HAS_MESHTASTIC`, `pub`), and the
-  pure target-resolution/interface-construction helpers
+  that serializes blocking Meshtastic I/O off the event loop), the re-runnable
+  `meshtastic`/`pubsub`/`serial` imports (`HAS_MESHTASTIC`, `pub`),
+  `ensure_meshtastic_library` (one automatic `pip install -r requirements.txt`
+  per process when the library is missing; `MESHTASTIC_AUTOINSTALL=0`
+  disables), and the pure target-resolution/interface-construction helpers
   (`connection_targets`, `parse_tcp_target`, `open_interface`,
-  `discover_serial_ports`, `DEFAULT_TCP_PORT`).
+  `discover_serial_ports`, `DEFAULT_TCP_PORT`). `open_interface` raises with
+  install instructions for real serial/TCP targets when the library is
+  missing — the mock is only returned for `mock_port` targets or explicit
+  `MESHTASTIC_MOCK=1` opt-in.
 - **`chunking.py`** — `chunk_message` / `split_utf8` plus `MAX_MESSAGE_LENGTH`
   (233, the `DATA_PAYLOAD_LEN` ceiling) and `DEFAULT_CHUNK_BYTES` (170). Pure
   functions; the adapter delegates `_chunk_message` here.
 - **`node_freshness.py`** — `NodeFreshness`, the live-observed per-node overlay
   (`last_heard` / `snr` / `rssi`) layered over the library node DB. Bounded at
   `OBSERVED_NODE_LIMIT` (2048).
-- **`mock_interface.py`** — `MockLocalNode` + `MockSerialInterface`, the
-  fallback used when Meshtastic deps are missing or no port is found so the
-  plugin always loads.
+- **`mock_interface.py`** — `MockLocalNode` + `MockSerialInterface`, used for
+  tests, `mock_port` targets, and explicit `MESHTASTIC_MOCK=1` dry-runs. Real
+  serial/TCP targets NEVER fall back to it: a missing meshtastic library
+  raises at connect instead (see transport.py above).
 - **`mesh_tools.py`** — the ten `mesh_*` async tool handlers exposed to the
   agent. Seven are read-only (they serve already-heard data); three are
   **solicited requests** that transmit — see below. Named `mesh_tools`, **not**
@@ -166,7 +172,7 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 ### Connection lifecycle
 
-`connect()` resolves connection *targets* via `_connection_targets()` (delegating to `transport.connection_targets`) and spawns one `_reconnect_loop` per target (exponential backoff, keepalive polling) plus `_drain_queue_loop`. A target is an opaque key produced by `transport.py`: a serial devPath, `mock_port`, or a `tcp://host:port` URL. `transport.open_interface` maps the key to a `SerialInterface`, `TCPInterface`, or `MockSerialInterface` (from `mock_interface.py`). A configured `MESHTASTIC_TCP_HOST` takes precedence and is mutually exclusive with serial (one transport at a time). When no hardware/deps are present, it falls back to **`MockSerialInterface`** (two fake nodes) so the plugin always loads — "Plugin uses mock serial connection" means deps are missing or no port was found.
+`connect()` resolves connection *targets* via `_connection_targets()` (delegating to `transport.connection_targets`) and spawns one `_reconnect_loop` per target (exponential backoff, keepalive polling) plus `_drain_queue_loop`. A target is an opaque key produced by `transport.py`: a serial devPath, `mock_port`, or a `tcp://host:port` URL. `transport.open_interface` maps the key to a `SerialInterface`, `TCPInterface`, or `MockSerialInterface` (from `mock_interface.py`). A configured `MESHTASTIC_TCP_HOST` takes precedence and is mutually exclusive with serial (one transport at a time). When no hardware/deps are present it used to fall back to **`MockSerialInterface`** (two fake nodes) so the plugin always loads; since the fail-loud change (2026-08) a missing library raises with install instructions (after one auto-install attempt) and only `mock_port` / `MESHTASTIC_MOCK=1` produce a mock — "Plugin uses mock serial connection" now means deps are missing or no port was found.
 
 The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, oldest-first eviction; messages queued during a disconnect are lost if the gateway restarts before draining.
 
