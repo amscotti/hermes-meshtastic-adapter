@@ -61,6 +61,8 @@ from telemetry_db import get_position_history, get_telemetry_history, init_db
 
 handle_mesh_list_nodes = meshtastic_tools.handle_mesh_list_nodes
 handle_mesh_node_info = meshtastic_tools.handle_mesh_node_info
+handle_mesh_pause = meshtastic_tools.handle_mesh_pause
+handle_mesh_resume = meshtastic_tools.handle_mesh_resume
 handle_mesh_signal_quality = meshtastic_tools.handle_mesh_signal_quality
 handle_mesh_send_dm = meshtastic_tools.handle_mesh_send_dm
 handle_mesh_send_broadcast = meshtastic_tools.handle_mesh_send_broadcast
@@ -322,6 +324,51 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.adapter.handle_message.call_args[0][0].source.chat_id, "meshtastic:!ab12cd34"
         )
+
+    def test_pause_resume_state(self):
+        """pause_link/resume_link flip the flag and report it via pause_state."""
+        self.assertFalse(self.adapter._paused)
+        state = self.adapter.pause_link()
+        self.assertTrue(state["paused"])
+        self.assertIsNone(state["resumes_at"])  # untimed
+        self.assertTrue(self.adapter._paused)
+
+        state = self.adapter.resume_link()
+        self.assertFalse(state["paused"])
+        self.assertFalse(self.adapter._paused)
+
+    def test_pause_timed_reports_window_and_auto_expires(self):
+        """A timed pause reports a resume time and _pause_expired auto-resumes."""
+        state = self.adapter.pause_link(minutes=30)
+        self.assertTrue(state["paused"])
+        self.assertIsNotNone(state["resumes_at"])
+        self.assertAlmostEqual(state["resumes_in_minutes"], 30, delta=1)
+
+        # Not yet expired.
+        self.assertFalse(self.adapter._pause_expired())
+        self.assertTrue(self.adapter._paused)
+        # Force the deadline into the past → auto-resume.
+        self.adapter._pause_until = time.time() - 1
+        self.assertTrue(self.adapter._pause_expired())
+        self.assertFalse(self.adapter._paused)
+
+    async def test_mesh_pause_and_resume_tools(self):
+        """The tools drive pause_link/resume_link and report the state."""
+        out = json.loads(await handle_mesh_pause({"minutes": 5}))
+        self.assertTrue(out["paused"])
+        self.assertIn("note", out)
+        self.assertTrue(self.adapter._paused)
+
+        out = json.loads(await handle_mesh_resume({}))
+        self.assertFalse(out["paused"])
+        self.assertFalse(self.adapter._paused)
+
+    async def test_mesh_pause_rejects_bad_minutes(self):
+        """Non-numeric / non-positive minutes are rejected, not paused."""
+        for bad in ("soon", 0, -5):
+            out = json.loads(await handle_mesh_pause({"minutes": bad}))
+            self.assertIn("error", out)
+        self.assertFalse(self.adapter._paused)
 
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""

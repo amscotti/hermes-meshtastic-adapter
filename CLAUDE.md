@@ -201,6 +201,10 @@ The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, ol
 
 **Drops are classified in the log.** `_note_link_drop` timestamps the outage and `_report_link_recovery` reports it on reconnect, splitting **socket resets** (back within `SOCKET_RESET_MAX_OUTAGE_SECS`, i.e. the node stayed up) from **node absences** (longer — reboot, WiFi drop, power loss), with running session totals. The distinction is the whole diagnosis: a handful of resets is normal for an ESP32 over WiFi, while repeated long absences are the node's own health and not something the adapter can fix. Log forensics of 2026-07-24 turned 16 apparent "drops" into 11 absences (user-initiated reboots) and 5 genuine resets — the counters exist so that analysis doesn't have to be redone by hand.
 
+### Pausing the radio (freeing the node)
+
+The node accepts only a couple of TCP clients, so connecting from the phone app or web UI means the gateway must let go first. `hermes plugins disable` + restart is too blunt (drops every platform and in-flight conversation) and an agent can't do it without killing its own process. `mesh_pause` / `mesh_resume` (and `pause_link` / `resume_link`) set `self._paused`; the `_reconnect_loop` checks it each tick, releases the interface via the serialized close (`_pop_interface_for_lifecycle` + `_close_interfaces`), and stops reconnecting — process, queues and other platforms stay up. A timed pause (`_pause_until`, polled by `_pause_expired`, capped at `PAUSE_MAX_MINUTES`) auto-resumes so "off for a bit" can't become "down all night". Outbound messages queue while paused.
+
 ### Cron / standalone delivery
 
 `_standalone_send` (wired via `cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL"`) spins up a **short-lived** adapter connection with `allow_queueing=False` so cron failures surface. It does not reuse the live gateway adapter.

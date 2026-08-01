@@ -15,13 +15,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+PAUSE_MAX_MINUTES = 12 * 60  # 12h cap on a timed pause
+
 # JSON Schemas are imported for exposure in __init__.py
 try:
     from .schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_PAUSE_SCHEMA,
         MESH_REQUEST_POSITION_SCHEMA,
         MESH_REQUEST_TELEMETRY_SCHEMA,
+        MESH_RESUME_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
@@ -33,8 +37,10 @@ except ImportError:
     from schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_PAUSE_SCHEMA,
         MESH_REQUEST_POSITION_SCHEMA,
         MESH_REQUEST_TELEMETRY_SCHEMA,
+        MESH_RESUME_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
@@ -46,8 +52,10 @@ except ImportError:
 __all__ = [
     "MESH_LIST_NODES_SCHEMA",
     "MESH_NODE_INFO_SCHEMA",
+    "MESH_PAUSE_SCHEMA",
     "MESH_REQUEST_POSITION_SCHEMA",
     "MESH_REQUEST_TELEMETRY_SCHEMA",
+    "MESH_RESUME_SCHEMA",
     "MESH_SEND_BROADCAST_SCHEMA",
     "MESH_SEND_DM_SCHEMA",
     "MESH_SIGNAL_QUALITY_SCHEMA",
@@ -57,8 +65,10 @@ __all__ = [
     "set_adapter",
     "handle_mesh_list_nodes",
     "handle_mesh_node_info",
+    "handle_mesh_pause",
     "handle_mesh_request_position",
     "handle_mesh_request_telemetry",
+    "handle_mesh_resume",
     "handle_mesh_send_broadcast",
     "handle_mesh_send_dm",
     "handle_mesh_signal_quality",
@@ -849,3 +859,42 @@ async def handle_mesh_traceroute(args: dict, **kwargs) -> str:
         },
         ensure_ascii=False,
     )
+
+
+async def handle_mesh_pause(args: dict, **kwargs) -> str:
+    """Release the node so something else can connect to it."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    minutes = args.get("minutes")
+    if minutes is not None:
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "Parameter 'minutes' must be a number."})
+        if minutes <= 0:
+            return json.dumps({"error": "Parameter 'minutes' must be positive."})
+        minutes = min(minutes, PAUSE_MAX_MINUTES)
+
+    state = adapter_inst.pause_link(minutes)
+    return json.dumps(
+        {
+            **state,
+            "note": (
+                "Radio released — the node is free for another client. Outbound messages "
+                "queue until the link resumes."
+            ),
+        },
+        indent=2,
+    )
+
+
+async def handle_mesh_resume(args: dict, **kwargs) -> str:
+    """Reconnect to the node after a pause."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    state = adapter_inst.resume_link()
+    return json.dumps({**state, "note": "Reconnecting to the node; it takes a second."}, indent=2)
