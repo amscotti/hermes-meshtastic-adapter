@@ -1,7 +1,9 @@
 name: meshtastic-platform
+# Installer gate for forward compat with Hermes' plugin manifest versioning.
+manifest_version: 1
 label: Meshtastic
 kind: platform
-version: 1.0.0
+version: 1.2.0
 description: >
   Meshtastic platform adapter for Hermes Agent.
   Connects to a Meshtastic LoRa mesh node over USB serial or TCP/IP and relays
@@ -10,6 +12,9 @@ author: Anthony Scotti
 # No strictly-required env: the adapter connects over serial (defaulting to
 # 'auto' discovery) OR TCP (MESHTASTIC_TCP_HOST). Either transport works, so
 # neither is mandatory — configure one below.
+# MESHTASTIC_MOCK / MESHTASTIC_AUTOINSTALL are intentionally NOT listed here:
+# they are dev/ops knobs (documented in README) that users should never be
+# prompted for — a mock or disabled auto-install silently changes behavior.
 optional_env:
   - name: MESHTASTIC_SERIAL_PORT
     description: "Path to the Meshtastic USB-serial port (e.g. /dev/cu.usbserial-110 or 'auto'). Leave unset when connecting via MESHTASTIC_TCP_HOST."
@@ -70,4 +75,12 @@ optional_env:
   - name: MESHTASTIC_TELEMETRY_RETENTION_DAYS
     description: "Age in days at which persisted telemetry/position/signal rows are pruned from SQLite (default: 30, 0 disables). Runs at most hourly."
     prompt: "Telemetry retention days"
+    password: false
+  - name: MESHTASTIC_TELEMETRY_MAX_ROWS
+    description: "Hard ceiling on rows per SQLite table (telemetry/positions/signal_quality), newest first — not per node (default: 100000, 0 disables the cap)"
+    prompt: "Telemetry max rows per table"
+    password: false
+  - name: MESHTASTIC_OPEN_TIMEOUT
+    description: "Seconds to bound the interface-open wait before treating it as a connect failure (default: 20, 0 waits indefinitely). Relevant on slow serial/WiFi."
+    prompt: "Connect open timeout seconds"
     password: false

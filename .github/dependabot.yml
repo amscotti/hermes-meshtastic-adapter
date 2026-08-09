@@ -1,0 +1,14 @@
+# Dependabot keeps the mutable pins in the workflows honest:
+#   - github-actions: bumps actions/*@vX tags when newer majors ship.
+#   - npm: bumps the pinned `opencode-ai` devDependency (opencode-review.yml
+#     installs exactly that version), so the reviewer is reproducible.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"

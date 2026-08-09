@@ -8,6 +8,7 @@ with the Hermes gateway runner.
 import asyncio
 import importlib
 import logging
+import math
 import os
 import socket
 import sys
@@ -16,17 +17,11 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
-from datetime import datetime
 from types import ModuleType
 from typing import Any, cast
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import (
-    BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
-    SendResult,
-)
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 try:
     from . import ack_state
@@ -57,6 +52,26 @@ try:
     from . import transport
 except ImportError:
     import transport
+
+try:
+    from . import inbound
+except ImportError:
+    import inbound
+
+try:
+    from . import send_path
+except ImportError:
+    import send_path
+
+try:
+    from . import connection
+except ImportError:
+    import connection
+
+try:
+    from . import solicited
+except ImportError:
+    import solicited
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +117,14 @@ KEEPALIVE_FAIL_COUNT = 3
 # stayed up (a socket-level RST); anything longer means the node itself was
 # gone — a reboot, a WiFi drop, or a power cycle. Worth separating in the log:
 # the first is a transport hiccup, the second is the node's own health.
-SOCKET_RESET_MAX_OUTAGE_SECS = 6.0
+# Canonical value lives in connection.py (classify_link_drop); re-exported for
+# back-compat.
+SOCKET_RESET_MAX_OUTAGE_SECS = connection.SOCKET_RESET_MAX_OUTAGE_SECS
+
+# _standalone_send waits this long for the reconnect task to open an interface.
+# Real serial/TCP constructors block until node info arrives (seconds), and
+# connect() returns before the daemon transport worker finishes the open.
+_STANDALONE_OPEN_TIMEOUT_SECS = 15.0
 
 # ACK bookkeeping state machine lives in ack_state; AckStatus is re-exported
 # here so existing imports from adapter keep resolving.
@@ -128,6 +150,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
     # instead of truncating it at max_message_length.
     splits_long_messages = True
 
+    # LoRa has no edit primitive. Hermes uses this for streaming; tool-progress
+    # pairing with edit_message is documented on edit_message itself.
+    SUPPORTS_MESSAGE_EDITING = False
+
     # Upper bound on retained ACK/NACK bookkeeping records to avoid unbounded
     # memory growth on a long-running gateway. Oldest non-pending records evict
     # first. Aliases ack_state.ACK_RECORD_LIMIT (single source of truth); kept as
@@ -140,6 +166,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
     # truth); kept as a class attribute so tests/subclasses can override it
     # (the factory seam _create_node_freshness passes it through).
     OBSERVED_NODE_LIMIT = node_freshness.OBSERVED_NODE_LIMIT
+
+    # Bounded receive path: the inbound queue sheds its OLDEST entry when full.
+    INCOMING_QUEUE_MAXSIZE = 1000
+
+    # Bounded outbound path: the offline queue (drained on reconnect) evicts its
+    # OLDEST entry when full. Documented in README/CLAUDE.md as "bounded at 100".
+    OUTBOUND_QUEUE_MAXSIZE = 100
+
+    # Cap on queued+running SQLite writes; when full the newest observation is
+    # dropped (freshness already captured it in memory).
+    DB_WRITE_MAX_QUEUE = 128
+
+    # Cap on in-flight handle_message tasks (authorized-text flood defense).
+    MESSAGE_TASK_LIMIT = 256
+
+    # A transiently-failing queued message is retried this many times before it
+    # is dropped, so a stuck interface cannot block the rest of the queue.
+    DRAIN_MAX_ATTEMPTS = 3
+
+    # Re-warn for an unauthorized node at most once per window (log-volume bound).
+    UNAUTHORIZED_REWARN_SECS = 300.0
 
     @property
     def message_len_fn(self):
@@ -183,6 +230,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
     @property
     def _ack_lock(self) -> threading.Lock:
         return self._ack_tracker._ack_lock
+
+    @property
+    def _response_waiters(self) -> dict[tuple[str, str], list[ConcurrentFuture]]:
+        """Read-only bridge to the solicited tracker's registry (tests item-read it)."""
+        return self._solicited._response_waiters
+
+    @property
+    def _response_lock(self) -> threading.Lock:
+        """Read-only bridge to the solicited tracker's lock."""
+        return self._solicited._response_lock
 
     def _maybe_record_pubsub_ack(self, packet: dict) -> bool:
         return self._ack_tracker._maybe_record_pubsub_ack(packet)
@@ -294,15 +351,74 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def format_tool_event(
         self, event: Any, *, mode: str = "all", preview_max_len: int = 40
     ) -> str | None:
-        """Suppress tool-progress chrome over LoRa.
+        """Render a short emoji tool blurb for LoRa (not the full args dump).
 
-        The base default renders per-tool progress text (emoji + name + preview),
-        which would become its own LoRa chunk(s) — real airtime cost on a ~170-
-        byte/4-s-per-chunk channel. Return None so tool events are dropped before
-        they reach the mesh (the final answer still delivers in full).
+        Hermes gateway defaults emit long lines like
+        ``🔍 Searching the web for <long query>``. Over mesh we only want a
+        one-line blurb (emoji + verb); the final answer still delivers in full.
+        Returns None when the event is unusable so the dispatcher can drop it.
         """
-        del event, mode, preview_max_len
-        return None
+        del mode, preview_max_len
+        try:
+            from agent.display import get_tool_emoji, get_tool_verb
+        except ImportError:
+            get_tool_emoji = None  # type: ignore[assignment]
+            get_tool_verb = None  # type: ignore[assignment]
+
+        tool_name = getattr(event, "tool_name", None) or ""
+        if not tool_name:
+            return None
+        emoji = "⚙️"
+        if get_tool_emoji is not None:
+            try:
+                emoji = get_tool_emoji(tool_name, default="⚙️") or "⚙️"
+            except Exception as exc:
+                logger.debug("get_tool_emoji(%r) failed: %s", tool_name, exc)
+        verb = None
+        if get_tool_verb is not None:
+            try:
+                verb = get_tool_verb(tool_name)
+            except Exception as exc:
+                logger.debug("get_tool_verb(%r) failed: %s", tool_name, exc)
+                verb = None
+        if verb:
+            return f"{emoji} {verb}"
+        return f"{emoji} {tool_name}"
+
+    @staticmethod
+    def _compact_tool_progress_line(content: str) -> str:
+        """Shrink a gateway tool-progress line to a short LoRa blurb.
+
+        The classic progress_callback path does not call ``format_tool_event``;
+        it builds full verb+preview strings and ``send()``s them. Cap those to
+        emoji + verb (drop `` for <preview>`` / long args) so each tool is one
+        short mesh packet instead of a multi-chunk dump.
+        """
+        text = (content or "").strip()
+        if not text:
+            return content
+        # Progress is single-line chrome; multi-line dumps (approval walls,
+        # fenced terminal blocks) are not compacted here — they need other
+        # handling. Only rewrite short single-line progress.
+        if "\n" in text:
+            return content
+        # "🔍 Searching the web for long query…" → "🔍 Searching the web"
+        if " for " in text:
+            head, _, _rest = text.partition(" for ")
+            head = head.strip()
+            if head:
+                return head
+        # "⚙️ tool_name: \"preview…\"" → "⚙️ tool_name"
+        if ": " in text and len(text) > 48:
+            head, _, _rest = text.partition(": ")
+            head = head.strip()
+            if head:
+                return head
+        # No structured tool-progress separator matched. This could be a real
+        # emoji-leading reply (e.g. an emoji-heavy user-facing message), not
+        # gateway chrome — do not guess-and-truncate. Return the original so the
+        # normal chunking path applies instead of silently mangling real content.
+        return content
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("meshtastic")
@@ -374,6 +490,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # the chat id; fix the all-too-common missing-prefix misconfiguration.
         self._expand_home_channel_env_for_gateway()
 
+        # Nodes already warned about unauthorized access, mapped to the last
+        # warn time — a per-node re-warn window bounds the log volume.
+        self._unauthorized_warned: dict[str, float] = {}
+
         if not transport.HAS_MESHTASTIC:
             logger.error(
                 "meshtastic library is NOT installed in the gateway's Python "
@@ -389,6 +509,28 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # packet stream), keyed by node id. Fed in _on_receive for EVERY heard
         # node and layered over the library's node DB by the mesh_* tools.
         self._node_freshness = self._create_node_freshness()
+
+        # Receive-stage packet pipeline (normalization → freshness overlay →
+        # self-echo filter → observability routing → authz pre-check) lives in
+        # inbound.InboundProcessor. It runs synchronously on the platform loop;
+        # SQLite writes are delegated back through the _run_db_write writers so
+        # they stay off the loop. The processor never imports the adapter —
+        # everything it needs is injected here.
+        self._inbound = inbound.InboundProcessor(
+            normalize_id=self._normalize_node_id,
+            freshness=self._node_freshness,
+            allow_all=lambda: self.allow_all,
+            allowed_nodes=lambda: self.allowed_nodes,
+            write_signal=lambda nid, snr, rssi, hops: self._run_db_write(
+                lambda: telemetry_db.log_signal(nid, snr, rssi, hops)
+            ),
+            write_telemetry=lambda nid, decoded: self._run_db_write(
+                lambda: inbound.log_telemetry_packet(nid, decoded)
+            ),
+            write_position=lambda nid, decoded: self._run_db_write(
+                lambda: inbound.log_position_packet(nid, decoded)
+            ),
+        )
 
         # Active hardware connections mapping: devPath -> interface.
         # _iface_lock protects only short map/state operations; slow Meshtastic
@@ -416,6 +558,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Bounded at 100 messages, oldest-first eviction
         self._outbound_queue: list[dict[str, Any]] = []
         self._queue_lock = threading.Lock()
+        # Bound for _run_db_write's executor backlog (see DB_WRITE_MAX_QUEUE).
+        self._db_write_slots = threading.Semaphore(self.DB_WRITE_MAX_QUEUE)
         # ACK/NACK tracking state machine: owns the 7 ACK dicts + _ack_lock.
         # Exposed on the adapter via read-only property delegates below so
         # send() and tests can keep reading self._ack_lock / self._pending_acks.
@@ -429,17 +573,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._link_drop_counts: dict[str, int] = {"socket_reset": 0, "node_absent": 0}
 
         # Waiters for *solicited* replies (telemetry / position / traceroute
-        # requested with wantResponse). Keyed (kind, node_id) -> ConcurrentFuture
-        # list; _on_receive resolves them when the matching packet arrives. Same
-        # thread-safe storage/resolution model as _ack_futures.
-        self._response_waiters: dict[tuple[str, str], list[ConcurrentFuture]] = {}
-        self._response_lock = threading.Lock()
+        # requested with wantResponse) live in solicited.SolicitedRequestTracker;
+        # the registry and lock are exposed via read-only property delegates
+        # below so call sites and tests can keep reading self._response_waiters.
+        self._solicited = solicited.SolicitedRequestTracker(
+            normalize_node_id=self._normalize_node_id,
+            interfaces_provider=self.get_interfaces,
+            executor_provider=self._transport_executor_for_solicit,
+            link_lost_exc=MeshLinkLost,
+        )
 
         # Pause state: when set, the reconnect loop releases the node's socket
-        # and stops reconnecting so another client (phone / web UI) can take the
-        # node's limited TCP slot. _pause_until arms an auto-resume.
+        # and stops reconnecting so another client can take the node's limited
+        # TCP slot; _pause_until arms an auto-resume. Guarded by _pause_lock.
         self._paused = False
         self._pause_until: float | None = None
+        self._pause_lock = threading.Lock()
 
         # Platform loop: set in connect(). Owns _incoming_queue, reconnect /
         # drain tasks, and the pubsub→queue bridge. Send/ACK waiters may run on
@@ -488,150 +637,36 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._interfaces[target] = iface
         return True
 
-    def _pop_interface(self, target: str) -> Any | None:
-        """Remove and return one interface without performing blocking I/O."""
-        with self._iface_lock:
-            return self._interfaces.pop(target, None)
-
     def _pop_interface_for_lifecycle(
         self, target: str, lifecycle_id: int
     ) -> tuple[bool, Any | None]:
-        """Remove ``target`` only while ``lifecycle_id`` still owns adapter state."""
+        """Remove ``target`` only while ``lifecycle_id`` still owns adapter state.
+
+        Stays on the adapter: it is a two-lock (lifecycle -> iface) read-modify-
+        write over adapter state, so it cannot be extracted without either
+        leaking the lock-ordering invariant or parameterizing a whole lock pair.
+        """
         with self._lifecycle_lock:
             if lifecycle_id != self._lifecycle_id or not self._running:
                 return False, None
             with self._iface_lock:
                 return True, self._interfaces.pop(target, None)
 
-    def _close_interfaces_serialized(self, interfaces: list[Any]) -> None:
-        """Close interfaces on a worker thread, serialized with sendText."""
-        for iface in interfaces:
-            try:
-                iface.close()
-            except Exception as exc:
-                logger.error("Error closing Meshtastic interface: %s", exc)
-
     @staticmethod
-    async def _await_concurrent_future(
-        future: ConcurrentFuture, timeout: float | None = None
-    ) -> Any:
-        """Await without propagating asyncio cancellation into queued worker jobs.
-
-        Polling (rather than ``asyncio.shield(asyncio.wrap_future(...))``) keeps
-        the implementation trivial and guarantees a caller ``CancelledError``
-        cannot reach the daemon worker job. The 10ms cadence is a deliberate
-        tradeoff: awaits only cover slow, infrequent transport open/close/drain
-        calls, so the wakeup cost is negligible relative to the I/O latency.
-        """
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while not future.done():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError
-            await asyncio.sleep(0.01)
-        return future.result()
-
-    async def _close_interfaces_on_daemon_thread(
-        self, interfaces: list[Any], timeout: float
-    ) -> None:
-        """Close via a short-lived daemon thread — never on the event-loop thread."""
-        close_fut: ConcurrentFuture = ConcurrentFuture()
-
-        def _close() -> None:
-            try:
-                self._close_interfaces_serialized(interfaces)
-            except BaseException as exc:
-                try:
-                    close_fut.set_exception(exc)
-                except ConcurrentInvalidStateError:
-                    pass
-            else:
-                try:
-                    close_fut.set_result(None)
-                except ConcurrentInvalidStateError:
-                    pass
-
-        threading.Thread(target=_close, name="meshtastic-close", daemon=True).start()
-        await self._await_concurrent_future(close_fut, timeout)
-
-    async def _close_interfaces_after_executor(
-        self,
-        executor: _DaemonTransportExecutor,
-        interfaces: list[Any],
-        timeout: float,
-    ) -> None:
-        """Close only after a shutting-down worker drains accepted transport work."""
-        close_fut: ConcurrentFuture = ConcurrentFuture()
-
-        def _drain_then_close() -> None:
-            try:
-                # Unbounded join is deliberate: a bounded join could let close
-                # run concurrently with an in-flight sendText, violating the
-                # transport serialization this path exists to preserve. The
-                # caller's await is time-bounded and this thread is a daemon,
-                # so a stuck worker still cannot pin process exit.
-                executor.shutdown(wait=True)
-                self._close_interfaces_serialized(interfaces)
-            except BaseException as exc:
-                try:
-                    close_fut.set_exception(exc)
-                except ConcurrentInvalidStateError:
-                    pass
-            else:
-                try:
-                    close_fut.set_result(None)
-                except ConcurrentInvalidStateError:
-                    pass
-
-        threading.Thread(
-            target=_drain_then_close,
-            name="meshtastic-close-after-worker",
-            daemon=True,
-        ).start()
-        await self._await_concurrent_future(close_fut, timeout)
-
-    async def _close_interfaces_via_executor(
-        self,
-        executor: _DaemonTransportExecutor,
-        interfaces: list[Any],
-        timeout: float,
-    ) -> None:
-        """Close on the transport worker; drain-then-close if it is mid-shutdown."""
-        try:
-            close_fut = executor.submit(self._close_interfaces_serialized, interfaces)
-        except RuntimeError:
-            # Executor shut down between the read and submit. Wait for its
-            # accepted work to drain before closing, preserving the
-            # no-concurrent-sendText/close transport invariant.
-            await self._close_interfaces_after_executor(executor, interfaces, timeout)
-            return
-        await self._await_concurrent_future(close_fut, timeout)
+    def _close_interfaces_serialized(interfaces: list[Any]) -> None:
+        """Test-compat delegate — body moved to transport.close_interfaces_serialized."""
+        transport.close_interfaces_serialized(interfaces)
 
     async def _close_interfaces(self, interfaces: list[Any]) -> None:
-        """Close interfaces off the event-loop thread, time-bounded.
-
-        Dispatch (each path never runs close on the caller's loop):
-          1. ``_close_interfaces_via_executor`` — the lifecycle transport worker
-             (normal path, serialized against sendText).
-          2. ``_close_interfaces_on_daemon_thread`` — short-lived daemon thread
-             when no worker exists (never connected / already torn down).
-        A TimeoutError only abandons the *await*; the daemon close still runs.
-        """
-        if not interfaces:
-            return
-        timeout = self._executor_shutdown_timeout()
+        """Delegate — body moved to transport.close_interfaces (test-compat)."""
         with self._lifecycle_lock:
             executor = self._transport_executor
-        try:
-            if executor is not None:
-                await self._close_interfaces_via_executor(executor, interfaces, timeout)
-            else:
-                await self._close_interfaces_on_daemon_thread(interfaces, timeout)
-        except TimeoutError:
-            logger.warning(
-                "Meshtastic interface close still running after %.1fs; disconnect continues "
-                "(daemon transport worker will finish in the background)",
-                timeout,
-            )
+        # cast(Any): the dual-import binds ``transport`` to a union of two
+        # module objects, so the nominal _DaemonTransportExecutor type cannot
+        # cross this boundary; the value itself is unchanged.
+        await transport.close_interfaces(
+            interfaces, cast(Any, executor), self._executor_shutdown_timeout()
+        )
 
     @staticmethod
     def _open_cancel_timeout() -> float:
@@ -641,11 +676,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         runs on the daemon transport worker and closes a stale result via
         lifecycle_id. Override with MESHTASTIC_OPEN_CANCEL_TIMEOUT.
         """
-        raw = os.getenv("MESHTASTIC_OPEN_CANCEL_TIMEOUT") or "5"
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return 5.0
+        return connection.open_cancel_timeout()
 
     @staticmethod
     def _executor_shutdown_timeout() -> float:
@@ -653,58 +684,50 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         ``0`` means do not wait. Override with MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT.
         """
-        raw = os.getenv("MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT") or "5"
-        try:
-            return max(0.0, float(raw))
-        except (TypeError, ValueError):
-            return 5.0
+        return connection.executor_shutdown_timeout()
+
+    @staticmethod
+    def _open_timeout() -> float:
+        """Seconds to bound the success-path open (``0`` disables the bound)."""
+        return connection.open_timeout()
 
     async def _shutdown_transport_executor(self, executor: _DaemonTransportExecutor) -> None:
-        """Shut down the daemon transport worker without hanging forever."""
-        timeout = self._executor_shutdown_timeout()
-        executor.shutdown(wait=False)
-        deadline = time.monotonic() + timeout
-        # Poll without blocking the platform loop. Daemon worker means a stuck
-        # operation cannot pin process exit after this bounded wait expires.
-        while executor.is_alive() and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        if executor.is_alive():
-            logger.warning(
-                "Meshtastic transport executor still busy after %.1fs during disconnect; "
-                "continuing (daemon worker will finish in the background)",
-                timeout,
-            )
+        """Delegate — body moved to transport.shutdown_transport_executor (test-compat)."""
+        # cast(Any): same dual-import union boundary as _close_interfaces.
+        await transport.shutdown_transport_executor(
+            cast(Any, executor), self._executor_shutdown_timeout()
+        )
 
     def _drop_interface_if_dead_serialized(self, target: str, iface: Any) -> bool | None:
-        """Atomically probe and close a dead interface.
-
-        Returns None if the target changed, True if alive, and False after a
-        dead interface was removed and closed. This runs on the single daemon
-        transport worker, so probe-through-removal is serialized against
-        sendText: a send cannot slip between them.
-        """
-        with self._iface_lock:
-            if self._interfaces.get(target) is not iface:
-                return None
-        if self._interface_is_alive(iface):
-            return True
-        with self._iface_lock:
-            if self._interfaces.get(target) is not iface:
-                return None
-            self._interfaces.pop(target, None)
-        try:
-            iface.close()
-        except Exception as exc:
-            logger.error("Error closing dropped Meshtastic interface: %s", exc)
-        return False
+        """Delegate — body moved to transport.drop_interface_if_dead_serialized."""
+        return transport.drop_interface_if_dead_serialized(
+            target,
+            iface,
+            interfaces=self._interfaces,
+            iface_lock=self._iface_lock,
+            is_alive=self._interface_is_alive,
+        )
 
     def _open_and_register_interface(self, target: str, lifecycle_id: int) -> Any | None:
-        """Open on a worker, then atomically adopt or close a stale result."""
+        """Open on a worker, then atomically adopt or close a stale result.
+
+        A timed-out open can still finish on the daemon worker and register the
+        target while a retry is already in flight. The retry's open then fails
+        ``_register_interface`` because the key is taken — without recovering
+        the live iface, ``_reconnect_loop`` would treat ``None`` as terminal
+        and exit while the interface stays registered with no liveness poll.
+        """
         iface = self._open_interface(target)
         if self._register_interface(target, iface, lifecycle_id=lifecycle_id):
             return iface
-        self._close_interfaces_serialized([iface])
-        return None
+        # Registration lost the race. Prefer the already-registered iface for
+        # this lifecycle; otherwise close our orphan and report failure.
+        with self._lifecycle_lock:
+            active = self._running and lifecycle_id == self._lifecycle_id
+            with self._iface_lock:
+                existing = self._interfaces.get(target) if active else None
+        transport.close_interfaces_serialized([iface])
+        return existing
 
     def _subscribe_pubsub(self) -> None:
         """Subscribe once per adapter lifecycle, independent of interface count.
@@ -748,11 +771,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return False
         try:
             if not loop.is_running():
-                logger.debug(
-                    "Skipping %s: target loop not running (loop=%r)",
-                    what,
-                    loop,
-                )
+                logger.debug("Skipping %s: target loop not running (loop=%r)", what, loop)
                 return False
             loop.call_soon_threadsafe(callback, *args)
             return True
@@ -798,20 +817,47 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         Inbound processing runs on the platform loop. The target callables
         swallow their own exceptions, so the executor future is intentionally
-        fire-and-forget.
+        fire-and-forget. The semaphore bounds queued+running writes so a packet
+        flood cannot grow the default executor's backlog without limit; a write
+        dropped while the budget is full is acceptable — the packet's freshness
+        was already captured in memory and only the newest observation is lost.
         """
         loop = self.loop
-        if loop is not None:
-            loop.run_in_executor(None, fn)
-        else:
+        if loop is None:
             fn()
+            return
+        if not self._db_write_slots.acquire(blocking=False):
+            logger.debug("Dropping Meshtastic DB write: executor backlog full")
+            return
+        try:
+            future = loop.run_in_executor(None, fn)
+        except Exception:
+            self._db_write_slots.release()
+            raise
+        future.add_done_callback(lambda _fut: self._db_write_slots.release())
 
     def _is_authorized_node(self, node_id: str) -> bool:
+        # Test-compat delegate — receive logic lives in inbound.py
+        # (InboundProcessor); keep until moved tests drop the dependency.
         """Check if a node ID is permitted to speak with the bot."""
-        if self.allow_all:
-            return True
-        nid = node_id.strip().lower()
-        return nid in self.allowed_nodes or nid.lstrip("!") in self.allowed_nodes
+        return inbound.is_authorized_node(
+            node_id, allow_all=self.allow_all, allowed_nodes=self.allowed_nodes
+        )
+
+    def _warn_unauthorized_node(self, sender: str) -> None:
+        """Log an unauthorized sender at most once per re-warn window.
+
+        Every unauthorized TEXT packet used to log a warning — a flood from one
+        node on a shared channel would write a disk line per packet. Warn on the
+        first sighting, then debug until ``UNAUTHORIZED_REWARN_SECS`` elapses.
+        """
+        now = time.time()
+        last = self._unauthorized_warned.get(sender)
+        if last is None or now - last >= self.UNAUTHORIZED_REWARN_SECS:
+            self._unauthorized_warned[sender] = now
+            logger.warning("Unauthorized node ID %s skipped.", sender)
+        else:
+            logger.debug("Unauthorized node ID %s skipped (repeated).", sender)
 
     @staticmethod
     def _normalize_node_id(node_id: Any) -> str | None:
@@ -829,7 +875,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if isinstance(node_id, bool):
             return str(node_id).lower()
         if isinstance(node_id, int):
-            return f"!{node_id:08x}"
+            # Node numbers are unsigned 32-bit. Reject out-of-range values so a
+            # hostile envelope cannot mint a bogus id (e.g. `!-0000001` from a
+            # negative, or a value colliding with an allowed node) — such a
+            # sender is dropped instead.
+            if 0 <= node_id < 2**32:
+                return f"!{node_id:08x}"
+            return None
         text = str(node_id).strip()
         if not text:
             return None
@@ -915,54 +967,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
         rssi: Any,
         hop_count: int | None,
     ) -> None:
+        # Test-compat delegate — receive logic lives in inbound.py
+        # (InboundProcessor); keep until moved tests drop the dependency.
         self._node_freshness.update(node_id, rx_time, snr, rssi, hop_count)
 
     def get_observed_node(self, node_id: str) -> dict[str, Any]:
         return self._node_freshness.get(node_id)
 
     def _get_interface_node_id(self, interface: Any) -> str | None:
-        """Return the local Meshtastic node ID for an interface, if known.
-
-        Prefers the library's ``getMyNodeInfo()`` (real MeshInterface) which
-        returns the node-DB entry including ``user.id``. Falls back to
-        ``myInfo.my_node_num`` (protobuf) and the mock's ``getMyNodeId()``.
-        """
-        if hasattr(interface, "getMyNodeInfo") and callable(interface.getMyNodeInfo):
-            try:
-                info = interface.getMyNodeInfo()
-            except Exception:
-                info = None
-            if isinstance(info, dict):
-                user = info.get("user") or {}
-                user_id = user.get("id") if isinstance(user, dict) else None
-                if isinstance(user_id, str) and user_id:
-                    return self._normalize_node_id(user_id) or user_id
-                num = info.get("num")
-                if isinstance(num, int):
-                    return f"!{num:08x}"
-
-        my_info = getattr(interface, "myInfo", None)
-        my_node_num = None
-        if isinstance(my_info, dict):
-            my_node_num = my_info.get("my_node_num")
-        elif my_info is not None:
-            my_node_num = getattr(my_info, "my_node_num", None)
-
-        if isinstance(my_node_num, int):
-            return f"!{my_node_num:08x}"
-        if my_node_num is not None:
-            try:
-                return f"!{int(my_node_num):08x}"
-            except (TypeError, ValueError):
-                pass
-
-        get_my = getattr(interface, "getMyNodeId", None)
-        if callable(get_my):
-            try:
-                return self._normalize_node_id(get_my())
-            except Exception:
-                return None
-        return None
+        """Test-compat delegate — body moved to inbound.interface_node_id."""
+        return inbound.interface_node_id(interface, normalize_id=self._normalize_node_id)
 
     def _load_tools_module(self) -> ModuleType:
         """Load the companion tools module without colliding with Hermes' tools package."""
@@ -999,6 +1013,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._running = True
             self._lifecycle_id += 1
             lifecycle_id = self._lifecycle_id
+            self._link_down_since.clear()  # drop timestamps belong to the old lifecycle
             if self._transport_executor is None:
                 self._transport_executor = _DaemonTransportExecutor(name="meshtastic-transport")
         self.loop = asyncio.get_running_loop()
@@ -1009,15 +1024,17 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         # Pass the generation and queue explicitly so a task stranded on an old
         # loop cannot consume a replacement lifecycle's queue after restart.
-        incoming_queue = asyncio.Queue()
+        # Bounded so a packet flood cannot grow the receive path without limit.
+        incoming_queue = asyncio.Queue(maxsize=self.INCOMING_QUEUE_MAXSIZE)
         self._incoming_queue = incoming_queue
         self._incoming_consumer_task = asyncio.create_task(
             self._consume_incoming_queue(lifecycle_id, incoming_queue)
         )
 
-        # Determine connection targets to open
-        targets = self._connection_targets()
-        logger.info(f"Connecting to Meshtastic targets: {targets}")
+        # Determine targets off-loop: "auto" serial discovery blocks on USB
+        # enumeration, which must not stall the platform loop.
+        targets = await asyncio.to_thread(self._connection_targets)
+        logger.info("Connecting to Meshtastic targets: %s", targets)
 
         # Start connection routine for each target
         self._reconnect_tasks.clear()
@@ -1033,50 +1050,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return True
 
     def _connection_targets(self) -> list[str]:
-        """Resolve the connection target keys to open.
-
-        A configured TCP host takes precedence over serial: the two transports
-        are mutually exclusive. Targets are opaque keys understood by
-        ``_reconnect_loop`` and ``_open_interface`` — a ``tcp://host:port`` URL
-        for TCP, otherwise a serial device path (or ``mock_port`` fallback).
-        """
+        """Resolve the connection target keys to open (TCP host wins over serial;
+        ``auto`` serial discovers ports or falls back to ``mock_port``)."""
         return transport.connection_targets(self.tcp_host, self.tcp_port, self.serial_port)
 
     def _open_interface(self, target: str) -> Any:
-        """Open the serial/TCP interface for a connection target.
-
-        Runs the blocking Meshtastic constructors; callers offload this to an
-        executor. Falls back to the mock interface when the Meshtastic libraries
-        are unavailable so the plugin still loads.
-        """
+        """Open the serial/TCP interface for a target (delegates to transport)."""
         return transport.open_interface(target)
 
     def _discover_serial_ports(self) -> list[str]:
-        """Discover likely Meshtastic serial devices cross-platform.
-
-        Prefer ``meshtastic.util.findPorts`` (VID whitelist for known radios,
-        then non-blacklisted ports) so ``auto`` does not open every USB-serial
-        gadget on the host. Fall back to pyserial / glob when the library is
-        unavailable.
-        """
+        """Discover likely Meshtastic serial devices (delegates to transport)."""
         return transport.discover_serial_ports()
 
     def _apply_tcp_keepalive(self, iface: Any) -> None:
         """Arm OS-level TCP keepalive on a node socket, re-arming after self-heal.
 
-        ``TCPInterface._reconnect()`` silently swaps in a brand-new socket when a
-        read or write fails, and socket options do not survive that — so this is
-        called from the liveness poll too, and tracks which socket object it has
-        already configured (by identity) to stay a no-op the rest of the time.
-
-        Best-effort by design: an unsupported platform or a socket closing under
-        us must not take the link down, so failures are logged at debug and the
-        library's 300s heartbeat remains the backstop.
-
-        Note: ``_keepalive_socket_id`` tracks ONE socket (a single TCP transport
-        is enforced — serial interfaces have no socket and the mock neither), so
-        two live TCP interfaces would ping-pong re-arming. Fine today; rework
-        into a per-interface map if multi-TCP ever lands.
+        ``TCPInterface._reconnect()`` swaps in a brand-new socket on a failed
+        read/write and socket options do not survive that, so this runs from the
+        liveness poll too, tracking the socket it configured (by identity) to
+        stay a no-op otherwise. Best-effort: failures log at debug and the
+        library's 300s heartbeat remains the backstop. ``_keepalive_socket_id``
+        tracks ONE socket (single-TCP is enforced), fine today.
         """
         sock = getattr(iface, "socket", None)
         if sock is None or not hasattr(sock, "setsockopt"):
@@ -1112,29 +1106,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._link_down_since[target] = time.time()
 
     def _report_link_recovery(self, target: str) -> None:
-        """Log how long *target* was gone, and what that says about the node.
+        """Log how long *target* was gone and what that says about the node.
 
         A short outage means the node stayed up and only the socket died; a long
-        one means the node itself was away. Reported together with running
-        counts, because the ratio is the diagnosis: a handful of resets is
-        normal for an ESP32 over WiFi, while repeated long absences point at the
-        node's power, WiFi signal, or reboots.
-
-        The ``SOCKET_RESET_MAX_OUTAGE_SECS`` split is reconnect-latency
-        dependent: a genuine reset that takes longer than the threshold to
-        re-establish (backoff, DHCP) is logged as an absence. Heuristic by
-        design — the counts are approximate, not a contract.
+        one means the node itself was away. The ``SOCKET_RESET_MAX_OUTAGE_SECS``
+        split is reconnect-latency dependent — heuristic by design.
         """
         dropped_at = self._link_down_since.pop(target, None)
         if dropped_at is None:
             return
         outage = time.time() - dropped_at
-        if outage <= SOCKET_RESET_MAX_OUTAGE_SECS:
-            self._link_drop_counts["socket_reset"] += 1
-            verdict = "socket reset, node stayed up"
-        else:
-            self._link_drop_counts["node_absent"] += 1
-            verdict = "node was unreachable (reboot, WiFi drop, or power loss)"
+        kind = connection.classify_link_drop(outage)
+        self._link_drop_counts[kind] += 1
+        verdict = (
+            "socket reset, node stayed up"
+            if kind == connection.SOCKET_RESET
+            else "node was unreachable (reboot, WiFi drop, or power loss)"
+        )
         logger.info(
             "Meshtastic link to %s restored after %.1fs — %s "
             "(session totals: %d socket resets, %d node absences)",
@@ -1149,15 +1137,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Release the radio while leaving the rest of the gateway running.
 
         The node accepts a limited number of TCP clients, so working with it
-        from a phone or the web UI means the gateway has to let go first.
-        Stopping the whole gateway for that is a blunt instrument — it drops
-        every platform and every in-flight conversation — and an agent cannot do
-        it at all without killing the process it is running in. Pausing keeps the
-        process, the queues and the other platforms up; only the interface is
-        closed and the reconnect loop parked.
+        from a phone or the web UI means the gateway has to let go first —
+        without dropping every platform and in-flight conversation. Pausing
+        keeps the process, the queues and the other platforms up; only the
+        interface is closed and the reconnect loop parked.
         """
-        self._paused = True
-        self._pause_until = time.time() + minutes * 60 if minutes else None
+        if minutes is not None and not math.isfinite(minutes):
+            # NaN/Inf deadline never expires and crashes pause_state — reject it.
+            raise ValueError("pause_link minutes must be a finite number")
+        if minutes == 0:
+            # A zero-minute pause is a no-op, not an indefinite one: 0 is falsy,
+            # so the deadline branch below would otherwise set _pause_until=None
+            # (an untimed pause that only an explicit resume_link() clears).
+            return self.pause_state()
+        with self._pause_lock:
+            # Deadline first: the loop must never see paused=True with a stale one.
+            self._pause_until = time.time() + minutes * 60 if minutes is not None else None
+            self._paused = True
         logger.info(
             "Meshtastic link paused%s",
             f" for {minutes:g} minute(s)" if minutes else " until resumed",
@@ -1166,140 +1162,87 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
     def resume_link(self) -> dict[str, Any]:
         """Re-arm the reconnect loop; it reconnects on its own within ~1s."""
-        was_paused = self._paused
-        self._paused = False
-        self._pause_until = None
+        with self._pause_lock:
+            was_paused = self._paused
+            self._paused, self._pause_until = False, None
         if was_paused:
             logger.info("Meshtastic link resumed")
         return self.pause_state()
 
     def pause_state(self) -> dict[str, Any]:
         """Current pause status, for tools to report instead of guessing."""
+        with self._pause_lock:
+            paused, pause_until = self._paused, self._pause_until
         return {
-            "paused": self._paused,
-            "resumes_at": (
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._pause_until))
-                if self._pause_until
-                else None
-            ),
-            "resumes_in_minutes": (
-                round((self._pause_until - time.time()) / 60, 1) if self._pause_until else None
-            ),
+            "paused": paused,
+            "resumes_at": connection.resumes_at_str(pause_until),
+            "resumes_in_minutes": connection.resumes_in_minutes(pause_until, time.time()),
         }
 
     def _pause_expired(self) -> bool:
         """Auto-resume once a timed pause runs out.
 
-        Polled from the reconnect loop rather than armed as a timer: the loop
-        already ticks, and a timed pause exists so that "switch it off for a bit"
-        cannot silently become "the mesh was down all night".
+        Polled from the reconnect loop rather than armed as a timer, so a timed
+        pause cannot silently become "the mesh was down all night".
         """
-        if self._paused and self._pause_until and time.time() >= self._pause_until:
+        with self._pause_lock:
+            paused, until = self._paused, self._pause_until
+        if connection.pause_classify(paused, until, time.time()) == connection.PAUSE_EXPIRED:
             logger.info("Meshtastic pause expired — resuming link")
+            # resume_link re-acquires _pause_lock, so release it before the call.
             self.resume_link()
             return True
         return False
 
     async def _reconnect_loop(self, target: str, lifecycle_id: int):
         """Exponential backoff reconnect loop for one connection target."""
-        backoff = 1.0
+        backoff = connection.INITIAL_BACKOFF
         while self._lifecycle_is_active(lifecycle_id):
             try:
-                # Paused: release the node's socket (via the serialized close)
-                # and don't reconnect, so another client can take its TCP slot.
+                # A timed pause that ran out auto-resumes here; the step
+                # decision below then takes the normal connect/poll branch.
                 self._pause_expired()
-                if self._paused:
-                    active, dropped = self._pop_interface_for_lifecycle(target, lifecycle_id)
-                    if not active:
-                        break
-                    if dropped is not None:
-                        logger.info("Releasing Meshtastic interface %s while paused", target)
-                        await self._close_interfaces([dropped])
-                    await asyncio.sleep(1.0)
-                    continue
+                with self._pause_lock:
+                    paused = self._paused
                 with self._iface_lock:
-                    needs_connect = target not in self._interfaces
-                if needs_connect:
-                    logger.info(f"Attempting to connect to Meshtastic target: {target}...")
-                    # Constructors can block. The worker adopts the result only
-                    # if this lifecycle still wants it; canceled/stale opens are
-                    # closed before the worker returns.
-                    with self._lifecycle_lock:
-                        executor = self._transport_executor
-                    if executor is None:
+                    has_iface = target in self._interfaces
+                step = connection.reconnect_step(paused, has_iface)
+                if step == connection.RELEASE:
+                    # Paused: release the node's socket (via the serialized
+                    # close) so another client can take its TCP slot.
+                    if not await self._release_interface_if_paused(target, lifecycle_id):
                         break
-                    try:
-                        open_cf = executor.submit(
-                            lambda t=target, lid=lifecycle_id: self._open_and_register_interface(
-                                t, lid
-                            )
-                        )
-                    except RuntimeError as exc:
-                        # Executor shutdown mid-teardown — not a connection
-                        # failure, so no backoff/retry: just exit the loop.
-                        if "cannot schedule new futures after shutdown" in str(exc).lower():
-                            break
-                        raise
-                    try:
-                        iface = await self._await_concurrent_future(open_cf)
-                    except asyncio.CancelledError:
-                        # Constructor work cannot be canceled once running.
-                        # Wait briefly for stale-lifecycle cleanup; if the open
-                        # is hung (or timeout is 0), abandon the await so
-                        # disconnect can finish. Daemon worker still closes a
-                        # late result via lifecycle_id.
-                        timeout = self._open_cancel_timeout()
-                        if timeout > 0:
-                            try:
-                                await self._await_concurrent_future(open_cf, timeout)
-                            except TimeoutError:
-                                logger.warning(
-                                    "Meshtastic open for %s still running after %.1fs cancel "
-                                    "wait; disconnect continues (stale result will be closed)",
-                                    target,
-                                    timeout,
-                                )
-                            except Exception:
-                                # The constructor failed after we were cancelled.
-                                # Preserve the CancelledError — that is the
-                                # meaningful outcome for the caller; the worker
-                                # already logged the open failure.
-                                logger.debug(
-                                    "Cancelled Meshtastic open for %s also raised",
-                                    target,
-                                    exc_info=True,
-                                )
-                        else:
-                            logger.warning(
-                                "Meshtastic open for %s abandoned immediately on cancel "
-                                "(MESHTASTIC_OPEN_CANCEL_TIMEOUT=0); stale result will be closed",
-                                target,
-                            )
-                        raise
+                    await asyncio.sleep(connection.PAUSE_POLL_SECS)
+                elif step == connection.WAIT:
+                    # Paused without an interface: stay parked, don't reconnect.
+                    await asyncio.sleep(connection.PAUSE_POLL_SECS)
+                elif step == connection.CONNECT:
+                    logger.info("Attempting to connect to Meshtastic target: %s...", target)
+                    iface = await self._open_interface_for_lifecycle(target, lifecycle_id)
                     if iface is None:
-                        break
-                    backoff = 1.0  # Reset backoff on success
-                    logger.info(f"Successfully connected to Meshtastic on {target}")
+                        # Open returned None (executor gone, stale lifecycle, or
+                        # a pure failure). A concurrent timed-out open may still
+                        # have registered the target — adopt it and poll rather
+                        # than exiting permanently with a live, unmonitored iface.
+                        with self._iface_lock:
+                            iface = self._interfaces.get(target)
+                        if iface is None:
+                            break
+                    backoff = connection.reset_backoff()  # Reset backoff on success
+                    logger.info("Successfully connected to Meshtastic on %s", target)
                     self._apply_tcp_keepalive(iface)
                     self._report_link_recovery(target)
-
-                    # Security warnings for local node
-                    my_node = getattr(iface, "localNode", None)
-                    if my_node:
-                        # Try to read info dictionary
-                        nodes = getattr(iface, "nodes", {}) or {}
-                        my_id = self._get_interface_node_id(iface) or ""
-
-                        my_info = nodes.get(my_id, {})
-                        if not my_info.get("user", {}).get("publicKey"):
-                            logger.warning(
-                                f"!!! WARNING: Local node {my_id} has no initialized public/private key. "
-                                "DMs WILL FAIL. Please pair/connect the node to the official Meshtastic mobile app "
-                                "at least once to complete encryption setup."
-                            )
-
+                    self._warn_missing_node_key(iface)
+                else:
+                    # Connected: poll until the link drops, then reconnect.
+                    if await self._poll_interface_until_drop(target, lifecycle_id):
+                        continue
+            except transport.TransportBusyError:
+                logger.warning("Meshtastic transport worker busy for %s; retrying", target)
+                await asyncio.sleep(backoff)
+                backoff = connection.next_backoff(backoff)
             except Exception as e:
-                logger.error(f"Failed to connect to Meshtastic on {target}: {e}")
+                logger.error("Failed to connect to Meshtastic on %s: %s", target, e)
                 active_lifecycle, dropped = self._pop_interface_for_lifecycle(target, lifecycle_id)
                 if not active_lifecycle:
                     break
@@ -1308,72 +1251,170 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
                 # Sleep with exponential backoff
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
-                continue
+                backoff = connection.next_backoff(backoff)
 
-            # If successfully connected, poll until the connection drops
-            while self._lifecycle_is_active(lifecycle_id):
-                with self._iface_lock:
-                    if target not in self._interfaces:
-                        break
-                    iface = self._interfaces[target]
-                with self._lifecycle_lock:
-                    executor = self._transport_executor
-                if executor is None:
-                    break
-                alive = await asyncio.wrap_future(
-                    executor.submit(self._drop_interface_if_dead_serialized, target, iface)
+    async def _release_interface_if_paused(self, target: str, lifecycle_id: int) -> bool:
+        """Drop ``target``'s interface while paused.
+
+        Returns False when the lifecycle ended and the loop should exit;
+        True otherwise (the caller sleeps one pause tick and re-checks).
+        """
+        active, dropped = self._pop_interface_for_lifecycle(target, lifecycle_id)
+        if not active:
+            return False
+        if dropped is not None:
+            logger.info("Releasing Meshtastic interface %s while paused", target)
+            await self._close_interfaces([dropped])
+        return True
+
+    async def _open_interface_for_lifecycle(self, target: str, lifecycle_id: int) -> Any | None:
+        """Submit one interface open to the transport worker and await it.
+
+        Returns the live interface, or ``None`` when the executor is gone or a
+        stale open was closed (lifecycle ended while the constructor ran) — in
+        both cases the loop exits rather than backing off. Constructors can
+        block, so the worker adopts the result only if this lifecycle still
+        wants it; canceled/stale opens are closed before the worker returns.
+        """
+        with self._lifecycle_lock:
+            executor = self._transport_executor
+        if executor is None:
+            return None
+        try:
+            open_cf = executor.submit(
+                lambda t=target, lid=lifecycle_id: self._open_and_register_interface(t, lid)
+            )
+        except RuntimeError as exc:
+            # Executor shutdown mid-teardown — not a connection failure, so no
+            # backoff/retry: just exit the loop.
+            if send_path.is_executor_shutdown_error(exc):
+                return None
+            raise
+        open_timeout = self._open_timeout()
+        try:
+            # Bound the success-path open so a wedged constructor cannot pin
+            # this await (and the reconnect loop) forever — expiry is a connect
+            # failure that the loop backs off from.
+            return await transport.await_concurrent_future(open_cf, open_timeout or None)
+        except TimeoutError:
+            logger.warning(
+                "Meshtastic open for %s did not finish within %.1fs; backing off "
+                "(constructor still runs on the daemon worker)",
+                target,
+                open_timeout,
+            )
+            raise
+        except asyncio.CancelledError:
+            # Constructor work cannot be canceled once running. Wait briefly
+            # for stale-lifecycle cleanup; if the open is hung (or timeout is
+            # 0), abandon the await so disconnect can finish. Daemon worker
+            # still closes a late result via lifecycle_id.
+            timeout = self._open_cancel_timeout()
+            if timeout > 0:
+                try:
+                    await transport.await_concurrent_future(open_cf, timeout)
+                except TimeoutError:
+                    logger.warning(
+                        "Meshtastic open for %s still running after %.1fs cancel "
+                        "wait; disconnect continues (stale result will be closed)",
+                        target,
+                        timeout,
+                    )
+                except Exception:
+                    # The constructor failed after we were cancelled. Preserve
+                    # the CancelledError — that is the meaningful outcome for
+                    # the caller; the worker already logged the open failure.
+                    logger.debug(
+                        "Cancelled Meshtastic open for %s also raised",
+                        target,
+                        exc_info=True,
+                    )
+            else:
+                logger.warning(
+                    "Meshtastic open for %s abandoned immediately on cancel "
+                    "(MESHTASTIC_OPEN_CANCEL_TIMEOUT=0); stale result will be closed",
+                    target,
                 )
-                if alive is None:
-                    break
-                if not alive:
-                    logger.warning(f"Meshtastic target {target} dropped connection!")
-                    # Timestamp the drop; #14's outer loop owns the serialized
-                    # close (interfaces must not be closed on the loop thread).
-                    self._note_link_drop(target)
-                    break
+            raise
 
-                # The library swaps the socket out from under us when it
-                # self-heals a failed read/write, so re-arm on the new one.
-                self._apply_tcp_keepalive(iface)
-                await asyncio.sleep(2.0)
+    def _warn_missing_node_key(self, iface: Any) -> None:
+        """Log a security warning when the local node has no initialized key."""
+        my_node = getattr(iface, "localNode", None)
+        if my_node:
+            # Try to read info dictionary
+            nodes = getattr(iface, "nodes", {}) or {}
+            my_id = self._get_interface_node_id(iface) or ""
+            my_info = nodes.get(my_id, {})
+            if not my_info.get("user", {}).get("publicKey"):
+                logger.warning(
+                    "!!! WARNING: Local node %s has no initialized public/private key. "
+                    "DMs WILL FAIL. Please pair/connect the node to the official "
+                    "Meshtastic mobile app at least once to complete encryption setup.",
+                    my_id,
+                )
+
+    async def _poll_interface_until_drop(self, target: str, lifecycle_id: int) -> bool:
+        """Poll a connected interface's liveness until it drops.
+
+        Returns True when the link dropped (the outer loop reconnects with
+        backoff); False when the poller should exit (lifecycle ended, executor
+        gone, or the interface was replaced under us). A drop is timestamped
+        here; the outer loop owns the serialized close (interfaces must not be
+        closed on the loop thread).
+        """
+        while self._lifecycle_is_active(lifecycle_id):
+            with self._iface_lock:
+                if target not in self._interfaces:
+                    return False
+                iface = self._interfaces[target]
+            with self._lifecycle_lock:
+                executor = self._transport_executor
+            if executor is None:
+                return False
+            # cast(Any): the dual-import binds ``transport`` to a union of two
+            # module objects, so the nominal _DaemonTransportExecutor type
+            # cannot cross this boundary; the value itself is unchanged.
+            try:
+                alive = await asyncio.wrap_future(
+                    transport.submit_liveness_probe(
+                        cast(Any, executor),
+                        target,
+                        iface,
+                        interfaces=self._interfaces,
+                        iface_lock=self._iface_lock,
+                    )
+                )
+            except Exception as exc:
+                # Executor shut down between grab and probe submit (concurrent
+                # disconnect): exit the poller silently — not a "Failed to
+                # connect" ERROR with re-run close logic.
+                if send_path.is_executor_shutdown_error(exc):
+                    return False
+                raise
+            outcome = connection.poll_outcome(alive)
+            if outcome == connection.EXIT:
+                return False
+            if outcome == connection.DROP:
+                logger.warning("Meshtastic target %s dropped connection!", target)
+                self._note_link_drop(target)
+                # The liveness probe confirmed the drop (the same poll that owns
+                # interface teardown). A solicited reply can only return over the
+                # connection the request went out on, so fail the waiters now
+                # instead of sitting out the full timeout — but only here, never
+                # on the library's transient connection.lost event, which a
+                # self-healing TCP link outlives.
+                self._abandon_response_waiters("connection lost")
+                return True
+
+            # The library swaps the socket out from under us when it
+            # self-heals a failed read/write, so re-arm on the new one.
+            self._apply_tcp_keepalive(iface)
+            await asyncio.sleep(connection.LIVENESS_POLL_SECS)
+        return False
 
     def _interface_is_alive(self, iface: Any) -> bool:
-        """Best-effort liveness probe for a connected interface.
-
-        Probe transport-specific handles first. meshtastic's
-        ``MeshInterface.isConnected`` is a ``threading.Event`` *attribute* (not a
-        method) present on every real interface, so it must be checked LAST and
-        via ``is_set()``: checking it first would shadow the TCP/serial branches,
-        and calling it raises (an Event is not callable) — masking real drops on
-        both transports.
-        """
-        # TCP: TCPInterface exposes the live socket, but its _readBytes self-heals
-        # dead sockets (close -> sleep 1 -> reconnect), creating a brief
-        # socket=None window. Probing the raw socket in that window would falsely
-        # report a drop and tear the interface down mid-self-heal. Trust the
-        # library's authoritative isConnected Event instead — it is cleared only
-        # in _disconnected() (a real drop), not during the self-heal window.
-        is_connected = getattr(iface, "isConnected", None)
-        if hasattr(iface, "socket"):
-            if is_connected is not None and hasattr(is_connected, "is_set"):
-                return bool(is_connected.is_set())
-            return iface.socket is not None
-        # Serial: pyserial stream exposes is_open / isOpen().
-        stream = getattr(iface, "stream", None)
-        if stream is not None:
-            if hasattr(stream, "isOpen"):
-                return bool(stream.isOpen())
-            if hasattr(stream, "is_open"):
-                return bool(stream.is_open)
-            return True
-        # Fallback: meshtastic's threading.Event liveness flag. Reuses the
-        # is_connected binding from the top of this function (the attribute
-        # hasn't changed); no need to re-read it.
-        if hasattr(is_connected, "is_set"):
-            return bool(is_connected.is_set())
-        # No known liveness handle (e.g. the mock interface) — assume alive.
-        return True
+        """Test-compat delegate — body moved to transport.interface_is_alive."""
+        return transport.interface_is_alive(iface)
 
     async def _drain_queue_loop(self, lifecycle_id: int):
         """Monitor and drain the outbound messages queue when connections are active."""
@@ -1383,7 +1424,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     item = self._outbound_queue.pop(0)
 
                 try:
-                    logger.info(f"Draining queued message to {item['chat_id']}")
+                    logger.info("Draining queued message to %s", item["chat_id"])
                     # Shield the executor-backed transport call so disconnect
                     # can await its real result: requeue only when it definitely
                     # did not send, avoiding loss or a duplicate after teardown.
@@ -1415,19 +1456,47 @@ class MeshtasticAdapter(BasePlatformAdapter):
                             )
                         raise
                     if not res.success:
-                        with self._queue_lock:
-                            self._outbound_queue.insert(0, item)
-                        await asyncio.sleep(5.0)
-                    else:
-                        delay = float(os.getenv("MESHTASTIC_CHUNK_DELAY", "4.0"))
-                        await asyncio.sleep(delay)
+                        if self._requeue_or_drop(item, res.error):
+                            await asyncio.sleep(5.0)
+                        continue
+                    # Never raises: a garbage MESHTASTIC_CHUNK_DELAY after the
+                    # item was already delivered must not requeue a duplicate.
+                    await asyncio.sleep(send_path.safe_chunk_pacing_delay())
                 except Exception as e:
-                    logger.error(f"Error draining queued message: {e}")
-                    with self._queue_lock:
-                        self._outbound_queue.insert(0, item)
-                    await asyncio.sleep(5.0)
+                    logger.error("Error draining queued message: %s", e, exc_info=True)
+                    if self._requeue_or_drop(item, None):
+                        await asyncio.sleep(5.0)
             else:
                 await asyncio.sleep(1.0)
+
+    def _requeue_or_drop(self, item: dict[str, Any], error: str | None) -> bool:
+        """Requeue a retryable drained item, or drop it to keep the queue moving.
+
+        Mirrors ``_send_chunk`` via ``send_path.drain_retry_decision``: only
+        transient failures are re-queued; permanent failures are dropped after
+        one attempt so they cannot block the items behind them. Returns True
+        when the item was re-queued.
+        """
+        attempts = item.get("attempts", 0) + 1
+        if send_path.drain_retry_decision(error, attempts, self.DRAIN_MAX_ATTEMPTS):
+            item["attempts"] = attempts
+            with self._queue_lock:
+                self._outbound_queue.insert(0, item)
+            logger.warning(
+                "Queued Meshtastic message to %s retryable (attempt %d/%d): %s",
+                item["chat_id"],
+                attempts,
+                self.DRAIN_MAX_ATTEMPTS,
+                error or "send raised",
+            )
+            return True
+        logger.error(
+            "Dropping queued Meshtastic message to %s after %d attempts: %s",
+            item["chat_id"],
+            attempts,
+            error or "send raised",
+        )
+        return False
 
     def _start_disconnect_task(self, completion: ConcurrentFuture) -> None:
         """Start teardown on the event loop that owns platform tasks."""
@@ -1455,6 +1524,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 self._disconnect_owner_loop = current_loop
                 self._disconnect_task = current_loop.create_task(self._disconnect_impl(completion))
 
+    def _reserve_disconnect_owner(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Claim the disconnect-owner loop under the lifecycle lock."""
+        with self._lifecycle_lock:
+            self._disconnect_owner_loop = loop
+
     async def disconnect(self) -> None:
         """Request platform-loop teardown and await its shared completion."""
         platform_loop: asyncio.AbstractEventLoop | None = None
@@ -1481,23 +1555,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if start_teardown:
             current_loop = asyncio.get_running_loop()
             if platform_loop is current_loop:
-                with self._lifecycle_lock:
-                    self._disconnect_owner_loop = current_loop
+                self._reserve_disconnect_owner(current_loop)
                 self._start_disconnect_task(completion)
             elif platform_loop is not None and platform_loop.is_running():
-                with self._lifecycle_lock:
-                    self._disconnect_owner_loop = platform_loop
+                self._reserve_disconnect_owner(platform_loop)
                 try:
                     platform_loop.call_soon_threadsafe(self._start_disconnect_task, completion)
                 except RuntimeError:
-                    with self._lifecycle_lock:
-                        self._disconnect_owner_loop = current_loop
+                    self._reserve_disconnect_owner(current_loop)
                     self._start_disconnect_task(completion)
             else:
                 # Platform loop already stopped: fallback cleanup can still
                 # cancel (without awaiting) old-loop tasks and close transport.
-                with self._lifecycle_lock:
-                    self._disconnect_owner_loop = current_loop
+                self._reserve_disconnect_owner(current_loop)
                 self._start_disconnect_task(completion)
         else:
             logger.debug("Waiting for Meshtastic disconnect already in progress")
@@ -1528,18 +1598,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def _disconnect_impl(self, completion: ConcurrentFuture) -> None:
         """Teardown implementation; always owned by the platform loop when live.
 
-        Ownership-gate pattern: this task can be superseded at any time by a
-        follower caller that takes over teardown (see ``_start_disconnect_task``).
-        So every stage boundary re-checks, under one ``_lifecycle_lock`` hold,
-        that ALL of the following still hold before touching shared state:
-          1. ``self._disconnecting`` is still set (no completed teardown);
-          2. ``self._disconnect_future is completion`` (same teardown epoch);
-          3. ``self._disconnect_task is current_task`` (this task is the owner).
-        Failing any gate means a newer owner exists, so this task returns
-        ``superseded`` without mutating the newer lifecycle's state. The
-        ``finally`` block only settles ``completion`` and clears flags when the
-        same three checks pass, so a stale task can never advertise completion
-        or wipe a successor's bookkeeping.
+        Ownership-gate pattern: a follower caller can supersede this task at any
+        time (``_start_disconnect_task``), so every stage boundary re-checks under
+        one ``_lifecycle_lock`` hold that ``self._disconnecting`` is still set,
+        ``self._disconnect_future is completion`` (same epoch), and
+        ``self._disconnect_task is current_task`` (this task is the owner). Failing
+        any gate means a newer owner exists — return ``superseded`` without mutating
+        its state; the ``finally`` only settles ``completion`` when the same checks
+        pass, so a stale task never advertises completion or wipes a successor.
         """
         failure: BaseException | None = None
         cancelled = False
@@ -1547,10 +1613,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         current_task = asyncio.current_task()
         try:
             with self._lifecycle_lock:
-                if (
-                    not self._disconnecting
-                    or self._disconnect_future is not completion
-                    or self._disconnect_task is not current_task
+                if not connection.teardown_owner_current(
+                    self._disconnecting,
+                    self._disconnect_future,
+                    self._disconnect_task,
+                    completion,
+                    current_task,
                 ):
                     superseded = True
                     return
@@ -1571,11 +1639,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     self._disconnect_interfaces.extend(detached)
                 ports = list(self._disconnect_interfaces)
                 self._fail_pending_acks(reason="DISCONNECTED")
-                lifecycle_tasks = list(self._reconnect_tasks.values())
-                if self._queue_drain_task:
-                    lifecycle_tasks.append(self._queue_drain_task)
-                if self._incoming_consumer_task:
-                    lifecycle_tasks.append(self._incoming_consumer_task)
+                # Solicited waiters die with the link; abandon is idempotent.
+                self._abandon_response_waiters("disconnect")
+                lifecycle_tasks = connection.teardown_task_list(
+                    self._reconnect_tasks, self._queue_drain_task, self._incoming_consumer_task
+                )
                 self._reconnect_tasks.clear()
                 self._queue_drain_task = None
                 self._incoming_consumer_task = None
@@ -1584,36 +1652,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # a follower loop while the platform loop is still running; calling
             # Task.cancel() directly from another thread is not safe, so foreign-
             # loop tasks are marshalled via call_soon_threadsafe.
-            current_loop = asyncio.get_running_loop()
-            for task in lifecycle_tasks:
-                self._cancel_task_threadsafe(task)
-            local_lifecycle_tasks = [
-                task for task in lifecycle_tasks if task.get_loop() is current_loop
-            ]
-            if local_lifecycle_tasks:
-                await asyncio.gather(*local_lifecycle_tasks, return_exceptions=True)
+            await self._cancel_and_gather(lifecycle_tasks)
             with self._lifecycle_lock:
-                if (
-                    not self._disconnecting
-                    or self._disconnect_future is not completion
-                    or self._disconnect_task is not current_task
+                if not connection.teardown_owner_current(
+                    self._disconnecting,
+                    self._disconnect_future,
+                    self._disconnect_task,
+                    completion,
+                    current_task,
                 ):
                     superseded = True
                     return
                 message_tasks = list(self._message_tasks)
                 self._message_tasks.clear()
-            for task in message_tasks:
-                self._cancel_task_threadsafe(task)
-            local_message_tasks = [
-                task for task in message_tasks if task.get_loop() is current_loop
-            ]
-            if local_message_tasks:
-                await asyncio.gather(*local_message_tasks, return_exceptions=True)
+            await self._cancel_and_gather(message_tasks)
             with self._lifecycle_lock:
-                if (
-                    not self._disconnecting
-                    or self._disconnect_future is not completion
-                    or self._disconnect_task is not current_task
+                if not connection.teardown_owner_current(
+                    self._disconnecting,
+                    self._disconnect_future,
+                    self._disconnect_task,
+                    completion,
+                    current_task,
                 ):
                     superseded = True
                     return
@@ -1623,10 +1682,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if should_start_close:
                 await self._close_interfaces([iface for _, iface in ports])
             with self._lifecycle_lock:
-                if (
-                    not self._disconnecting
-                    or self._disconnect_future is not completion
-                    or self._disconnect_task is not current_task
+                if not connection.teardown_owner_current(
+                    self._disconnecting,
+                    self._disconnect_future,
+                    self._disconnect_task,
+                    completion,
+                    current_task,
                 ):
                     superseded = True
                     return
@@ -1646,33 +1707,69 @@ class MeshtasticAdapter(BasePlatformAdapter):
             failure = exc
             logger.error("Error disconnecting Meshtastic platform: %s", exc, exc_info=True)
         finally:
-            if cancelled or superseded:
-                with self._lifecycle_lock:
-                    if self._disconnect_task is current_task:
-                        self._disconnect_task = None
-                        self._disconnect_owner_loop = None
-            else:
-                with self._lifecycle_lock:
-                    if (
-                        self._disconnecting
-                        and self._disconnect_future is completion
-                        and self._disconnect_task is current_task
-                    ):
-                        # Settle completion before releasing ownership so polling
-                        # callers cannot observe task=None with completion pending.
-                        try:
-                            if failure is None:
-                                completion.set_result(None)
-                            else:
-                                completion.set_exception(failure)
-                        except ConcurrentInvalidStateError:
-                            pass
-                        self._disconnecting = False
-                        self._disconnect_done.set()
-                        self._disconnect_interfaces.clear()
-                        self._disconnect_close_started = False
-                        self._disconnect_task = None
-                        self._disconnect_owner_loop = None
+            self._teardown_epilogue(completion, current_task, failure, cancelled, superseded)
+
+    async def _cancel_and_gather(self, tasks: list[asyncio.Task]) -> None:
+        """Cancel each task on its owning loop; await the local ones.
+
+        Task.cancel() is only safe from the task's own loop thread, so
+        foreign-loop tasks are marshalled via call_soon_threadsafe; the local
+        subset is gathered (exceptions swallowed — teardown never fails a
+        cancelled task's outcome).
+        """
+        current_loop = asyncio.get_running_loop()
+        for task in tasks:
+            self._cancel_task_threadsafe(task)
+        local_tasks = connection.tasks_on_loop(tasks, current_loop)
+        if local_tasks:
+            await asyncio.gather(*local_tasks, return_exceptions=True)
+
+    def _teardown_epilogue(
+        self,
+        completion: ConcurrentFuture,
+        current_task: asyncio.Task | None,
+        failure: BaseException | None,
+        cancelled: bool,
+        superseded: bool,
+    ) -> None:
+        """Settle teardown bookkeeping once ownership is released (finally block).
+
+        Cancelled or superseded teardowns only clear the task/owner slots — a
+        polling caller atomically starts a takeover task on a live loop. A
+        settled owner additionally resolves the shared completion and resets
+        the teardown flags; it never settles while the same three ownership
+        checks fail, so a stale task cannot advertise completion or wipe a
+        successor's bookkeeping.
+        """
+        if cancelled or superseded:
+            with self._lifecycle_lock:
+                if self._disconnect_task is current_task:
+                    self._disconnect_task = None
+                    self._disconnect_owner_loop = None
+            return
+        with self._lifecycle_lock:
+            if connection.teardown_owner_current(
+                self._disconnecting,
+                self._disconnect_future,
+                self._disconnect_task,
+                completion,
+                current_task,
+            ):
+                # Settle completion before releasing ownership so polling
+                # callers cannot observe task=None with completion pending.
+                try:
+                    if failure is None:
+                        completion.set_result(None)
+                    else:
+                        completion.set_exception(failure)
+                except ConcurrentInvalidStateError:
+                    pass
+                self._disconnecting = False
+                self._disconnect_done.set()
+                self._disconnect_interfaces.clear()
+                self._disconnect_close_started = False
+                self._disconnect_task = None
+                self._disconnect_owner_loop = None
 
     def _on_receive_pubsub(self, packet, interface=None):
         """Wrapper callback called by the pubsub framework (running on PySub background thread).
@@ -1681,7 +1778,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         loop that owns ``_incoming_queue``. There is no running loop on the
         pubsub thread, and a send-loop queue would never be drained.
         """
-        if not self._running or self._incoming_queue is None:
+        queue = self._incoming_queue
+        if not self._running or queue is None:
             return
         if interface is not None:
             with self._iface_lock:
@@ -1690,8 +1788,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     return
         self._schedule_on_loop(
             self.loop,
-            self._incoming_queue.put_nowait,
-            (packet, interface),
+            inbound.enqueue_incoming,
+            queue,
+            packet,
+            interface,
             what="inbound packet enqueue",
         )
 
@@ -1700,31 +1800,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         The library fires ``meshtastic.connection.lost`` from ``_disconnected()``
         — e.g. on a reader-thread exit or a device reboot — cases the liveness
-        poll can miss or lag. This is observability-only; the reconnect loop's
-        ``_interface_is_alive`` poll still owns teardown to avoid racing the
-        library's own TCP self-heal.
+        poll can miss or lag. This is observability-only: the reconnect loop's
+        ``_interface_is_alive`` poll still owns teardown AND waiter abandonment,
+        so a transient blip ``TCPInterface._reconnect()`` self-heals without
+        failing an in-flight solicited request whose reply may still return over
+        the re-established link.
         """
         logger.warning("Meshtastic reported connection lost (interface=%s).", interface)
-        # A solicited reply can only return over the connection the request went
-        # out on, so once it drops the wait is dead time — up to a full 60s
-        # traceroute timeout of the agent sitting mute. Fail them now.
-        self._abandon_response_waiters("connection lost")
 
     def _abandon_response_waiters(self, reason: str) -> None:
         """Fail every in-flight solicited request when the link goes down."""
-        with self._response_lock:
-            pending = [f for futures in self._response_waiters.values() for f in futures]
-            self._response_waiters.clear()
-        if not pending:
-            return
-        logger.info("Abandoning %d in-flight Meshtastic request(s): %s", len(pending), reason)
-        for future in pending:
-            if future.done():
-                continue
-            try:
-                future.set_exception(MeshLinkLost(reason))
-            except ConcurrentInvalidStateError:
-                pass
+        self._solicited.abandon_all(reason)
+
+    def _transport_executor_for_solicit(self) -> Any:
+        """Read the lifecycle-scoped transport executor under the lifecycle lock."""
+        with self._lifecycle_lock:
+            return self._transport_executor
 
     def _on_connection_established(self, interface=None):
         """Log Meshtastic-reported connection establishment (pubsub background thread)."""
@@ -1736,19 +1827,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
             try:
                 packet, interface = await incoming_queue.get()
                 try:
-                    # Keep lifecycle ownership through synchronous dispatch so
-                    # disconnect/reconnect cannot advance the generation in the
-                    # gap between validation and _on_receive side effects.
+                    # Validate generation under the lock, then dispatch unlocked.
+                    # _on_receive → _maybe_record_pubsub_ack → _record_ack_response
+                    # re-acquires _lifecycle_lock when upgrading IMPLICIT→real ACK;
+                    # holding a non-reentrant Lock across _on_receive deadlocks the
+                    # platform loop on that multi-hop path. Stale packets after
+                    # disconnect are still filtered by lifecycle stamps inside ACK
+                    # recording and by _running / generation checks elsewhere.
                     with self._lifecycle_lock:
                         if lifecycle_id != self._lifecycle_id or not self._running:
                             break
-                        self._on_receive(packet, interface)
+                    self._on_receive(packet, interface)
                 finally:
                     incoming_queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in incoming queue consumer: {e}", exc_info=True)
+                logger.error("Error in incoming queue consumer: %s", e, exc_info=True)
 
     def _handle_message_done(self, task: asyncio.Task):
         """Callback to discard finished task and log exceptions."""
@@ -1758,22 +1853,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Error in handle_message task: {e}", exc_info=True)
+            logger.error("Error in handle_message task: %s", e, exc_info=True)
 
     @staticmethod
     def _channel_field(ch: Any, key: str) -> Any:
         """Read a channel field from a dict (mock) or a protobuf Channel (hardware).
 
-        ``localNode.channels`` is a list of dicts under the mock interface but a
-        list of protobuf ``Channel`` objects on real hardware — those have no
-        ``.get()``, and their name lives under ``settings`` (``ch.settings.name``).
+        Delegates to ``inbound.channel_field``; kept for callers that still
+        reach the adapter (``_send_immediate``, tests).
         """
-        if isinstance(ch, dict):
-            return ch.get(key)
-        if key == "name":
-            settings = getattr(ch, "settings", None)
-            return getattr(settings, "name", None) if settings is not None else None
-        return getattr(ch, key, None)
+        return inbound.channel_field(ch, key)
 
     def _on_receive(self, packet: dict, interface: Any = None):
         """Processes incoming packet in the main loop thread."""
@@ -1785,99 +1874,39 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # the request id must already be one of ours.
             self._maybe_record_pubsub_ack(packet)
 
-            # Canonical node id (! + lowercase 8-hex) so Hermes gateway
-            # allowlist exact-match and session keys stay consistent.
-            from_id = self._normalize_node_id(packet.get("fromId") or packet.get("from"))
-            if not from_id:
+            my_node_id = self._get_interface_node_id(interface) if interface else None
+
+            # Receive-stage pipeline: packet normalization, freshness overlay,
+            # self-echo filter, signal/telemetry/position routing and the authz
+            # pre-check all run in inbound.InboundProcessor — synchronous on
+            # this loop, with SQLite writes delegated via its writer callbacks
+            # to _run_db_write.
+            result = self._inbound.process(packet, my_node_id=my_node_id)
+            sender = result.sender
+            if sender is None:
                 return
 
-            # Resolve any solicited-request waiter for this node. Done here,
-            # before the auth gate — a reply is protocol data addressed to us,
-            # so the allowlist (which gates who may talk to the agent) must not
-            # drop it. The normal telemetry/position DB logging still runs later.
-            self._maybe_resolve_solicited(from_id, packet.get("decoded", {}) or {})
+            # Resolve any solicited-request waiter for this node (before the auth
+            # gate — a reply is protocol data addressed to us). rxTime lets the
+            # tracker reject a packet that predates the request (a pre-armed
+            # periodic broadcast, not a reply).
+            rx_time = (
+                packet.get("rxTime")
+                if isinstance(packet, dict)
+                else getattr(packet, "rxTime", None)
+            )
+            self._maybe_resolve_solicited(sender, result.decoded, rx_time=rx_time)
 
-            # Link metadata from the packet envelope.
-            # Prefer rx* keys from the radio envelope; use is-not-None so a
-            # legitimate 0.0 SNR (or 0 RSSI) is not treated as missing.
-            snr = packet.get("rxSnr")
-            if snr is None:
-                snr = packet.get("snr")
-            rssi = packet.get("rxRssi")
-            if rssi is None:
-                rssi = packet.get("rssi")
-            hop_limit = packet.get("hopLimit")
-            hop_start = packet.get("hopStart")
-            hop_count = None
-            if hop_limit is not None and hop_start is not None:
-                hop_count = max(0, hop_start - hop_limit)
-
-            # Track observed freshness for EVERY heard node — BEFORE the auth
-            # gate, so last_heard/signal stay current even for nodes that aren't
-            # allowed to talk to Hermes (e.g. a node the user just wants to watch).
-            self._update_observed(from_id, packet.get("rxTime"), snr, rssi, hop_count)
-
-            decoded = packet.get("decoded", {})
-            portnum = decoded.get("portnum")
-
-            # Echo filtering (avoid bot replying to itself) BEFORE the auth gate:
-            # the local node is normally NOT in the allowlist, so checking auth
-            # first logged every self-echo as "Unauthorized" and made this filter
-            # unreachable dead code.
-            my_node_id = None
-            if interface:
-                my_node_id = self._get_interface_node_id(interface)
-
-            if my_node_id and from_id == my_node_id:
+            if result.dropped:
                 return
 
-            # Observability (signal / telemetry / position) is recorded for EVERY
-            # heard node, BEFORE the auth gate — same rationale as _update_observed
-            # above. The allowlist controls who may *talk to the agent* (the
-            # prompt-injection surface), not what the agent may see of the mesh;
-            # gating these writes left the DB holding data for the single
-            # allowlisted node only, so mesh_telemetry / mesh_signal_quality /
-            # position history were empty for every other node. Safe pre-auth:
-            # these handlers persist numeric fields only (battery/voltage/temp/
-            # humidity/pressure/uptime, lat/lon/alt, snr/rssi/hops) — no
-            # attacker-controlled text is stored or surfaced.
-            if snr is not None or rssi is not None:
-                self._run_db_write(lambda: telemetry_db.log_signal(from_id, snr, rssi, hop_count))
-
-            # Telemetry: portnums_pb2.PortNum.TELEMETRY_APP == 67 (MessageToDict
-            # usually emits the string name). Older code treated 4/33 as
-            # telemetry/env — those are NODEINFO_APP and IP_TUNNEL_APP.
-            if portnum in ("TELEMETRY_APP", 67):
-                self._run_db_write(lambda: self._handle_telemetry_packet(from_id, decoded))
+            if not result.authorized:
+                self._warn_unauthorized_node(sender)
                 return
 
-            # Position: portnums_pb2.PortNum.POSITION_APP == 3
-            if portnum in ("POSITION_APP", 3):
-                self._run_db_write(lambda: self._handle_position_packet(from_id, decoded))
+            text = result.text
+            if text is None:  # unreachable: the pipeline drops packets without text
                 return
-
-            # We only bridge TEXT messages (TEXT_MESSAGE_APP == 1)
-            if portnum not in ("TEXT_MESSAGE_APP", 1, "TEXT_MESSAGE"):
-                return
-
-            # Restriction check — guards the message path into the agent, which
-            # is the only path carrying attacker-controlled text.
-            if not self._is_authorized_node(from_id):
-                logger.warning(f"Unauthorized node ID {from_id} skipped.")
-                return
-
-            # Library may expose decoded text and/or raw payload bytes.
-            payload = decoded.get("payload")
-            text_field = decoded.get("text")
-            if payload is None and text_field is None:
-                return
-
-            if isinstance(payload, bytes):
-                text = payload.decode("utf-8", errors="replace")
-            elif payload is not None:
-                text = str(payload)
-            else:
-                text = str(text_field)
 
             # RF path of this inbound text, logged next to the message itself so
             # the forward route (mesh -> us) can be correlated with the ACK path
@@ -1885,147 +1914,92 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # >0 means it came via that many relays.
             logger.info(
                 "Meshtastic inbound text: from=%s hops=%s snr=%s rssi=%s bytes=%d text=%r",
-                from_id,
-                hop_count,
-                snr,
-                rssi,
+                sender,
+                result.hop_count,
+                result.snr,
+                result.rssi,
                 len(text.encode("utf-8")),
                 text[:80],
             )
 
-            # Determine scopes (DM vs Channel)
-            to_id = packet.get("toId") or packet.get("to")
-            is_broadcast = False
-            if to_id in (4294967295, 0xFFFFFFFF):
-                is_broadcast = True
-            elif isinstance(to_id, str):
-                to_id_clean = to_id.strip().lower()
-                if to_id_clean in (
-                    "^all",
-                    "broadcast",
-                    "4294967295",
-                    "0xffffffff",
-                    "ffffffff",
-                    "!ffffffff",
-                ):
-                    is_broadcast = True
-
-            if isinstance(to_id, int):
-                to_id = "^all" if is_broadcast else f"!{to_id:08x}"
-
             # By default the agent only answers direct messages — never a shared
             # channel/broadcast (avoids spamming a public channel's airtime).
-            if is_broadcast and not self.allow_channels:
+            if result.is_broadcast and not self.allow_channels:
                 logger.info(
                     "Ignoring channel/broadcast message from %s "
                     "(set MESHTASTIC_ALLOW_CHANNELS=true to answer channels)",
-                    from_id,
+                    sender,
                 )
                 return
 
-            channel_index = packet.get("channel", 0)
-
-            if is_broadcast or to_id == "^all" or to_id == "broadcast":
+            if result.is_broadcast:
                 # Scoped channel group chat session
-                channel_name = str(channel_index)
-                if (
-                    interface
-                    and hasattr(interface, "localNode")
-                    and hasattr(interface.localNode, "channels")
-                ):
-                    for ch in interface.localNode.channels:
-                        if self._channel_field(
-                            ch, "index"
-                        ) == channel_index and self._channel_field(ch, "name"):
-                            channel_name = self._channel_field(ch, "name")
-                            break
+                channel_name = inbound.resolve_channel_name(interface, result.channel_index)
                 chat_id = f"meshtastic:channel:{channel_name}"
                 chat_type = "group"
             else:
                 # Private direct message session
-                chat_id = f"meshtastic:{from_id}"
+                chat_id = f"meshtastic:{sender}"
                 chat_type = "dm"
 
             # Fetch sender display names
-            sender_name = from_id
-            if interface and hasattr(interface, "nodes") and from_id in interface.nodes:
-                user = interface.nodes[from_id].get("user", {})
-                sender_name = user.get("longName") or user.get("shortName") or from_id
+            sender_name = inbound.resolve_sender_name(interface, sender)
 
-            # Build packet context for the agent.  Keep this compact but include
+            # Build packet context for the agent. Keep this compact but include
             # the LoRa metadata that matters for decisions/debugging.
-            meta_lines = ["[Meshtastic packet metadata]"]
-            meta_lines.append(f"from: {from_id} ({sender_name})")
-            meta_lines.append(f"to: {to_id}")
-            meta_lines.append(f"chat_scope: {chat_id} ({chat_type})")
-            meta_lines.append(f"channel: {channel_index}")
-            if snr is not None:
-                meta_lines.append(f"rx_snr: {snr} dB")
-            if rssi is not None:
-                meta_lines.append(f"rx_rssi: {rssi} dBm")
-            if hop_count is not None:
-                meta_lines.append(f"hop_count: {hop_count}")
-            if hop_limit is not None:
-                meta_lines.append(f"hop_limit: {hop_limit}")
-            if hop_start is not None:
-                meta_lines.append(f"hop_start: {hop_start}")
-            for key in (
-                "id",
-                "rxTime",
-                "priority",
-                "wantAck",
-                "pkiEncrypted",
-                "publicKey",
-                "nextHop",
-                "relayNode",
-                "transportMechanism",
-            ):
-                if key in packet:
-                    val = packet.get(key)
-                    if key == "publicKey":
-                        val = "present" if val else "absent"
-                    meta_lines.append(f"{key}: {val}")
-            packet_context = "\n".join(meta_lines)
+            packet_context = inbound.build_packet_context(
+                packet,
+                sender=sender,
+                sender_name=sender_name,
+                to_id=result.to_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                channel_index=result.channel_index,
+                snr=result.snr,
+                rssi=result.rssi,
+                hop_count=result.hop_count,
+                hop_limit=result.hop_limit,
+                hop_start=result.hop_start,
+            )
 
             # Build Hermes MessageEvent
             source = self.build_source(
                 chat_id=chat_id,
-                user_id=from_id,
+                user_id=sender,
                 user_name=sender_name,
                 chat_type=chat_type,
             )
 
-            # Prefer the radio's receive time so session history reflects when the
-            # packet actually arrived over the air, not when the loop drained it
-            # (packets can sit in the incoming queue across reconnects). A skewed
-            # or garbage rxTime must never drop the message — fall back to now().
-            event_ts = datetime.now()
-            rx_time = packet.get("rxTime")
-            if rx_time:
-                try:
-                    event_ts = datetime.fromtimestamp(float(rx_time))
-                except (TypeError, ValueError, OverflowError, OSError):
-                    pass
+            # Prefer the radio's receive time so session history reflects when
+            # the packet actually arrived over the air, not when the loop
+            # drained it (packets can sit in the incoming queue across
+            # reconnects). A skewed or garbage rxTime must never drop the
+            # message — fall back to now().
+            event_ts = inbound.event_timestamp(packet)
 
-            # If the phone app sent this as a reply, surface the replied-to packet
-            # id so the agent/gateway has reply context.
-            reply_id = decoded.get("replyId")
+            # If the phone app sent this as a reply, surface the replied-to
+            # packet id so the agent/gateway has reply context.
+            reply_id = result.decoded.get("replyId")
 
-            # Resolve a packet id; explicitly distinguish "absent" (None) from a
-            # falsy-but-valid 0, since `or` would skip an id of 0.
-            pkt_id = packet.get("id")
-            if pkt_id is None:
-                pkt_id = packet.get("rxTime") or time.time()
             event = MessageEvent(
                 text=text,
                 message_type=MessageType.TEXT,
                 source=source,
                 raw_message=packet,
-                message_id=str(pkt_id),
+                message_id=inbound.resolve_packet_id(packet),
                 channel_context=packet_context,
                 timestamp=event_ts,
                 reply_to_message_id=str(reply_id) if reply_id is not None else None,
             )
+
+            # Cap in-flight gateway tasks so an authorized-node text flood cannot
+            # grow _message_tasks without bound (drop under extreme pressure).
+            if len(self._message_tasks) >= self.MESSAGE_TASK_LIMIT:
+                logger.warning(
+                    "Dropping inbound Meshtastic message from %s: too many in-flight gateway tasks",
+                    sender,
+                )
+                return
 
             # Bridge to Hermes Gateway
             task = asyncio.create_task(self.handle_message(event))
@@ -2033,96 +2007,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             task.add_done_callback(self._handle_message_done)
 
         except Exception as e:
-            logger.error(f"Error handling inbound Meshtastic packet: {e}", exc_info=True)
-
-    @staticmethod
-    def _first_not_none(*values: Any) -> Any:
-        """Return the first value that is not None (0 / 0.0 / False are kept).
-
-        Mirrored as ``tools._first_not_none`` (loaded as ``meshtastic_tools``);
-        keep both in sync — tools cannot import adapter at module load without
-        risking a cycle through the gateway stack.
-        """
-        for value in values:
-            if value is not None:
-                return value
-        return None
-
-    def _handle_telemetry_packet(self, node_id: str, decoded: dict):
-        """Helper to process and log sensor/metrics telemetry."""
-        try:
-            # Check for device metrics or environment metrics nested
-            telemetry = decoded.get("telemetry", {})
-            if not telemetry:
-                # If parsed differently by protobufs
-                telemetry = decoded
-
-            metrics = telemetry.get("deviceMetrics", {}) or {}
-            env = telemetry.get("environmentMetrics", {}) or {}
-
-            # batteryLevel 0 means external power on many devices — must not use
-            # truthiness. Real mesh dicts use uptimeSeconds (MessageToDict);
-            # accept legacy "uptime" too (mock / older payloads).
-            battery = self._first_not_none(
-                metrics.get("batteryLevel"), telemetry.get("batteryLevel")
-            )
-            voltage = self._first_not_none(metrics.get("voltage"), telemetry.get("voltage"))
-            uptime = self._first_not_none(
-                metrics.get("uptimeSeconds"),
-                metrics.get("uptime"),
-                telemetry.get("uptimeSeconds"),
-                telemetry.get("uptime"),
-            )
-
-            temp = self._first_not_none(
-                env.get("temperature"),
-                env.get("barometric_temperature"),
-                telemetry.get("temperature"),
-            )
-            humidity = self._first_not_none(
-                env.get("relativeHumidity"), telemetry.get("relativeHumidity")
-            )
-            pressure = self._first_not_none(
-                env.get("barometricPressure"), telemetry.get("barometricPressure")
-            )
-
-            if any(val is not None for val in (battery, voltage, temp, humidity, pressure, uptime)):
-                telemetry_db.log_telemetry(
-                    node_id=node_id,
-                    battery_level=battery,
-                    voltage=voltage,
-                    temperature=temp,
-                    humidity=humidity,
-                    pressure=pressure,
-                    uptime=uptime,
-                )
-                logger.debug(f"Logged telemetry for node {node_id}")
-        except Exception as e:
-            logger.error(f"Error logging telemetry packet: {e}")
-
-    def _handle_position_packet(self, node_id: str, decoded: dict):
-        """Helper to process and log position updates."""
-        try:
-            pos = decoded.get("position", {}) or decoded
-            lat = pos.get("latitude")
-            lon = pos.get("longitude")
-            alt = pos.get("altitude")
-
-            if lat is not None and lon is not None:
-                # Real coordinates inside meshtastic packages are scaled down or decimals
-                # protobuf stores them scaled by 1e7
-                if abs(lat) > 90.0 or abs(lon) > 180.0:
-                    lat = lat / 1e7
-                    lon = lon / 1e7
-                    if alt is not None:
-                        alt = alt / 1.0  # standard float
-
-                telemetry_db.log_position(
-                    node_id=node_id, latitude=lat, longitude=lon, altitude=alt
-                )
-                logger.debug(f"Logged position for node {node_id}")
-        except Exception as e:
-            logger.error(f"Error logging position packet: {e}")
+            logger.error("Error handling inbound Meshtastic packet: %s", e, exc_info=True)
 
     # ------------------------------------------------------------------
     # Solicited requests (agent actively asks a node for data)
@@ -2134,100 +2019,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
     # lifecycle transport executor so it can't race close.
     # ------------------------------------------------------------------
 
-    def _register_response_waiter(self, kind: str, node_id: str) -> ConcurrentFuture:
-        """Arm a waiter for a solicited reply of *kind* from *node_id*."""
-        future: ConcurrentFuture = ConcurrentFuture()
-        with self._response_lock:
-            self._response_waiters.setdefault((kind, node_id), []).append(future)
-        return future
-
-    def _resolve_response_waiters(self, kind: str, node_id: str, payload: dict) -> None:
-        """Hand *payload* to anyone waiting on a *kind* reply from *node_id*."""
-        with self._response_lock:
-            futures = self._response_waiters.pop((kind, node_id), [])
-        for future in futures:
-            if not future.done():
-                self._set_ack_future_result(future, payload)
-
-    def _maybe_resolve_solicited(self, from_id: str, decoded: dict) -> None:
+    def _maybe_resolve_solicited(self, from_id: str, decoded: dict, *, rx_time: Any = None) -> None:
         """Feed a telemetry/position/traceroute packet to any matching waiter."""
-        if not isinstance(decoded, dict):
-            return
-        portnum = decoded.get("portnum")
-        if portnum in ("TELEMETRY_APP", 67):
-            self._resolve_response_waiters("telemetry", from_id, decoded.get("telemetry", decoded))
-        elif portnum in ("POSITION_APP", 3):
-            self._resolve_response_waiters("position", from_id, decoded.get("position", decoded))
-        elif portnum in ("TRACEROUTE_APP", 70):
-            route = decoded.get("traceroute") or decoded.get("routeDiscovery") or {}
-            self._resolve_response_waiters("traceroute", from_id, route)
-
-    def _discard_response_waiter(self, kind: str, node_id: str, future: ConcurrentFuture) -> None:
-        """Drop a waiter that timed out so the registry can't grow unbounded."""
-        with self._response_lock:
-            pending = self._response_waiters.get((kind, node_id))
-            if not pending:
-                return
-            if future in pending:
-                pending.remove(future)
-            if not pending:
-                self._response_waiters.pop((kind, node_id), None)
-
-    async def _solicit(
-        self,
-        kind: str,
-        node_id: str,
-        send: Callable[[Any], Any],
-        timeout: float,
-    ) -> dict[str, Any]:
-        """Send a request to one node and await its reply.
-
-        Returns ``{"ok": True, "data": ...}`` or ``{"ok": False, "error": ...}``
-        — never raises for an unanswered request, since silence is the normal
-        outcome for a distant node.
-        """
-        dest = self._normalize_node_id(node_id) or node_id
-        ifaces = self.get_interfaces()
-        with self._lifecycle_lock:
-            executor = self._transport_executor
-        if not ifaces or executor is None:
-            return {"ok": False, "error": "No active Meshtastic interfaces connected"}
-        iface = ifaces[0]
-
-        future = self._register_response_waiter(kind, dest)
-        try:
-            await asyncio.wrap_future(executor.submit(lambda: send(iface)))
-        except Exception as e:
-            self._discard_response_waiter(kind, dest, future)
-            logger.error("Meshtastic %s request to %s failed to send: %s", kind, dest, e)
-            return {"ok": False, "error": f"Could not send {kind} request: {e}"}
-
-        logger.info("Meshtastic %s requested from %s (timeout=%.0fs)", kind, dest, timeout)
-        try:
-            data = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
-        except (TimeoutError, asyncio.CancelledError):
-            self._discard_response_waiter(kind, dest, future)
-            logger.info("Meshtastic %s request to %s timed out", kind, dest)
-            return {
-                "ok": False,
-                "error": (
-                    f"{dest} did not answer the {kind} request within {timeout:.0f}s. "
-                    "The node may be out of range, asleep, or the reply was lost."
-                ),
-            }
-        except MeshLinkLost as e:
-            # The link dropped mid-wait — the reply can't return, so fail fast
-            # instead of sitting out the full timeout.
-            logger.info("Meshtastic %s request to %s abandoned: %s", kind, dest, e)
-            return {
-                "ok": False,
-                "error": (
-                    f"The Meshtastic link dropped before {dest} answered the {kind} "
-                    f"request ({e}). The packet may have gone out; try again."
-                ),
-            }
-        logger.info("Meshtastic %s reply received from %s", kind, dest)
-        return {"ok": True, "data": data}
+        self._solicited.maybe_resolve(from_id, decoded, rx_time=rx_time)
 
     def _post_request(
         self,
@@ -2244,9 +2038,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         the interface ``Timeout`` — 300s for TCP — inside our transport-executor
         thread and raises on expiry. That stalled the whole tool call for five
         minutes on a silent/unreachable node and surfaced as "failed to send",
-        while ``_solicit``'s own timeout never applied. We already resolve replies
+        while ``solicit``'s own timeout never applied. We already resolve replies
         on the pubsub receive path, so post via ``sendData`` (serialize + send
-        only, ``onResponse=None``) and let ``_solicit``'s timeout be the single
+        only, ``onResponse=None``) and let ``solicit``'s timeout be the single
         authority on the wait.
         """
         iface.sendData(
@@ -2287,7 +2081,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def request_telemetry(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
         """Ask a node for fresh device metrics (battery, voltage, uptime)."""
         dest = self._normalize_node_id(node_id) or node_id
-        return await self._solicit(
+        return await self._solicited.solicit(
             "telemetry",
             node_id,
             lambda iface: self._post_request(
@@ -2299,7 +2093,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def request_position(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
         """Ask a node for its current position."""
         dest = self._normalize_node_id(node_id) or node_id
-        return await self._solicit(
+        return await self._solicited.solicit(
             "position",
             node_id,
             # Empty Position — what the stock client sends when asking (not
@@ -2315,7 +2109,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     ) -> dict[str, Any]:
         """Discover the actual route to a node, with per-hop SNR."""
         dest = self._normalize_node_id(node_id) or node_id
-        return await self._solicit(
+        return await self._solicited.solicit(
             "traceroute",
             node_id,
             # Empty RouteDiscovery — each relay appends itself en route; the
@@ -2338,32 +2132,42 @@ class MeshtasticAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         allow_queueing: bool = True,
     ) -> SendResult:
-        """
-        Send a message. Queue it if not connected.
-        Splits oversized payloads into numbered chunks automatically.
-        """
-        # Meshtastic reply threading: reply_to is a prior packet id (string); the
-        # radio's replyId is an int. Only valid integer ids become threaded replies.
+        """Send a message, queueing if not connected; oversized payloads are chunked."""
+        # Gateway tool-progress path bypasses format_tool_event and builds long
+        # verb+preview lines; compact those to a short emoji blurb before chunking.
+        # Only rewrite single-line chrome that starts with a non-ASCII symbol
+        # (emoji). ASCII punctuation (markdown bullets "-", "*", quotes, parens)
+        # is never compacted — those are plausible single-line agent replies, and
+        # _compact_tool_progress_line's " for " / ": " splits would mangle them.
+        if content and "\n" not in content and content.strip():
+            lead = content.strip()[0]
+            if not lead.isascii():
+                compacted = self._compact_tool_progress_line(content)
+                if compacted != content and len(compacted) < len(content):
+                    content = compacted
+        # reply_to is a prior packet id; only valid integer ids become threaded replies.
         reply_id = self._parse_reply_id(reply_to)
         wait_for_ack, ack_timeout = self._ack_wait_config(metadata)
         retries = self._send_retries(metadata)
 
         # Retry applies to direct messages only: broadcasts have no per-recipient
         # ACK, so re-sending them would flood the shared channel.
-        dest = chat_id.split(":", 2)[1] if ":" in chat_id else ""
-        is_dm = dest.startswith("!")
+        dest = send_path.dest_from_chat_id(chat_id)
+        is_dm = send_path.is_node_dest(dest)
 
         # Retrying is only meaningful when we can observe delivery, so enabling
         # retries for a DM implies waiting for its ACK.
-        if retries > 0 and is_dm and not wait_for_ack:
-            wait_for_ack = True
-            if ack_timeout <= 0:
-                ack_timeout = 30.0
+        wait_for_ack, ack_timeout = send_path.retry_implies_ack_wait(
+            retries, is_dm, wait_for_ack, ack_timeout
+        )
 
-        max_attempts = retries + 1 if (retries > 0 and wait_for_ack and is_dm) else 1
+        max_attempts = send_path.max_send_attempts(retries, wait_for_ack, is_dm)
         retry_backoff = self._retry_backoff()
 
-        chunks = self._chunk_message(content)
+        chunks, chunk_error = send_path.chunk_send_result(content, self._chunk_message)
+        if chunk_error is not None:
+            return SendResult(success=False, error=chunk_error)
+
         logger.info(
             "Sending message to %s. Splitting into %d chunks (bytes=%d).",
             chat_id,
@@ -2378,14 +2182,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # Multi-packet LoRa delivery needs real pacing; too-fast writes are
             # accepted by the local serial API but get dropped/overwritten on air.
             if idx > 0:
-                delay = float(os.getenv("MESHTASTIC_CHUNK_DELAY", "4.0"))
+                delay = send_path.chunk_pacing_delay()
                 logger.info(
                     "Waiting %.1fs before Meshtastic chunk %d/%d", delay, idx + 1, len(chunks)
                 )
                 await asyncio.sleep(delay)
 
-            # Deliver this chunk, re-sending un-ACKed transient failures up to
-            # ``max_attempts`` times (1 == no retry, the default).
+            # Deliver this chunk, retrying transient failures up to max_attempts.
             attempt = 0
             while True:
                 attempt += 1
@@ -2397,7 +2200,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     ack_timeout=ack_timeout,
                     reply_id=reply_id,
                 )
-                if res.success or attempt >= max_attempts or not self._is_retriable_failure(res):
+                if not send_path.should_retry_chunk(
+                    res.success, attempt, max_attempts, self._is_retriable_failure(res)
+                ):
                     break
                 logger.warning(
                     "Meshtastic chunk %d/%d not delivered (attempt %d/%d): %s — retrying in %.1fs",
@@ -2424,9 +2229,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 return SendResult(
                     success=False,
                     message_id=last_msg_id,
-                    error=f"chunk {idx + 1}/{len(chunks)} failed after {attempt} attempt(s): {res.error}",
+                    error=f"message only partially delivered: chunk {idx + 1}/{len(chunks)} failed after {attempt} attempt(s): {res.error}",
                     raw_response={"chunks": raw_chunks, "ack_waited": wait_for_ack},
-                    continuation_message_ids=tuple(sent_ids[1:]) if len(sent_ids) > 1 else (),
+                    continuation_message_ids=tuple(sent_ids[:-1]) if len(sent_ids) > 1 else (),
+                    retryable=self._is_retriable_failure(res),
                 )
             if attempt > 1:
                 logger.info(
@@ -2444,7 +2250,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             success=True,
             message_id=last_msg_id,
             raw_response={"chunks": raw_chunks, "ack_waited": wait_for_ack},
-            continuation_message_ids=tuple(sent_ids[1:]) if len(sent_ids) > 1 else (),
+            continuation_message_ids=tuple(sent_ids[:-1]) if len(sent_ids) > 1 else (),
         )
 
     def _chunk_message(self, content: str) -> list[str]:
@@ -2474,7 +2280,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _queue_outbound_chunk(self, chat_id: str, chunk: str) -> SendResult:
         """Enqueue a chunk while disconnected (bounded, oldest-first eviction)."""
         with self._queue_lock:
-            if len(self._outbound_queue) >= 100:
+            if len(self._outbound_queue) >= self.OUTBOUND_QUEUE_MAXSIZE:
                 self._outbound_queue.pop(0)
             self._outbound_queue.append(
                 {"chat_id": chat_id, "content": chunk, "timestamp": time.time()}
@@ -2498,7 +2304,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         ``no_iface``, ``no_pubkey``, or None on success. The worker serializes
         concurrent agent-session sends and
         platform reconnect/close against Meshtastic's unsynchronized packet-id /
-        response-handler / TX-queue state.
+        response-handler / TX-queue state. DM node / channel resolution and the
+        pubkey readiness decision are delegated to send_path.
         """
         with self._iface_lock:
             if lifecycle_id != self._lifecycle_id or not self._running:
@@ -2507,26 +2314,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if not ifaces:
                 return "no_iface", None, dest
 
-        iface = ifaces[0]
-        if dest.startswith("!"):
-            node_info = None
-            for current_iface in ifaces:
-                nodes = getattr(current_iface, "nodes", None) or {}
-                # Exact key first, then case-insensitive scan of the node DB.
-                if dest in nodes:
-                    iface = current_iface
-                    node_info = nodes[dest]
-                    break
-                dest_bare = dest.lstrip("!")
-                for nid, ninfo in nodes.items():
-                    if str(nid).lower().lstrip("!") == dest_bare:
-                        iface = current_iface
-                        node_info = ninfo
-                        dest = str(nid)  # use the library's key form for sendText
-                        break
-                if node_info is not None:
-                    break
-            if node_info is not None and not node_info.get("user", {}).get("publicKey"):
+        if send_path.is_node_dest(dest):
+            iface, dest, dm_ready = send_path.dm_send_target(dest, ifaces)
+            if not dm_ready:
                 return "no_pubkey", None, dest
             pkt = iface.sendText(
                 text=content,
@@ -2537,21 +2327,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
             return None, pkt, dest
 
-        channel_index = 0
-        channel_name_or_index = parts[2] if len(parts) > 2 else "0"
-        if channel_name_or_index.isdigit():
-            channel_index = int(channel_name_or_index)
-        else:
-            for current_iface in ifaces:
-                if hasattr(current_iface, "localNode") and hasattr(
-                    current_iface.localNode, "channels"
-                ):
-                    for ch in current_iface.localNode.channels:
-                        ch_name = self._channel_field(ch, "name")
-                        if ch_name and ch_name.lower() == channel_name_or_index.lower():
-                            iface = current_iface
-                            channel_index = self._channel_field(ch, "index") or 0
-                            break
+        channel_index, iface = send_path.channel_send_target(parts, ifaces, self._channel_field)
+        if iface is None:  # numeric spec no interface exposes
+            return "no_channel", None, dest
         pkt = iface.sendText(
             text=content,
             channelIndex=channel_index,
@@ -2572,18 +2350,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
         reply_id: int | None = None,
     ) -> SendResult:
         """Helper to send a single wrapped chunk, queueing it on failure/disconnect."""
-        # Fast path under _iface_lock (map presence only). _send_immediate
-        # re-checks on the serialized transport worker so a disconnect
-        # between these cannot send on a closed interface without surfacing
-        # no_iface for queueing.
+        # Fast path under _iface_lock (map presence only); the worker re-checks,
+        # so a mid-send disconnect surfaces no_iface for queueing.
         if not self._has_interfaces():
             if wait_for_ack:
+                # ack_state treats this as retriable (queueing is ACK-unsafe).
                 return SendResult(
-                    success=False, error="No active interfaces connected; cannot wait for ACK"
+                    success=False,
+                    error=f"{send_path.NO_INTERFACES_ERROR}; cannot wait for ACK",
                 )
             if not allow_queueing:
                 return SendResult(
-                    success=False, error="No active interfaces connected and queueing disabled"
+                    success=False,
+                    error=f"{send_path.NO_INTERFACES_ERROR} and queueing disabled",
                 )
             return self._queue_outbound_chunk(chat_id, chunk)
 
@@ -2594,15 +2373,29 @@ class MeshtasticAdapter(BasePlatformAdapter):
             ack_timeout=ack_timeout,
             reply_id=reply_id,
         )
-        # Race: interface dropped after the fast-path check but before locked send.
+        # Race: interface dropped after the fast-path check but before the
+        # locked send — nothing went out, so re-queue is safe (no gap risk).
+        # Only the no-interface token qualifies: a generic "Meshtastic send
+        # failed" from a mid-sequence sendText raise must NOT be requeued here,
+        # because earlier chunks in this send() may already be on the mesh and
+        # requeueing a lone later chunk would deliver them out of order. That
+        # failure is instead surfaced to send(), which aborts the sequence with
+        # a "partially delivered" error (and retries within the DM retry budget
+        # via TRANSIENT_TRANSPORT_ERRORS; broadcasts abort — no ACK to observe).
         if (
             not res.success
-            and res.error == "No active interfaces connected"
+            and res.error == send_path.NO_INTERFACES_ERROR
             and not wait_for_ack
             and allow_queueing
         ):
             return self._queue_outbound_chunk(chat_id, chunk)
         return res
+
+    def _drop_send_token(self, send_token: object) -> None:
+        """Pop a send generation's provisional ACK staging under the ack lock."""
+        with self._ack_lock:
+            self._ack_inflight_tokens.pop(send_token, None)
+            self._early_ack_packets.pop(send_token, None)
 
     async def _send_immediate(
         self,
@@ -2613,25 +2406,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
         ack_timeout: float = 0.0,
         reply_id: int | None = None,
     ) -> SendResult:
-        """Dispatch one text chunk immediately to the interface."""
-        send_token: object | None = None
+        """Dispatch one text chunk immediately to the interface.
+
+        Orchestrates the send: transport submission on the daemon worker,
+        AckTracker bookkeeping and the optional ACK wait. The decisions —
+        transport-error mapping, ACK-outcome classification, raw_response /
+        ack-record shapes — are delegated to send_path.
+        """
+        send_token = object()
         try:
             parts = chat_id.split(":", 2)
             if len(parts) < 2:
                 return SendResult(success=False, error="Invalid chat_id format")
 
-            dest = parts[1]
-            # DM destinations are ``!``-prefixed node ids — canonicalize case so
-            # node-DB lookup matches the library's lowercase keys.
-            if dest.startswith("!"):
-                dest = self._normalize_node_id(dest) or dest
+            dest = send_path.normalize_dm_dest(parts[1], self._normalize_node_id)
 
-            send_token = object()
             with self._lifecycle_lock:
                 executor = self._transport_executor
                 lifecycle_id = self._lifecycle_id
             if executor is None:
-                return SendResult(success=False, error="No active interfaces connected")
+                return SendResult(success=False, error=send_path.NO_INTERFACES_ERROR)
             with self._ack_lock:
                 self._ack_inflight_tokens[send_token] = lifecycle_id
             ack_callback = self._make_ack_callback_for_send(dest, content, send_token, lifecycle_id)
@@ -2649,64 +2443,40 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     )
                 )
             except RuntimeError as exc:
-                if "cannot schedule new futures after shutdown" in str(exc).lower():
-                    with self._ack_lock:
-                        self._ack_inflight_tokens.pop(send_token, None)
-                        self._early_ack_packets.pop(send_token, None)
-                    return SendResult(success=False, error="No active interfaces connected")
+                if send_path.is_executor_shutdown_error(exc) or isinstance(
+                    exc, transport.TransportBusyError
+                ):
+                    # Shutdown, or the worker's queue is full (wedged blocking
+                    # call): surface the queueing trigger so _send_chunk re-queues
+                    # instead of buffering in the executor without limit.
+                    self._drop_send_token(send_token)
+                    return SendResult(success=False, error=send_path.NO_INTERFACES_ERROR)
                 raise
             with self._lifecycle_lock:
                 stale_lifecycle = lifecycle_id != self._lifecycle_id or not self._running
             # Inspect definitive pre-send failures before lifecycle turnover.
             # In particular, a stale-generation worker returns no_iface before
             # sendText, which lets _send_chunk safely queue a non-ACK message.
-            if err == "no_iface":
-                with self._ack_lock:
-                    self._ack_inflight_tokens.pop(send_token, None)
-                    self._early_ack_packets.pop(send_token, None)
-                return SendResult(success=False, error="No active interfaces connected")
-            if err == "no_pubkey":
-                with self._ack_lock:
-                    self._ack_inflight_tokens.pop(send_token, None)
-                    self._early_ack_packets.pop(send_token, None)
-                return SendResult(
-                    success=False,
-                    error=f"Target node {dest} has no public key; direct message cannot be encrypted",
-                )
+            pre_send_error = send_path.map_transport_error(err, dest)
+            if pre_send_error is not None:
+                self._drop_send_token(send_token)
+                return SendResult(success=False, error=pre_send_error)
             if stale_lifecycle:
-                with self._ack_lock:
-                    self._ack_inflight_tokens.pop(send_token, None)
-                    self._early_ack_packets.pop(send_token, None)
+                self._drop_send_token(send_token)
                 pkt_id = self._extract_packet_id(pkt)
                 # Note: deliberately NOT stored in _pending_acks/_ack_responses.
                 # A stale-lifecycle send must not pollute the new lifecycle's ACK
                 # bookkeeping (an old worker returning after reconnect cannot
                 # enter new ACK state). The outcome is surfaced only via this
                 # SendResult's raw_response.
-                ack_record = {
-                    "dest": dest,
-                    "bytes": len(content.encode("utf-8")),
-                    "status": AckStatus.TIMEOUT,
-                    "error_reason": "DISCONNECTED",
-                    "response_at": time.time(),
-                }
-                error = (
-                    f"Meshtastic disconnected while waiting for ACK on packet {pkt_id}"
-                    if wait_for_ack and pkt_id
-                    else "Meshtastic disconnected while transport send was in progress"
-                )
+                ack_record = send_path.disconnect_ack_record(dest, content)
                 return SendResult(
                     success=False,
                     message_id=pkt_id,
-                    error=error,
-                    raw_response={
-                        "packet_id": pkt_id,
-                        "dest": dest,
-                        "ack_requested": True,
-                        "ack_waited": wait_for_ack,
-                        "ack_timeout": ack_timeout if wait_for_ack else None,
-                        "ack": ack_record,
-                    },
+                    error=send_path.disconnect_error(wait_for_ack, pkt_id),
+                    raw_response=send_path.stale_send_raw_response(
+                        pkt_id, dest, wait_for_ack, ack_timeout, ack_record
+                    ),
                 )
             pkt_id = self._extract_packet_id(pkt)
             ack_future = self._track_pending_ack(
@@ -2735,73 +2505,52 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 len(content.encode("utf-8")),
                 content[:80],
             )
-            raw_response = {
-                "packet_id": pkt_id,
-                "dest": dest,
-                "ack_requested": True,
-                "ack_waited": wait_for_ack,
-                "ack_timeout": ack_timeout if wait_for_ack else None,
-                "ack": self.get_ack_status(pkt_id) if pkt_id else None,
-            }
+            raw_response = send_path.outbound_raw_response(
+                pkt_id,
+                dest,
+                wait_for_ack,
+                ack_timeout,
+                self.get_ack_status(pkt_id) if pkt_id else None,
+            )
 
             if wait_for_ack:
-                if not pkt_id or not ack_future:
+                waitable = send_path.waitable_ack_wait(pkt_id, ack_future)
+                if waitable is None:
                     return SendResult(
                         success=False,
                         message_id=pkt_id,
                         error="Cannot wait for ACK without a packet id",
                         raw_response=raw_response,
                     )
-                ack_record = await self._wait_for_ack(pkt_id, ack_future, ack_timeout)
+                pkt_id, waitable_future = waitable
+                ack_record = await self._wait_for_ack(pkt_id, waitable_future, ack_timeout)
                 raw_response["ack"] = ack_record
-                status = ack_record.get("status")
-                if status == AckStatus.ACK:
-                    return SendResult(success=True, message_id=pkt_id, raw_response=raw_response)
-                if status == AckStatus.NAK:
-                    reason = ack_record.get("error_reason") or "unknown"
-                    return SendResult(
-                        success=False,
-                        message_id=pkt_id,
-                        error=f"Meshtastic NAK for packet {pkt_id}: {reason}",
-                        raw_response=raw_response,
-                    )
-                if status == AckStatus.IMPLICIT_ACK:
-                    # A relay rebroadcast our packet — the mesh is carrying it.
-                    # Treat that as a successful send (the official client's
-                    # DELIVERED, vs RECEIVED for a real end-to-end ACK): the
-                    # destination's real ACK, if it arrives later, is picked up
-                    # by _maybe_record_pubsub_ack and upgrades the record. Not a
-                    # failure — so the gateway does not fire a duplicate
-                    # plain-text fallback, and (implicit not being retriable)
-                    # no re-send either. raw_response keeps status=implicit_ack
-                    # so callers can still tell relay- from end-to-end-confirmed.
-                    return SendResult(success=True, message_id=pkt_id, raw_response=raw_response)
-                # TIMEOUT (including DISCONNECTED from _fail_pending_acks).
-                err_reason = ack_record.get("error_reason")
-                if err_reason == "DISCONNECTED":
-                    return SendResult(
-                        success=False,
-                        message_id=pkt_id,
-                        error=f"Meshtastic disconnected while waiting for ACK on packet {pkt_id}",
-                        raw_response=raw_response,
-                    )
+                success, error = send_path.classify_ack_outcome(ack_record, pkt_id)
                 return SendResult(
-                    success=False,
-                    message_id=pkt_id,
-                    error=f"Meshtastic ACK timeout for packet {pkt_id}",
-                    raw_response=raw_response,
+                    success=success, message_id=pkt_id, error=error, raw_response=raw_response
                 )
 
-            return SendResult(success=bool(pkt), message_id=pkt_id, raw_response=raw_response)
+            return SendResult(success=err is None, message_id=pkt_id, raw_response=raw_response)
 
         except Exception as e:
-            logger.error(f"Failed to deliver message immediately: {e}", exc_info=True)
-            return SendResult(success=False, error=str(e))
+            # Map to a stable token: raw internal exception text (executor
+            # messages, library stack fragments) must not leak into the
+            # user-facing SendResult.error. Log the real cause separately.
+            #
+            # Design note: an unexpected exception here is a permanent drop for
+            # the *live* send. _send_chunk requeues only the no-interface token
+            # (nothing went out → safe); this generic token is surfaced to
+            # send(), which aborts a multi-chunk sequence as "partially
+            # delivered" (requeueing a lone later chunk would gap the order).
+            # It is still retriable within the DM retry budget — it is a member
+            # of ack_state.TRANSIENT_TRANSPORT_ERRORS, so is_retriable_failure
+            # returns True and send()'s chunk-retry loop re-sends when a budget
+            # is configured (DMs with MESHTASTIC_SEND_RETRIES). Broadcasts have
+            # no ACK to observe and no retry budget, so they abort — by design.
+            logger.error("Failed to deliver message immediately: %s", e, exc_info=True)
+            return SendResult(success=False, error="Meshtastic send failed")
         finally:
-            if send_token is not None:
-                with self._ack_lock:
-                    self._ack_inflight_tokens.pop(send_token, None)
-                    self._early_ack_packets.pop(send_token, None)
+            self._drop_send_token(send_token)
 
     async def edit_message(
         self,
@@ -2813,14 +2562,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         **kwargs,
     ) -> SendResult:
-        """Meshtastic has no edit primitive.
+        """Meshtastic has no edit primitive — pretend success, do not re-send.
 
-        Do NOT emulate edits by sending each progressive update: that floods LoRa
-        and causes partial long-answer delivery. Returning unsupported lets the
-        gateway fall back to a single final send(), which this adapter chunks.
+        Hermes' progress loop treats a *custom* ``edit_message`` as "platform
+        can edit", then on edit failure falls back to a **new permanent send
+        per tool step**. That flooded LoRa with full progress lines.
+
+        Returning success with the same ``message_id`` (no radio traffic)
+        keeps the progress bubble "editable" so later steps are silent.
+        Only the first short blurb (see ``_compact_tool_progress_line``) hits
+        the mesh; the final answer still goes through ``send()``.
         """
-        del chat_id, message_id, content, finalize, metadata, kwargs
-        return SendResult(success=False, error="Meshtastic does not support editing")
+        del chat_id, content, finalize, metadata, kwargs
+        return SendResult(success=True, message_id=message_id or "mesh-progress")
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Fetch chat details."""
@@ -2880,18 +2634,28 @@ async def _standalone_send(
         # Create an instance of MeshtasticAdapter
         adapter = MeshtasticAdapter(pconfig)
 
-        # Connect to establish the interface(s)
-        await adapter.connect()
-
-        # Wait for the connection task to run and register the interface
         success = False
-        error = None
-        for _ in range(20):
-            if adapter.get_interfaces():
-                break
-            await asyncio.sleep(0.1)
-
+        error: str | None = None
         try:
+            # Connect to establish the interface(s). connect() can raise after
+            # flipping _running and spawning the transport-executor thread /
+            # consumer+reconnect tasks, so disconnect() must run even on that
+            # path — otherwise a repeatedly-invoked cron sender leaks threads
+            # and tasks per failed run. disconnect() is idempotent against a
+            # partially-connected adapter.
+            await adapter.connect()
+
+            # Wait for the reconnect task to open an interface. connect() returns
+            # before the daemon transport worker finishes opening (SerialInterface/
+            # TCPInterface constructors block until node info arrives, seconds), so
+            # poll up to _STANDALONE_OPEN_TIMEOUT_SECS instead of racing the worker
+            # with a fixed 2s budget — cron delivery used to fail intermittently.
+            deadline = time.monotonic() + _STANDALONE_OPEN_TIMEOUT_SECS
+            while not adapter.get_interfaces():
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.1)
+
             res = await adapter.send(chat_id=chat_id, content=message, allow_queueing=False)
             success = res.success
             error = res.error
@@ -2903,7 +2667,7 @@ async def _standalone_send(
         else:
             return {"error": error or "Failed to send message"}
     except Exception as e:
-        logger.error(f"Standalone send failure: {e}")
+        logger.error("Standalone send failure: %s", e)
         return {"error": str(e)}
 
 

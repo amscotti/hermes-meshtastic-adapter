@@ -2,6 +2,14 @@
 Meshtastic integration plugin for Hermes Agent.
 
 Registers the platform adapter and the meshtastic toolset.
+
+NOTE: this file is intentionally absent from pyrefly ``project-includes`` (the
+repo dir is hyphenated, an invalid package name, so relative imports resolve to
+``__unknown__``) and from the flat test layout's imports. Its ``register`` is
+CI-executed by ``TestInitShim`` in test_mesh_tools.py, which loads this file
+as ``hermes_plugins.meshtastic`` the way the Hermes plugin loader does — so a
+stale import here (renamed handler/schema in mesh_tools.py) fails the suite
+instead of silently registering nothing at plugin-load time.
 """
 
 from .adapter import register as register_platform

@@ -13,16 +13,20 @@ jobs:
 
     steps:
       - name: Checkout plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Checkout Hermes Agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: NousResearch/hermes-agent
+          # Pinned commit for reproducible CI. Bump monthly or per Hermes
+          # release; hermes-drift.yml runs the same gates against latest main
+          # as an early-warning for drift.
+          ref: 470cf66b039c73bdd2c21d43094ce41a4db74eae
           path: _deps/hermes-agent
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -50,19 +54,30 @@ jobs:
       - name: Unit tests
         env:
           HERMES_AGENT_PATH: ${{ github.workspace }}/_deps/hermes-agent
+        # `unittest discover` (not an explicit file list) so a new test_*.py —
+        # including the arch-gate tests — is picked up automatically and
+        # can never silently drop out of CI. Discovery does not recurse into
+        # _deps/ (no __init__.py), so vendored tests stay out. `set +e`
+        # around `coverage run` lets the HTML report still be generated (and
+        # the coverage upload step still succeed) when a test fails; the exit
+        # code is re-checked after report generation so the step still fails.
         run: |
-          coverage run -m unittest \
-            test_meshtastic.py test_chunking.py test_node_freshness.py \
-            test_transport.py test_ack_state.py
+          set +e
+          coverage run -m unittest discover -s . -p "test_*.py"
+          test_status=$?
           coverage report -m
           coverage html
+          exit $test_status
 
       - name: Enforce coverage floor
         run: coverage report --fail-under=80
 
+      - name: Architecture gates (complexity / layering / extraction)
+        run: python scripts/check_arch_gates.py
+
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-report
           path: htmlcov/

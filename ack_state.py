@@ -26,12 +26,31 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from typing import Protocol
+
     from gateway.platforms.base import SendResult
 
-# ACK bookkeeping was extracted from adapter.py; keep these logs on the
-# "adapter" logger so log routing (and tests that assertLogs("adapter", ...))
-# is unchanged from when the code lived there.
-logger = logging.getLogger("adapter")
+    class LifecycleHost(Protocol):
+        """The minimal adapter surface AckTracker dereferences (R4).
+
+        Duck-typed contract: ``MeshtasticAdapter`` (and test stubs) satisfy it
+        structurally; the tracker never reaches past these members.
+        ``_cross_loop_send_logged`` is read-write — the tracker flips it after
+        the first cross-loop send.
+        """
+
+        loop: asyncio.AbstractEventLoop | None
+        _running: bool
+        _cross_loop_send_logged: bool
+        _lifecycle_lock: threading.Lock
+        _lifecycle_id: int
+        ACK_RECORD_LIMIT: int
+
+        @staticmethod
+        def _normalize_node_id(node_id: Any) -> str | None: ...
+
+
+logger = logging.getLogger(__name__)
 
 
 class AckStatus(StrEnum):
@@ -80,6 +99,14 @@ PERMANENT_NAK_REASONS = frozenset(
     }
 )
 
+# Internal synthetic NAK reason for a packet-id collision (reused id still
+# in-flight when a new send adopted it). Prefixed with ``_`` so it cannot
+# collide with the attacker-controllable wire reason namespace
+# (``routing.errorReason``): a forged wire NAK carrying
+# ``errorReason="DUPLICATE_PACKET_ID"`` must not trigger the internal
+# "don't retry" branch in :func:`is_retriable_failure`.
+INTERNAL_NAK_DUPLICATE_PACKET_ID = "_DUPLICATE_PACKET_ID"
+
 
 def ack_wait_config(metadata: dict[str, Any] | None) -> tuple[bool, float]:
     """Return whether to wait for ACK/NACK responses and for how long."""
@@ -94,7 +121,13 @@ def ack_wait_config(metadata: dict[str, Any] | None) -> tuple[bool, float]:
 
     wait = timeout > 0
     if metadata and "meshtastic_wait_for_ack" in metadata:
-        wait = bool(metadata["meshtastic_wait_for_ack"])
+        # The JSON/config value arrives as a string on tool-call paths; a bare
+        # bool() would treat "false"/"0"/"no" as truthy and force a 30s wait.
+        raw = metadata["meshtastic_wait_for_ack"]
+        if isinstance(raw, bool):
+            wait = raw
+        else:
+            wait = str(raw).strip().lower() in {"1", "true", "yes", "on"}
         if wait and timeout <= 0:
             timeout = 30.0
     return wait, timeout
@@ -126,6 +159,19 @@ def retry_backoff() -> float:
         return 5.0
 
 
+# Stable internal error tokens the adapter produces for transient failures that
+# carry no ACK record (nothing went out): no-interface and the classified
+# transport-failure class. Both the send() retry loop and the drain requeue
+# path treat these as retriable-with-budget.
+TRANSIENT_TRANSPORT_ERRORS = frozenset(
+    {
+        "No active interfaces connected",
+        "No active interfaces connected; cannot wait for ACK",
+        "Meshtastic send failed",
+    }
+)
+
+
 def is_retriable_failure(result: SendResult) -> bool:
     """Decide whether a failed chunk send is worth re-sending.
 
@@ -144,27 +190,136 @@ def is_retriable_failure(result: SendResult) -> bool:
     transmissions) — and every copy actually reached the user.
 
     Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
-    record and are never retried — re-sending can't fix them.
+    record and are never retried — re-sending can't fix them. The exception is
+    the transient no-interface / transport-failure class: nothing went out, so
+    there is no ACK record, and the failure is exactly the flapping-link case
+    retries exist to ride through — those ARE retried within the attempt
+    budget (see ``TRANSIENT_TRANSPORT_ERRORS``).
     """
+    if result.retryable or result.error in TRANSIENT_TRANSPORT_ERRORS:
+        return True
     ack = (result.raw_response or {}).get("ack")
     if not isinstance(ack, dict):
         return False
     status = ack.get("status")
     reason = str(ack.get("error_reason") or "").upper()
-    # Adapter teardown — do not retry into a closed transport.
-    if reason == "DISCONNECTED":
+    # Adapter teardown — do not retry into a closed transport. Only the
+    # internal disconnect sentinel (TIMEOUT status + DISCONNECTED reason)
+    # matches; a forged wire NAK carrying errorReason="DISCONNECTED" has NAK
+    # status (any errorReason classifies as NAK) and falls through to the
+    # normal NAK retry classification below, where it is retriable because
+    # "DISCONNECTED" is not in PERMANENT_NAK_REASONS.
+    if reason == "DISCONNECTED" and status == AckStatus.TIMEOUT:
         return False
     # Adapter-internal synthetic NAK: the packet id collided with an
     # in-flight waiter. The chunk was already transmitted by sendText before
     # the collision was detected, so retrying would duplicate it on-air.
     # Fail safe and leave delivery to the (already sent) original packet.
-    if reason == "DUPLICATE_PACKET_ID":
+    # The internal token is ``_``-prefixed so a forged wire NAK with the
+    # unprefixed ``errorReason="DUPLICATE_PACKET_ID"`` cannot match.
+    if reason == INTERNAL_NAK_DUPLICATE_PACKET_ID:
         return False
     if status == AckStatus.TIMEOUT:
         return True
     if status == AckStatus.NAK:
-        return reason not in PERMANENT_NAK_REASONS
+        return not is_permanent_nak_reason(reason)
     return False
+
+
+def is_permanent_nak_reason(reason: str) -> bool:
+    """Whether a NAK reason is permanent (re-sending the packet cannot help)."""
+    return reason in PERMANENT_NAK_REASONS
+
+
+# A verdict that settles an ACK waiter (never downgraded by a later implicit).
+DEFINITIVE_ACK_STATUSES = (AckStatus.ACK, AckStatus.NAK)
+
+
+def classify_ack_verdict(
+    error_reason: str | None,
+    dest_norm: str | None,
+    ack_from: str | None,
+) -> AckStatus:
+    """Classify a routing ACK as NAK / implicit / real.
+
+    Any ``errorReason`` is a NAK. A relay confirmation (sender ≠ destination,
+    DM dest) is an IMPLICIT_ACK; everything else is a real end-to-end ACK
+    (missing sender counts as real, backward compatible).
+    """
+    if error_reason not in (None, "", "NONE"):
+        return AckStatus.NAK
+    if dest_norm and ack_from and ack_from != dest_norm:
+        return AckStatus.IMPLICIT_ACK
+    return AckStatus.ACK
+
+
+def ack_hop_info(packet: dict) -> tuple[int | None, int | None, int | None]:
+    """Extract ``(hops_away, hop_start, hop_limit)`` from a raw ACK packet."""
+    hop_start = packet.get("hopStart")
+    hop_limit = packet.get("hopLimit")
+    if isinstance(hop_start, int) and isinstance(hop_limit, int):
+        return max(0, hop_start - hop_limit), hop_start, hop_limit
+    return None, hop_start, hop_limit
+
+
+def safe_ack_envelope(packet: dict) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Safely extract ``(decoded, routing)`` dicts from a raw ACK packet.
+
+    Both fields are attacker-influenceable off the radio; non-dict truthy
+    values are defaulted to ``{}`` (mirroring ``_maybe_record_pubsub_ack``).
+    """
+    decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
+    if not isinstance(decoded, dict):
+        decoded = {}
+    routing_raw = decoded.get("routing")
+    routing = routing_raw if isinstance(routing_raw, dict) else {}
+    return decoded, routing
+
+
+def new_pending_record(dest: str, content: str) -> dict[str, Any]:
+    """A fresh PENDING bookkeeping record for an outbound chunk."""
+    return {
+        "dest": dest,
+        "bytes": len(content.encode("utf-8")),
+        "sent_at": time.time(),
+        "status": AckStatus.PENDING,
+    }
+
+
+def collision_record(dest: str, content: str) -> dict[str, Any]:
+    """The definitive NAK record for a reused packet id.
+
+    The chunk was already transmitted before the collision was detected, so
+    retrying would duplicate it on-air; the collision verdict is authoritative
+    for both the old waiter and any new one.
+    """
+    return {
+        "dest": dest,
+        "bytes": len(content.encode("utf-8")),
+        "sent_at": time.time(),
+        "response_at": time.time(),
+        "status": AckStatus.NAK,
+        "error_reason": INTERNAL_NAK_DUPLICATE_PACKET_ID,
+    }
+
+
+def discount_stale_response(
+    existing_response: dict[str, Any] | None,
+    response_token: object | None,
+    send_token: object | None,
+) -> dict[str, Any] | None:
+    """Early-response window: drop a response owned by a different send token.
+
+    A reused numeric packet id from an older send/lifecycle must not resolve
+    the new waiter, so its response is discounted (``None``).
+    """
+    if (
+        send_token is not None
+        and existing_response is not None
+        and response_token is not send_token
+    ):
+        return None
+    return existing_response
 
 
 class AckTracker:
@@ -177,7 +332,7 @@ class AckTracker:
     """
 
     def __init__(self, adapter: Any) -> None:
-        self._adapter = adapter
+        self._adapter: LifecycleHost = adapter
         self._pending_acks: dict[str, dict[str, Any]] = {}
         self._ack_responses: dict[str, dict[str, Any]] = {}
         # Internal generation tags prevent a reused packet id from consuming an
@@ -193,6 +348,12 @@ class AckTracker:
         # concurrent.futures.Future: set_result is thread-safe from any thread
         # (including disconnect on another loop). Awaiters use asyncio.wrap_future.
         self._ack_futures: dict[str, ConcurrentFuture] = {}
+        # pkt_id -> the lifecycle that created the record. ACK history survives
+        # lifecycle turnover by design (_fail_pending_acks keeps it), so the
+        # pubsub upgrade path must not promote a record from a DEAD lifecycle:
+        # a delayed routing packet after reconnect would otherwise mint a
+        # phantom "delivered" verdict in the fresh lifecycle's stores.
+        self._record_lifecycles: dict[str, int] = {}
         self._ack_lock = threading.Lock()
 
     def _maybe_record_pubsub_ack(self, packet: dict) -> bool:
@@ -211,26 +372,63 @@ class AckTracker:
         pkt_id = str(request_id)
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id)
-            # This fallback exists for exactly one case: a DM whose first
-            # response was a relay confirmation recorded as IMPLICIT_ACK. The
-            # meshtastic library removes the onResponse handler after the first
-            # invocation, so the real end-to-end routing ACK that follows arrives
-            # only via pubsub (_on_receive) and must upgrade the record to ACK.
+            # This fallback exists for a DM whose first response was a relay
+            # confirmation recorded as IMPLICIT_ACK. The meshtastic library
+            # removes the onResponse handler after the first invocation, so the
+            # real end-to-end routing ACK that follows arrives only via pubsub
+            # (_on_receive) and must upgrade the record to ACK.
             #
-            # For a still-PENDING waiter the magic-named onAckNak callback is the
-            # authoritative channel for the first response (the library invokes
-            # it for the routing ACK when wantAck + onResponse are set), so the
-            # pubsub path is intentionally *not* used there. Routing a pubsub
-            # ACK for a PENDING waiter would also risk misattributing a reused
-            # packet id. Non-waiting sends already get callback observability.
-            if (
-                record is None
-                or pkt_id not in self._ack_futures
-                or record.get("status") != AckStatus.IMPLICIT_ACK
-            ):
+            # For a still-PENDING waiter the magic-named onAckNak callback is
+            # the authoritative channel for the first response (the library
+            # invokes it for the routing ACK when wantAck + onResponse are
+            # set), so the pubsub path is intentionally *not* used there — the
+            # status check (only IMPLICIT_ACK records upgrade) keeps a PENDING
+            # waiter waiting.
+            #
+            # No live waiter is required: a fire-and-forget DM's relay
+            # confirmation also consumes the one-shot callback, and its real
+            # routing ACK must still upgrade the record for observability. A
+            # reused packet id from an older send is protected by the
+            # send-token check in _record_ack_response (a different owner's
+            # token drops the stale response).
+            if record is None or record.get("status") != AckStatus.IMPLICIT_ACK:
                 return False
+            # Only promote a record created by the CURRENT lifecycle. ACK
+            # records survive reconnect (_fail_pending_acks keeps them), so a
+            # delayed routing packet for an old send would otherwise upgrade a
+            # stale IMPLICIT_ACK into a phantom "delivered" verdict in the
+            # fresh lifecycle's observability stores.
+            if self._record_lifecycles.get(pkt_id) != self._adapter._lifecycle_id:
+                return False
+            # Capture the lifecycle id under the lock so the subsequent
+            # _record_ack_response call (outside the lock) can re-validate
+            # atomically under its combined lifecycle_lock→ack_lock hold.
+            # Without this, lifecycle_id defaults to None inside
+            # _record_ack_response and the staleness re-check is skipped — a
+            # disconnect/reconnect in the window between the check above and
+            # the call below could let a stale upgrade slip through.
+            lifecycle_id = self._adapter._lifecycle_id
             dest = str(record.get("dest") or "")
-        self._record_ack_response(packet, dest, "")
+            send_token = self._ack_tokens.get(pkt_id)
+            # Defense-in-depth (MEDIUM): only upgrade an implicit ACK when the
+            # routing ACK itself arrived directly. On a shared/PSK channel any
+            # node that observed the transmission can forge a routing ACK (our
+            # requestId + the destination's id) to mark delivery confirmed; the
+            # hop envelope is the only per-packet provenance available. An
+            # end-to-end ACK from the destination is expected directly, so a
+            # relayed packet keeps the record at IMPLICIT_ACK — still a
+            # delivered outcome (never a retry), just not an upgraded one.
+            # The hop fields must be present ints: a forged routing ACK that
+            # omits the envelope entirely is treated as direct only when the
+            # fields exist to disprove it. Inherited protocol trust limits
+            # this: a spoofed packet can also fake a 0-hop envelope, so this
+            # is defense-in-depth, not a guarantee.
+            hops, hop_start, hop_limit = ack_hop_info(packet)
+            if not (isinstance(hop_start, int) and isinstance(hop_limit, int) and hops == 0):
+                return False
+        self._record_ack_response(
+            packet, dest, "", send_token=send_token, lifecycle_id=lifecycle_id
+        )
         return True
 
     def _track_pending_ack(
@@ -257,112 +455,38 @@ class AckTracker:
         cross_send_id = 0
         if create_future:
             cf_future = ConcurrentFuture()
-            try:
-                send_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                send_loop = None
-            if (
-                send_loop is not None
-                and self._adapter.loop is not None
-                and send_loop is not self._adapter.loop
-            ):
-                cross_platform_id = id(self._adapter.loop)
-                cross_send_id = id(send_loop)
-                log_cross_loop = True
+            cross_platform_id, cross_send_id, log_cross_loop = self._cross_loop_context()
         with self._ack_lock:
             if log_cross_loop and not self._adapter._cross_loop_send_logged:
                 self._adapter._cross_loop_send_logged = True
             else:
                 log_cross_loop = False
-            existing_response = self._ack_responses.get(pkt_id)
-            if send_token is not None:
-                response_token = self._ack_response_tokens.get(pkt_id)
-                if existing_response is not None and response_token is not send_token:
-                    # Same numeric packet id from an older send/lifecycle.
-                    existing_response = None
+            existing_response = discount_stale_response(
+                self._ack_responses.get(pkt_id),
+                self._ack_response_tokens.get(pkt_id) if send_token is not None else None,
+                send_token,
+            )
 
             active_future = self._ack_futures.get(pkt_id)
             if active_future is not None and not active_future.done():
-                collision = {
-                    "dest": dest,
-                    "bytes": len(content.encode("utf-8")),
-                    "sent_at": time.time(),
-                    "response_at": time.time(),
-                    "status": AckStatus.NAK,
-                    "error_reason": "DUPLICATE_PACKET_ID",
-                }
-                self._ack_futures.pop(pkt_id, None)
-                self._pending_acks[pkt_id] = collision
-                self._ack_responses[pkt_id] = collision
-                self._set_ack_future_result(active_future, dict(collision))
-                if cf_future is not None:
-                    # Poison this reused id so neither old nor new generation
-                    # callbacks can overwrite the definitive collision result.
-                    self._ack_tokens[pkt_id] = object()
-                    self._ack_response_tokens.pop(pkt_id, None)
-                    self._set_ack_future_result(cf_future, dict(collision))
-                    return cf_future
-                # Fire-and-forget collision: the old waiter is terminated, and
-                # the new send's token now owns the id so its real ACK callback
-                # can still update the record (a delayed old-token ACK is
-                # ignored as stale by _record_ack_response).
-                if send_token is not None:
-                    self._ack_tokens[pkt_id] = send_token
-                logger.warning(
-                    "Meshtastic packet id collision with active ACK waiter: packet_id=%s",
-                    pkt_id,
+                return self._handle_active_waiter_collision(
+                    pkt_id, dest, content, active_future, cf_future, send_token
                 )
-                return None
+            if cf_future is not None and self._token_generation_collision(pkt_id, send_token):
+                return self._settle_poisoned_reuse(pkt_id, dest, content, cf_future)
 
-            prior_token = self._ack_tokens.get(pkt_id)
-            if (
-                cf_future is not None
-                and send_token is not None
-                and prior_token is not None
-                and prior_token is not send_token
-            ):
-                # A delayed wire ACK for the older packet would be
-                # indistinguishable from an ACK for this reuse. Fail safe.
-                collision = {
-                    "dest": dest,
-                    "bytes": len(content.encode("utf-8")),
-                    "sent_at": time.time(),
-                    "response_at": time.time(),
-                    "status": AckStatus.NAK,
-                    "error_reason": "DUPLICATE_PACKET_ID",
-                }
-                self._pending_acks[pkt_id] = collision
-                self._ack_responses[pkt_id] = collision
-                self._ack_tokens[pkt_id] = object()
-                self._ack_response_tokens.pop(pkt_id, None)
-                self._set_ack_future_result(cf_future, dict(collision))
-                self._prune_ack_history_locked()
-                return cf_future
-
-            record = existing_response or {
-                "dest": dest,
-                "bytes": len(content.encode("utf-8")),
-                "sent_at": time.time(),
-                "status": AckStatus.PENDING,
-            }
+            record = existing_response or new_pending_record(dest, content)
             if send_token is not None:
                 self._ack_tokens[pkt_id] = send_token
             # sendText can finish after disconnect's ACK sweep. Never register
             # a fresh waiter into a stopped lifecycle; preserve a real ACK/NAK
             # that arrived early, otherwise settle as disconnected now.
-            if (
-                create_future
-                and not self._adapter._running
-                and record.get("status")
-                not in (
-                    AckStatus.ACK,
-                    AckStatus.NAK,
-                )
-            ):
-                record["status"] = AckStatus.TIMEOUT
-                record["error_reason"] = "DISCONNECTED"
-                record["response_at"] = time.time()
+            self._settle_not_running_record(record, create_future)
             self._pending_acks[pkt_id] = record
+            # Stamp the record with the lifecycle that created it so the pubsub
+            # upgrade path (which has no lifecycle_id of its own) can reject a
+            # stale record from a previous lifecycle.
+            self._record_lifecycles[pkt_id] = self._adapter._lifecycle_id
             if cf_future is not None and self._adapter._running:
                 self._ack_futures[pkt_id] = cf_future
             elif cf_future is not None:
@@ -383,6 +507,118 @@ class AckTracker:
         # If a definitive response (real ACK / NAK) already arrived before the
         # waiter was created, resolve immediately. An early *implicit* ACK is not
         # definitive — leave the waiter open so a real ACK (or timeout) decides.
+        self._resolve_early_waiter(cf_future, existing_response)
+        return cf_future
+
+    def _cross_loop_context(self) -> tuple[int, int, bool]:
+        """Detect a send loop different from the platform loop.
+
+        Returns ``(platform_loop_id, send_loop_id, is_cross_loop)``; ACK
+        waiters are concurrent.futures so they settle loop-independently, but
+        the first cross-loop send logs once for diagnosis.
+        """
+        try:
+            send_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return 0, 0, False
+        platform_loop = self._adapter.loop
+        if platform_loop is None or send_loop is platform_loop:
+            return 0, 0, False
+        return id(platform_loop), id(send_loop), True
+
+    def _handle_active_waiter_collision(
+        self,
+        pkt_id: str,
+        dest: str,
+        content: str,
+        active_future: ConcurrentFuture,
+        cf_future: ConcurrentFuture | None,
+        send_token: object | None,
+    ) -> ConcurrentFuture | None:
+        """Settle a packet-id collision against a still-active waiter.
+
+        The old waiter is terminated with the collision verdict. If a new
+        waiter exists the id is poisoned so neither generation's callbacks can
+        overwrite the definitive result; a fire-and-forget send instead re-arms
+        the id with its own token so a delayed old-token ACK is ignored as
+        stale by ``_record_ack_response``.
+        """
+        collision = collision_record(dest, content)
+        self._ack_futures.pop(pkt_id, None)
+        self._pending_acks[pkt_id] = collision
+        self._ack_responses[pkt_id] = collision
+        self._set_ack_future_result(active_future, dict(collision))
+        if cf_future is not None:
+            # Poison this reused id so neither old nor new generation
+            # callbacks can overwrite the definitive collision result.
+            self._ack_tokens[pkt_id] = object()
+            self._ack_response_tokens.pop(pkt_id, None)
+            self._set_ack_future_result(cf_future, dict(collision))
+            return cf_future
+        # Fire-and-forget collision: the old waiter is terminated, and
+        # the new send's token now owns the id so its real ACK callback
+        # can still update the record (a delayed old-token ACK is
+        # ignored as stale by _record_ack_response).
+        if send_token is not None:
+            self._ack_tokens[pkt_id] = send_token
+        logger.warning(
+            "Meshtastic packet id collision with active ACK waiter: packet_id=%s",
+            pkt_id,
+        )
+        return None
+
+    def _token_generation_collision(self, pkt_id: str, send_token: object | None) -> bool:
+        """Whether a reused id still carries an older send's generation token."""
+        prior_token = self._ack_tokens.get(pkt_id)
+        return send_token is not None and prior_token is not None and prior_token is not send_token
+
+    def _settle_poisoned_reuse(
+        self,
+        pkt_id: str,
+        dest: str,
+        content: str,
+        cf_future: ConcurrentFuture,
+    ) -> ConcurrentFuture:
+        """Fail a new waiter whose id was reused from an older send.
+
+        A delayed wire ACK for the older packet would be indistinguishable
+        from an ACK for this reuse, so the id is poisoned for both
+        generations. Fail safe.
+        """
+        collision = collision_record(dest, content)
+        self._pending_acks[pkt_id] = collision
+        self._ack_responses[pkt_id] = collision
+        self._ack_tokens[pkt_id] = object()
+        self._ack_response_tokens.pop(pkt_id, None)
+        self._set_ack_future_result(cf_future, dict(collision))
+        self._prune_ack_history_locked()
+        return cf_future
+
+    def _settle_not_running_record(self, record: dict[str, Any], create_future: bool) -> None:
+        """Mark a fresh waiter as disconnected when the lifecycle is stopped.
+
+        A definitive verdict (ACK/NAK) or TIMEOUT already on the record is
+        preserved. An early ``IMPLICIT_ACK`` (relay confirmation) is rewritten
+        to ``TIMEOUT/DISCONNECTED``: the packet was relayed but the waiter
+        cannot stay open in a stopped lifecycle. The outcome is correct —
+        ``DISCONNECTED`` is non-retriable so a carried packet is not
+        duplicated — at the cost of losing the "relay confirmed" label.
+        """
+        if (
+            create_future
+            and not self._adapter._running
+            and record.get("status") not in DEFINITIVE_ACK_STATUSES
+        ):
+            record["status"] = AckStatus.TIMEOUT
+            record["error_reason"] = "DISCONNECTED"
+            record["response_at"] = time.time()
+
+    def _resolve_early_waiter(
+        self,
+        cf_future: ConcurrentFuture | None,
+        existing_response: dict[str, Any] | None,
+    ) -> None:
+        """Resolve a newly created waiter from an early definitive response."""
         if (
             cf_future is not None
             and existing_response
@@ -391,14 +627,18 @@ class AckTracker:
         ):
             self._set_ack_future_result(cf_future, existing_response)
 
-        return cf_future
-
     def _fail_pending_acks(self, reason: str = "DISCONNECTED") -> None:
         """Resolve outstanding ACK waiters (e.g. on disconnect).
 
         ``concurrent.futures.Future.set_result`` is thread-safe, so waiters on
         any agent-session loop unblock without requiring that loop to be running
         for the *set* (only for the awaiter to resume).
+
+        ``_pending_acks`` / ``_ack_responses`` / ``_ack_tokens`` are
+        intentionally NOT cleared here: ACK history (and its packet-id poison
+        markers) survives lifecycle turnover, so a reused packet id after a
+        reconnect is still rejected via ``_token_generation_collision``. History
+        is bounded by ``_prune_ack_history_locked``.
         """
         to_resolve: list[tuple[ConcurrentFuture, dict[str, Any]]] = []
         with self._ack_lock:
@@ -417,7 +657,12 @@ class AckTracker:
                 elif record.get("status", AckStatus.PENDING) not in (
                     AckStatus.ACK,
                     AckStatus.NAK,
+                    AckStatus.TIMEOUT,
                 ):
+                    # TIMEOUT is preserved: a waiter already stamped by
+                    # _wait_for_ack within the timeout->finally gap keeps its
+                    # original reason (e.g. ACK_TIMEOUT) instead of being
+                    # rewritten to DISCONNECTED.
                     record["status"] = AckStatus.TIMEOUT
                     record["error_reason"] = reason
                     record["response_at"] = time.time()
@@ -450,15 +695,23 @@ class AckTracker:
             for key in evictable[:excess]:
                 store.pop(key, None)
         retained = set(self._pending_acks) | set(self._ack_responses) | set(self._ack_futures)
-        for tokens in (self._ack_tokens, self._ack_response_tokens):
+        for tokens in (self._ack_tokens, self._ack_response_tokens, self._record_lifecycles):
             for key in list(tokens):
                 if key not in retained:
                     tokens.pop(key, None)
 
     def _make_ack_callback(self, dest: str, content: str):
-        """Build a Meshtastic onResponse callback that receives ACK/NACK packets."""
+        """Build a Meshtastic onResponse callback that receives ACK/NACK packets.
 
-        return self._make_ack_callback_for_send(dest, content, None)
+        Tokenless compat shim. Synthesizes the current lifecycle id at
+        construction time so ``_record_ack_response``'s staleness guard always
+        applies: a callback that fires after disconnect/reconnect is dropped
+        rather than written into a fresh lifecycle's ACK stores.
+        """
+
+        return self._make_ack_callback_for_send(
+            dest, content, None, lifecycle_id=self._adapter._lifecycle_id
+        )
 
     def _make_ack_callback_for_send(
         self,
@@ -502,8 +755,7 @@ class AckTracker:
         ACK. When scheduling the waiter, a **snapshot** of the record is passed
         so concurrent updates cannot mutate the dict the future will resolve to.
         """
-        decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
-        routing = decoded.get("routing", {}) or {}
+        decoded, routing = safe_ack_envelope(packet)
         request_id = decoded.get("requestId")
         if request_id is None:
             request_id = decoded.get("request_id")
@@ -517,44 +769,24 @@ class AckTracker:
             ack_from_raw = packet.get("fromId") or packet.get("from")
         ack_from = self._adapter._normalize_node_id(ack_from_raw)
         dest_norm = self._adapter._normalize_node_id(dest) if dest.startswith("!") else None
-
-        if error_reason not in (None, "", "NONE"):
-            status = AckStatus.NAK
-        elif dest_norm and ack_from and ack_from != dest_norm:
-            status = AckStatus.IMPLICIT_ACK
-        else:
-            status = AckStatus.ACK
+        status = classify_ack_verdict(error_reason, dest_norm, ack_from)
 
         # Diagnostic dump of the raw ACK packet, so the real-vs-implicit verdict
         # can be checked against what the radio actually saw: who sent it, how
         # far away, signal, and whether it came via a relay / MQTT.
-        if isinstance(packet, dict):
-            hop_start = packet.get("hopStart")
-            hop_limit = packet.get("hopLimit")
-            hops_away = (
-                hop_start - hop_limit
-                if isinstance(hop_start, int) and isinstance(hop_limit, int)
-                else None
+        self._log_ack_packet_dump(
+            packet, pkt_id, status, ack_from, ack_from_raw, dest, dest_norm, error_reason
+        )
+
+        # An ACK with no request id cannot be tied to an outbound packet. Drop
+        # it (logging only) rather than persisting an orphan "unknown" record
+        # that a forged id-less routing packet could inflate.
+        if pkt_id == "unknown":
+            logger.debug(
+                "Ignoring ACK response without a request id: packet_id=%s",
+                packet.get("id") if isinstance(packet, dict) else None,
             )
-            logger.info(
-                "Meshtastic ACK packet: req=%s verdict=%s from=%s (raw=%r) dest=%s (norm=%s) "
-                "to=%s hops=%s (start=%s limit=%s) snr=%s rssi=%s relay=%s mqtt=%s error=%s",
-                pkt_id,
-                status,
-                ack_from,
-                ack_from_raw,
-                dest,
-                dest_norm,
-                packet.get("toId") or packet.get("to"),
-                hops_away,
-                hop_start,
-                hop_limit,
-                packet.get("rxSnr"),
-                packet.get("rxRssi"),
-                packet.get("relayNode"),
-                packet.get("viaMqtt"),
-                error_reason,
-            )
+            return
 
         # Hold lifecycle ownership through the ACK-store commit. This closes the
         # check-to-commit window where disconnect/reconnect could otherwise
@@ -562,71 +794,24 @@ class AckTracker:
         with ExitStack() as stack:
             if lifecycle_id is not None:
                 stack.enter_context(self._adapter._lifecycle_lock)
-                if lifecycle_id != self._adapter._lifecycle_id or not self._adapter._running:
+                if self._lifecycle_is_stale(lifecycle_id):
                     logger.debug(
                         "Ignoring ACK callback from stale lifecycle: packet_id=%s",
                         pkt_id,
                     )
                     return
             stack.enter_context(self._ack_lock)
-            if send_token is not None:
-                inflight_lifecycle = self._ack_inflight_tokens.get(send_token)
-                if inflight_lifecycle is not None:
-                    if lifecycle_id is not None and inflight_lifecycle != lifecycle_id:
-                        return
-                    self._early_ack_packets[send_token] = (
-                        packet,
-                        dest,
-                        content,
-                        inflight_lifecycle,
-                    )
-                    return
-                active_token = self._ack_tokens.get(pkt_id)
-                # Two-level stale defense: the lifecycle_id check above already
-                # rejects callbacks from dead lifecycles; this token check is
-                # the second level, rejecting same-lifecycle packet-id reuse
-                # where an older send's id is still tracked. A missing token
-                # entry is only possible after lifecycle turnover, which the
-                # first level already caught — so no entry means accept.
-                if active_token is not None and active_token is not send_token:
-                    logger.debug("Ignoring stale ACK callback for packet_id=%s", pkt_id)
-                    return
-                self._ack_response_tokens[pkt_id] = send_token
-            record = self._pending_acks.get(pkt_id, {})
-            prior = record.get("status")
-            # Never let a weaker/later relay confirmation overwrite a definitive
-            # real ACK or NAK already stored on the shared record.
-            if status == AckStatus.IMPLICIT_ACK and prior in (
-                AckStatus.ACK,
-                AckStatus.NAK,
+            if send_token is not None and self._stage_ack_via_send_token(
+                pkt_id, packet, dest, content, send_token, lifecycle_id
             ):
-                record["response_at"] = time.time()
-                applied_status = prior
-                snapshot = None  # no waiter resolution for a discarded implicit
-            else:
-                record.update(
-                    {
-                        "dest": record.get("dest", dest),
-                        "bytes": record.get("bytes", len(content.encode("utf-8"))),
-                        "status": status,
-                        "error_reason": error_reason,
-                        "ack_from": ack_from,
-                        "response_at": time.time(),
-                        "response": {
-                            "packet_id": (packet.get("id") if isinstance(packet, dict) else None),
-                            "request_id": request_id,
-                            "from_id": ack_from,
-                            "to_id": packet.get("toId") if isinstance(packet, dict) else None,
-                            "routing": routing,
-                        },
-                    }
-                )
-                applied_status = status
-                # Snapshot so a concurrent update cannot mutate the future result.
-                snapshot = dict(record)
+                return
+            record = self._pending_acks.get(pkt_id, {})
+            applied_status, snapshot = self._merge_ack_into_record(
+                record, packet, dest, content, status, error_reason, ack_from, request_id, routing
+            )
             self._pending_acks[pkt_id] = record
             self._ack_responses[pkt_id] = record
-            if applied_status in (AckStatus.ACK, AckStatus.NAK):
+            if applied_status in DEFINITIVE_ACK_STATUSES:
                 future = self._ack_futures.pop(pkt_id, None)
             else:
                 future = self._ack_futures.get(pkt_id)
@@ -638,12 +823,160 @@ class AckTracker:
         # concurrent.futures.Future.set_result is thread-safe (pubsub thread OK).
         if (
             snapshot is not None
-            and applied_status in (AckStatus.ACK, AckStatus.NAK)
+            and applied_status in DEFINITIVE_ACK_STATUSES
             and future
             and not future.done()
         ):
             self._set_ack_future_result(future, snapshot)
 
+        self._log_ack_outcome(status, applied_status, pkt_id, dest, error_reason, ack_from, packet)
+
+    def _lifecycle_is_stale(self, lifecycle_id: int) -> bool:
+        """Whether a callback's lifecycle no longer owns the ACK stores."""
+        return lifecycle_id != self._adapter._lifecycle_id or not self._adapter._running
+
+    def _log_ack_packet_dump(
+        self,
+        packet: dict,
+        pkt_id: str,
+        status: AckStatus,
+        ack_from: str | None,
+        ack_from_raw: Any,
+        dest: str,
+        dest_norm: str | None,
+        error_reason: Any,
+    ) -> None:
+        if not isinstance(packet, dict):
+            return
+        hops_away, hop_start, hop_limit = ack_hop_info(packet)
+        logger.info(
+            "Meshtastic ACK packet: req=%s verdict=%s from=%s (raw=%r) dest=%s (norm=%s) "
+            "to=%s hops=%s (start=%s limit=%s) snr=%s rssi=%s relay=%s mqtt=%s error=%s",
+            pkt_id,
+            status,
+            ack_from,
+            ack_from_raw,
+            dest,
+            dest_norm,
+            packet.get("toId") or packet.get("to"),
+            hops_away,
+            hop_start,
+            hop_limit,
+            packet.get("rxSnr"),
+            packet.get("rxRssi"),
+            packet.get("relayNode"),
+            packet.get("viaMqtt"),
+            error_reason,
+        )
+
+    def _stage_ack_via_send_token(
+        self,
+        pkt_id: str,
+        packet: dict,
+        dest: str,
+        content: str,
+        send_token: object,
+        lifecycle_id: int | None,
+    ) -> bool:
+        """Early-ACK window: route a response whose send is still in flight.
+
+        ``sendText`` can invoke ``onAckNak`` before returning the packet id;
+        those responses are staged by send generation (``_early_ack_packets``)
+        until ``_track_pending_ack`` installs the packet-id token, and
+        stale-lifecycle callbacks stay out of shared ACK history. Returns True
+        when the response was consumed (staged or dropped) without recording.
+        """
+        inflight_lifecycle = self._ack_inflight_tokens.get(send_token)
+        if inflight_lifecycle is not None:
+            if lifecycle_id is not None and inflight_lifecycle != lifecycle_id:
+                return True
+            self._early_ack_packets[send_token] = (packet, dest, content, inflight_lifecycle)
+            return True
+        active_token = self._ack_tokens.get(pkt_id)
+        # Two-level stale defense: the lifecycle_id check above already rejects
+        # callbacks from dead lifecycles; this token check is the second level,
+        # rejecting same-lifecycle packet-id reuse where an older send's id is
+        # still tracked. A missing token entry is only possible after lifecycle
+        # turnover, which the first level already caught — so no entry means
+        # accept.
+        if active_token is not None and active_token is not send_token:
+            logger.debug("Ignoring stale ACK callback for packet_id=%s", pkt_id)
+            return True
+        self._ack_response_tokens[pkt_id] = send_token
+        return False
+
+    def _merge_ack_into_record(
+        self,
+        record: dict[str, Any],
+        packet: dict,
+        dest: str,
+        content: str,
+        status: AckStatus,
+        error_reason: Any,
+        ack_from: str | None,
+        request_id: Any,
+        routing: Any,
+    ) -> tuple[AckStatus, dict[str, Any] | None]:
+        """Apply a verdict to the shared record; return ``(applied, snapshot)``.
+
+        Never let a weaker/later relay confirmation overwrite a definitive
+        real ACK or NAK already stored on the shared record — the snapshot is
+        passed to the waiter so concurrent updates cannot mutate the dict the
+        future resolves to.
+        """
+        prior = record.get("status")
+        if status == AckStatus.IMPLICIT_ACK and prior in DEFINITIVE_ACK_STATUSES:
+            record["response_at"] = time.time()
+            return prior, None
+        prior_reason = str(record.get("error_reason") or "").upper()
+        if (
+            status in DEFINITIVE_ACK_STATUSES
+            and prior in DEFINITIVE_ACK_STATUSES
+            and prior_reason != INTERNAL_NAK_DUPLICATE_PACKET_ID
+        ):
+            # First-definitive-wins: a late second wire verdict for the same
+            # pkt_id (e.g. NAK after ACK, or vice versa) must not overwrite
+            # the record. The first definitive already resolved and popped
+            # the waiter, so this only protects get_ack_status correctness —
+            # the docstring's "definitive results are never downgraded by a
+            # later" claim applies to a second definitive too, not just
+            # implicit ACKs.
+            #
+            # An internal collision NAK (_DUPLICATE_PACKET_ID) is exempt: it
+            # is a bookkeeping sentinel, not a radio verdict. In the
+            # fire-and-forget collision path the new token owner's real ACK
+            # must still be able to upgrade the record.
+            record["response_at"] = time.time()
+            return prior, None
+        record.update(
+            {
+                "dest": record.get("dest", dest),
+                "bytes": record.get("bytes", len(content.encode("utf-8"))),
+                "status": status,
+                "error_reason": error_reason,
+                "ack_from": ack_from,
+                "response_at": time.time(),
+                "response": {
+                    "packet_id": (packet.get("id") if isinstance(packet, dict) else None),
+                    "request_id": request_id,
+                    "from_id": ack_from,
+                    "to_id": packet.get("toId") if isinstance(packet, dict) else None,
+                    "routing": routing,
+                },
+            }
+        )
+        return status, dict(record)
+
+    def _log_ack_outcome(
+        self,
+        status: AckStatus,
+        applied_status: AckStatus,
+        pkt_id: str,
+        dest: str,
+        error_reason: Any,
+        ack_from: str | None,
+        packet: dict,
+    ) -> None:
         if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
         elif status == AckStatus.IMPLICIT_ACK and applied_status == AckStatus.IMPLICIT_ACK:
@@ -718,7 +1051,10 @@ class AckTracker:
                 timeout,
                 record.get("status"),
             )
-            return record
+            # Snapshot, not the live shared record: a late ACK/NAK on the
+            # pubsub thread between this stamp and the caller's read of the
+            # return value must not flip the verdict _send_immediate reports.
+            return dict(record)
         finally:
             with self._ack_lock:
                 if self._ack_futures.get(pkt_id) is future:

@@ -1,8 +1,8 @@
-
-
 # Adaptador Hermes Meshtastic
 
-`hermes-meshtastic-adapter` es un complemento de la plataforma Hermes Agent que conecta Hermes a una malla LoRa Meshtastic. Recibe mensajes de texto sin formato de los nodos de la malla, los reenvía a las sesiones de Hermes y envía las respuestas de vuelta por LoRa como mensajes directos o transmisiones de canal.
+**Idiomas:** [English](README.md) · [Español](README.es-ES.md) · [Français](README.fr-FR.md)
+
+`hermes-meshtastic-adapter` es un complemento de plataforma de Hermes Agent que conecta Hermes a una malla LoRa Meshtastic. Recibe mensajes de texto plano de los nodos de la malla, los reenvía a las sesiones de Hermes y envía las respuestas de vuelta por LoRa como mensajes directos o transmisiones de canal.
 
 <p align="center">
   <img src="assets/demo-meshtastic-chat.jpg" alt="Chatting with the Hermes agent from the Meshtastic phone app, with replies split into numbered chunks and per-message SNR/RSSI" width="300">
@@ -68,6 +68,14 @@ hermes plugins enable meshtastic-platform
 
 Reinicia la puerta de enlace de Hermes después de cambiar archivos de complemento o variables de entorno.
 
+### Instalación y actualizaciones del complemento
+
+El campo `version` de `plugin.yaml` es solo informativo: `hermes plugins update` hace un `git pull`, así que `main` es el canal de actualización. `optional_env` no se muestra en `hermes config` para complementos instalados por el usuario; configura las variables de entorno vía `.env` / config. Con la instalación por symlink usada aquí, actualiza por el nombre del directorio: `hermes plugins update meshtastic` (no `meshtastic-platform`).
+
+## Desarrollo
+
+Colaboradores: [`docs/DEVELOPING.md`](docs/DEVELOPING.md) describe el flujo de trabajo — configuración del `.venv` del repositorio, ejecución de la suite de pruebas y las puertas (format/lint/types/coverage más las puertas de arquitectura ligeras: complexity / layering / extraction), la prueba de humo con interfaz simulada y una lista de verificación de hardware. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) mapea los módulos, los flujos de datos y las **reglas anti–clase dios para PRs asistidos por IA**. Lee ambos antes de editar código.
+
 ## Configuración
 
 Copia la plantilla incluida y edítala para tu nodo y malla:
@@ -100,12 +108,16 @@ Variables de entorno:
 | `MESHTASTIC_ALLOW_ALL_USERS` | No | `false` | Si es true, cualquier nodo de la malla puede comunicarse con Hermes. Úsalo con precaución. |
 | `MESHTASTIC_ALLOW_CHANNELS` | No | `false` | Si es true, el agente también responde a mensajes de **canal/transmisión** (respondiendo en el canal compartido). Desactivado por defecto para que el agente solo responda a mensajes directos y no sature el tiempo de aire de un canal público. |
 | `MESHTASTIC_HOME_CHANNEL` | No | Vacío | Destino predeterminado/cron, como `meshtastic:!da1b1613` o `meshtastic:channel:0`. Un ID de nodo sin prefijo (`!da1b1613` o `da1b1613`) / valor `channel:N` se antepone automáticamente con `meshtastic:` y una advertencia. |
-| `MESHTASTIC_CHUNK_BYTES` | No | `170` | Máx. bytes UTF-8 por fragmento saliente LoRa. `170` es conservador para fiabilidad multi-salto y deja margen para sobrecarga de DM cifrado (PKI); el límite máximo de carga útil del protocolo (y el tope para este valor) es `233`. |
+| `MESHTASTIC_CHUNK_BYTES` | No | `170` | Máx. bytes UTF-8 por fragmento saliente LoRa. `170` es conservador para fiabilidad multi-salto y deja margen para sobrecarga de DM cifrado (PKI); el techo de carga útil del protocolo (y el tope de este valor) es `233`. |
 | `MESHTASTIC_CHUNK_DELAY` | No | `4.0` | Retraso en segundos entre envíos de fragmentos. |
 | `MESHTASTIC_ACK_TIMEOUT` | No | `0` | Segundos para esperar ACK/NACK por fragmento saliente. `0` es sin bloqueo. Establece `30` para fallar envíos ante NAK o timeout. |
 | `MESHTASTIC_SEND_RETRIES` | No | `0` | Intentos de entrega adicionales para fragmentos de **mensaje directo** no ACK. `> 0` implica esperar el ACK; los fallos transitorios (timeout, no-route) se reenvían, los permanentes (p. ej. `TOO_LARGE`) no. Las transmisiones nunca se reintentan. |
 | `MESHTASTIC_RETRY_BACKOFF` | No | `5.0` | Segundos a esperar entre reintentos de entrega. |
-| `MESHTASTIC_TELEMETRY_RETENTION_DAYS` | No | `30` | Edad (días) en que las filas de telemetría/posición/señal persistedas se purgan de SQLite. `0` desactiva la purga. La purga se ejecuta como máximo cada hora, de forma diferida en escrituras. |
+| `MESHTASTIC_TELEMETRY_RETENTION_DAYS` | No | `30` | Edad (días) a la que las filas de telemetría/posición/señal persistidas se purgan de SQLite. `0` desactiva la purga. La purga se ejecuta como máximo cada hora, de forma diferida en escrituras. |
+| `MESHTASTIC_TELEMETRY_MAX_ROWS` | No | `100000` | Techo duro de filas **por tabla SQLite** (`telemetry` / `positions` / `signal_quality`), las más nuevas primero — no por nodo. Bajo una inundación, un nodo muy hablador puede desplazar a otros. `0` desactiva el techo. La retención por edad (`MESHTASTIC_TELEMETRY_RETENTION_DAYS`) sigue aplicando. |
+| `MESHTASTIC_OPEN_TIMEOUT` | No | `20` | Segundos para acotar la espera de apertura de interfaz en la ruta de éxito antes de tratarla como fallo de conexión (el constructor sigue ejecutándose en el worker daemon). `0` desactiva el límite (espera indefinida). Relevante en serial/WiFi lentos donde el descubrimiento puede colgarse. |
+| `MESHTASTIC_OPEN_CANCEL_TIMEOUT` | No | `5` | Segundos a esperar a que se complete una apertura de interfaz cancelada en vuelo. `0` abandona la apertura cancelada de inmediato. |
+| `MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT` | No | `5` | Segundos a esperar a que el hilo del worker de transporte drene trabajos pendientes de cierre/liveness durante la desconexión. `0` no espera. |
 | `MESHTASTIC_MOCK` | No | `false` | `true` ejecuta el adaptador contra la interfaz simulada (ejecución en seco, sin tráfico real de radio). Solo relevante cuando falta la biblioteca meshtastic; de lo contrario, el adaptador siempre abre la interfaz serial/TCP real. |
 | `MESHTASTIC_AUTOINSTALL` | No | `true` | Cuando falta la biblioteca meshtastic, el adaptador ejecuta `pip install -r requirements.txt` en el entorno Python de la puerta de enlace una vez por proceso (las actualizaciones de Hermes pueden borrar dependencias de complementos). Establece `0`/`false` para desactivarlo y fallar con instrucciones de instalación en su lugar. |
 
@@ -120,7 +132,7 @@ MESHTASTIC_TCP_PORT=4403
 
 Cuando se establece `MESHTASTIC_TCP_HOST` tiene prioridad y se omite el descubrimiento serial: el adaptador usa un solo transporte a la vez. Habilita WiFi/Ethernet y la API de red en el nodo a través de la aplicación Meshtastic primero. La reconexión con backoff exponencial y la cola de salida funcionan igual que por serial.
 
-## IDs de Chat
+## IDs de chat
 
 Los mensajes directos usan IDs de chat con alcance de nodo:
 
@@ -145,28 +157,55 @@ El complemento registra estas herramientas de Hermes:
 - `mesh_send_dm`: envía un mensaje directo a un nodo.
 - `mesh_send_broadcast`: envía una transmisión de canal.
 - `mesh_telemetry`: lee telemetría reciente de un nodo.
-- `mesh_telemetry_history`: consulta telemetría, posición o historial de señal persistedo.
+- `mesh_telemetry_history`: consulta telemetría, posición o historial de señal persistido.
+- `mesh_request_telemetry`: pide a un nodo que envíe telemetría fresca (solicitud solicitada).
+- `mesh_request_position`: pide a un nodo su posición actual (solicitud solicitada).
+- `mesh_traceroute`: traza la ruta hacia un nodo, con SNR por salto en ambos sentidos (solicitud solicitada).
+- `mesh_pause`: pausa la radio — libera la conexión del nodo de la puerta de enlace para que la app del teléfono o la UI web puedan usarlo (las pausas temporizadas se reanudan solas; tope `PAUSE_MAX_MINUTES`, 12 h).
+- `mesh_resume`: reanuda la radio después de `mesh_pause`.
 
-### Frescura del Nodo
+### Frescura del nodo
 
 La biblioteca meshtastic solo actualiza `lastHeard` de un nodo a partir de paquetes periódicos **NodeInfo**, por lo que se retrasa respecto a las transmisiones reales del nodo. El adaptador, por tanto, rastrea una superposición en vivo desde el flujo de paquetes: en cada paquete recibido actualiza el `last_heard` del emisor (desde el `rxTime` del paquete) y, para paquetes directos (0 saltos), su `snr`/`rssi` — reflejando al cliente oficial de Meshtastic. Esto se hace para **cada** nodo escuchado (incluidos los que no están en la lista de permitidos, para que puedas vigilar un nodo que no puentees), y `mesh_list_nodes` / `mesh_node_info` / `mesh_signal_quality` reportan el valor más reciente entre el de la biblioteca y esta superposición. `mesh_node_info` también devuelve `last_heard` / `last_heard_epoch`.
 
-## Semántica de Entrega
+## Progreso de herramientas (avisos cortos, no volcados de pasos)
+
+Cuando el agente usa herramientas (búsqueda web, terminal, …), Hermes puede emitir líneas de **progreso de herramienta**. En plataformas con edición de mensajes esas líneas se actualizan en el mismo sitio; en LoRa se convertirían en tráfico de radio permanente.
+
+Este complemento mantiene bajo el tiempo de aire de la malla:
+
+- El progreso es un **aviso corto con emoji** por herramienta (p. ej. `🔍 Searching the web`), no la consulta completa, la URL ni el comando de shell.
+- Las “ediciones” posteriores de progreso **no** se retransmiten por radio.
+- La respuesta final sigue entregándose completa (fragmentada como de costumbre).
+
+Configuración de visualización recomendada de Hermes (`~/.hermes/config.yaml`):
+
+```yaml
+display:
+  platforms:
+    meshtastic:
+      tool_progress: new    # un aviso por herramienta
+      streaming: false
+```
+
+Las solicitudes de **aprobación** de comandos peligrosos son independientes del chrome de progreso de herramientas y aún pueden aparecer como mensajes multilínea más largos; responde con `/approve` (o el flujo de aprobación configurado) cuando se te pida.
+
+## Semántica de entrega
 
 La entrega de Meshtastic y LoRa es de mejor esfuerzo.
 
 - El adaptador solicita ACKs con `wantAck=True` para paquetes salientes.
-- El adaptador registra una devolución de llamada `onAckNak` y registra ACK/NACK por ID de paquete cuando Meshtastic los proporciona.
-- El adaptador distingue un ACK **real** de extremo a extremo (enviado por el destino mismo) de un ACK **implícito** retransmitido por otro nodo (el paquete alcanzó la malla pero el destino no confirmó recepción) — reflejando RECEIVED vs DELIVERED del cliente oficial. Solo un ACK real cuenta como entregado; un ACK solo implícito se trata como no confirmado (y, con reintentos activados, se reenvía).
+- El adaptador registra una devolución de llamada `onAckNak` y registra/loguea ACK/NACK por ID de paquete cuando Meshtastic los proporciona.
+- El adaptador distingue un ACK **real** de extremo a extremo (enviado por el destino mismo) de un ACK **implícito** retransmitido por otro nodo (el paquete alcanzó la malla pero el destino no confirmó recepción) — reflejando RECEIVED vs DELIVERED del cliente oficial. Tanto un ACK real como un ACK solo implícito cuentan como **entregados** (`send_path.classify_ack_outcome`); un ACK implícito **nunca** se reintenta — la malla ya transportó el paquete, así que no hay evidencia de no entrega. El precio de mantener abierta la ventana de mejora a ACK real es que una respuesta solo implícita agota el timeout de ACK completo antes de que el envío regrese.
 - Por defecto, los envíos son sin bloqueo: que `sendText()` devuelva éxito significa que la radio local aceptó el paquete, y las devoluciones de llamada ACK/NACK posteriores se registran si llegan.
 - Establece `MESHTASTIC_ACK_TIMEOUT=30` o pasa metadatos de envío `meshtastic_ack_timeout` para esperar ACK/NACK por fragmento. En este modo, los NAK y timeouts hacen que `SendResult.success` sea falso.
-- Los resultados ACK se exponen en `SendResult.raw_response["chunks"][i]["ack"]` para envíos esperados, y pueden inspeccionarse luego en código con `adapter.get_ack_status(packet_id)`.
+- Los resultados ACK se exponen en `SendResult.raw_response["chunks"][i]["ack"]` para envíos con espera, y pueden inspeccionarse luego en código con `adapter.get_ack_status(packet_id)`.
 - Establece `MESHTASTIC_SEND_RETRIES=3` para reenviar automáticamente fragmentos de **mensaje directo** no ACK. Un reintento solo se activa ante un fallo transitorio (timeout ACK, no-route, max-retransmit); los NAK permanentes (`TOO_LARGE`, `NO_CHANNEL`, errores de auth/PKI) no se reintentan, y las transmisiones nunca se reintentan (sin ACK por destinatario). Cada reintento espera `MESHTASTIC_RETRY_BACKOFF` segundos; el conteo de intentos por fragmento se expone en `SendResult.raw_response["chunks"][i]["attempts"]`. Nota: si un mensaje se entregó realmente pero su ACK se perdió, un reintento envía un duplicado.
-- Las respuestas largas se dividen y ritman, pero cualquier fragmento aún puede ser descartado por la malla.
+- Las respuestas largas se dividen y se ritman, pero cualquier fragmento aún puede ser descartado por la malla. Un fallo permanente de fragmento **aborta el resto de la secuencia** tanto en DM como en transmisiones (`SendResult.success` es `false`; los IDs de paquetes ya enviados se conservan para diagnóstico). Eso evita inundar el canal compartido tras un error duro. El contenido vacío o solo espacios en blanco falla el envío en lugar de reportar un falso éxito.
 
-Incluso con la espera de ACK activada, la entrega sigue siendo de mejor esfuerzo porque el comportamiento de ACK depende de la calidad de la ruta, el comportamiento del firmware del nodo y si el destino está despierto.
+Incluso con la espera de ACK activada, la entrega sigue siendo de mejor esfuerzo porque el comportamiento de ACK depende de la calidad de la ruta, el firmware del nodo y si el destino está despierto.
 
-## Entrega Cron
+## Entrega cron
 
 Establece `MESHTASTIC_HOME_CHANNEL` para permitir que los trabajos cron de Hermes entreguen salida a través de Meshtastic.
 
@@ -179,7 +218,7 @@ MESHTASTIC_HOME_CHANNEL=meshtastic:channel:0
 
 El emisor cron independiente crea una conexión de adaptador de corta vida cuando es necesario y desactiva la cola para que los fallos cron sean visibles. Una mejora futura debería preferir reutilizar el adaptador de puerta de enlace ya conectado cuando esté disponible.
 
-## Energía y Suspensión
+## Energía y suspensión
 
 El complemento no modifica la configuración de energía de Meshtastic ni fuerza a los nodos remotos a permanecer despiertos.
 
@@ -198,7 +237,7 @@ Lo que no hace:
 
 Para una puerta de enlace/estación base, configura el comportamiento de energía en el nodo mismo a través de los ajustes de Meshtastic.
 
-## Notas de Seguridad
+## Notas de seguridad
 
 - No habilites `MESHTASTIC_ALLOW_ALL_USERS=true` a menos que entiendas el riesgo.
 - Prefiere listas de permitidos por nodo y mensajes directos.
@@ -207,7 +246,7 @@ Para una puerta de enlace/estación base, configura el comportamiento de energí
 - Los mensajes de malla pueden ser interceptados dependiendo de la configuración del canal y el intercambio de claves.
 - No expongas claves de canal o claves privadas a los prompts, registros o herramientas de Hermes.
 
-## Solución de Problemas
+## Solución de problemas
 
 ### El complemento usa una conexión serial simulada (mock)
 
@@ -244,54 +283,7 @@ El nodo destino puede no haber inicializado los metadatos de clave pública. Emp
 
 Los nodos en suspensión o ahorro de energía pueden no recibir mensajes inmediatamente. Configura el comportamiento de energía del dispositivo en Meshtastic.
 
-## Desarrollo
-
-Las herramientas de desarrollo están en el `.venv` del repositorio (gestionado por uv); usa `.venv/bin/python` para los comandos a continuación. El venv de Hermes en `~/.hermes/hermes-agent/venv` **no** incluye ruff/pyrefly/coverage.
-
-```bash
-uv sync   # o: uv venv && uv pip install -r requirements.txt -r requirements-dev.txt
-```
-
-Ejecuta el conjunto completo de pruebas (cinco módulos de prueba, serial simulado + SQLite temporal):
-
-```bash
-.venv/bin/python -m unittest \
-  test_meshtastic.py test_chunking.py test_node_freshness.py \
-  test_transport.py test_ack_state.py
-```
-
-Ejecuta formateo, linting y comprobaciones de tipos:
-
-```bash
-.venv/bin/python -m ruff format .
-.venv/bin/python -m ruff check .
-.venv/bin/python -m pyrefly check \
-  --python-interpreter-path .venv/bin/python \
-  --search-path ~/.hermes/hermes-agent --min-severity warn
-```
-
-Las solicitudes de extracción se verifican con GitHub Actions para formateo Ruff, linting Ruff, comprobación de tipos Pyrefly y pruebas unitarias con un umbral de cobertura del 80%.
-
-### Estructura del repositorio
-
-Módulos planos, sin anidamiento de paquetes (el complemento se carga en Hermes tanto como paquete como archivos planos):
-
-| Archivo | Responsabilidad |
-| --- | --- |
-| `adapter.py` | `MeshtasticAdapter` — orquestador: ciclo de vida, puente entrada→Hermes, ruta de salida `send()`, ganchos de política de Hermes. |
-| `ack_state.py` | `AckTracker` — máquina de estados ACK/NACK (ACK reales vs implícitos, esperas, reintentos). |
-| `transport.py` | Ejecutor de transporte daemon, resolución de destino serial/TCP, construcción de interfaz, importaciones diferidas `meshtastic`/`pubsub`. |
-| `chunking.py` | Fragmentación de mensajes por bytes UTF-8 (prefijos `[i/n]`, techo de 233 bytes). |
-| `node_freshness.py` | Superposición en vivo por nodo de `last_heard`/`snr`/`rssi`. |
-| `mock_interface.py` | Interfaz/nodo simulado de respaldo cuando no hay hardware o dependencias. |
-| `mesh_tools.py` | Los siete manejadores de herramientas `mesh_*` (cargados como módulo `meshtastic_tools`). |
-| `schemas.py` | Esquemas JSON de funciones para las herramientas. |
-| `telemetry_db.py` | Persistencia SQLite para telemetría/posiciones/calidad de señal. |
-| `__init__.py` | Punto de entrada del complemento `register(ctx)`. |
-
-Pruebas: `test_meshtastic.py` contiene pruebas de integración contra el adaptador ensamblado; `test_chunking.py`, `test_node_freshness.py`, `test_transport.py` y `test_ack_state.py` contienen pruebas unitarias por dominio.
-
-## Limitaciones Conocidas
+## Limitaciones conocidas
 
 - Se admiten los transportes USB serial y TCP/IP; BLE no está implementado.
 - Serial y TCP no pueden usarse al mismo tiempo; establecer `MESHTASTIC_TCP_HOST` selecciona TCP.
