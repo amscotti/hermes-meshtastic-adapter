@@ -1,188 +1,182 @@
 """
 JSON Schemas for Meshtastic AI Agent Tools.
+
+Each schema uses Hermes' inner tool form — ``{"name", "description",
+"parameters"}`` — matching the spotify plugin convention. The registry wraps
+this into the OpenAI ``{"type": "function", "function": {...}}`` envelope at
+definition time; pre-wrapping here double-wrapped the contract so the model saw
+tools with no description and no parameters (``tools/registry.get_definitions``
+and ``model_tools.coerce_tool_args`` both read the inner keys off the raw
+registered schema).
 """
 
 MESH_LIST_NODES_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_list_nodes",
-        "description": (
-            "Get a formatted list of all visible Meshtastic nodes in the mesh network with "
-            "their IDs, names, signal metrics, and status. Whether a node is heard DIRECTLY "
-            "(in radio range, no relay) is given by 'heard_directly' — never infer it from "
-            "signal strength: a relayed packet's SNR/RSSI describe the last hop, so a strong "
-            "reading can belong to a node many hops away. 'heard_directly' means a 0-hop "
-            "packet arrived within the last 24h (older receptions expire, since a node may "
-            "have moved or gone quiet); 'last_direct_heard' and 'last_direct_heard_age_hours' "
-            "say when. 'hops_away' is the distance of the LATEST packet "
-            "and legitimately varies as the mesh reroutes. 'signal_source' says whether the "
-            "reading came off a direct packet ('direct'), a relayed one ('relayed'), or is "
-            "of unknown origin."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
+    "name": "mesh_list_nodes",
+    "description": (
+        "Get a formatted list of all visible Meshtastic nodes in the mesh network with "
+        "their IDs, names, signal metrics, and status. Whether a node is heard DIRECTLY "
+        "(in radio range, no relay) is given by 'heard_directly' — never infer it from "
+        "signal strength: a relayed packet's SNR/RSSI describe the last hop, so a strong "
+        "reading can belong to a node many hops away. 'heard_directly' means a 0-hop "
+        "packet arrived within the last 24h (older receptions expire, since a node may "
+        "have moved or gone quiet); 'last_direct_heard' and 'last_direct_heard_age_hours' "
+        "say when. 'hops_away' is the distance of the LATEST packet "
+        "and legitimately varies as the mesh reroutes. 'signal_source' says whether the "
+        "reading came off a direct packet ('direct'), a relayed one ('relayed'), or is "
+        "of unknown origin."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
     },
 }
 
 MESH_NODE_INFO_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_node_info",
-        "description": (
-            "Retrieve detailed configuration and hardware status for a specific node in the "
-            "mesh network. Coordinates are the node's LAST KNOWN fix, not necessarily its "
-            "current position: check 'position_age_hours' / 'position_is_stale' before "
-            "presenting them as where the node is now, especially when plotting a map."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The unique node ID (e.g. '!da1b1613') or name of the node.",
-                }
-            },
-            "required": ["node_id"],
-            "additionalProperties": False,
+    "name": "mesh_node_info",
+    "description": (
+        "Retrieve detailed configuration and hardware status for a specific node in the "
+        "mesh network. Coordinates are the node's LAST KNOWN fix, not necessarily its "
+        "current position: check 'position_age_hours' / 'position_is_stale' before "
+        "presenting them as where the node is now, especially when plotting a map."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The unique node ID (e.g. '!da1b1613') or name of the node.",
+            }
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_SIGNAL_QUALITY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_signal_quality",
-        "description": (
-            "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, "
-            "Fair, Poor) for a specific node. The reading only describes the link to this "
-            "node when 'signal_source' is 'direct'; when it is 'relayed' the numbers belong "
-            "to the last hop, not to this node."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node.",
-                }
-            },
-            "required": ["node_id"],
-            "additionalProperties": False,
+    "name": "mesh_signal_quality",
+    "description": (
+        "Check the signal strength (SNR and RSSI) and quality label (Excellent, Good, "
+        "Fair, Poor) for a specific node. The reading only describes the link to this "
+        "node when 'signal_source' is 'direct'; when it is 'relayed' the numbers belong "
+        "to the last hop, not to this node."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node.",
+            }
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_SEND_DM_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_send_dm",
-        "description": "Send a private direct message (DM) to a specific node by ID or name.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The target node ID (e.g. '!da1b1613') or name of the node.",
-                },
-                "message": {
-                    "type": "string",
-                    "description": "The text message content to send. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
-                },
+    "name": "mesh_send_dm",
+    "description": "Send a private direct message (DM) to a specific node by ID or name.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The target node ID (e.g. '!da1b1613') or name of the node.",
             },
-            "required": ["node_id", "message"],
-            "additionalProperties": False,
+            "message": {
+                "type": "string",
+                "description": "The text message content to send. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
+            },
         },
+        "required": ["node_id", "message"],
+        "additionalProperties": False,
     },
 }
 
 MESH_SEND_BROADCAST_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_send_broadcast",
-        "description": "Broadcast a text message to all nodes on the primary channel or a specific secondary channel.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "The text message content to broadcast. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
-                },
-                "channel": {
-                    "type": "string",
-                    "description": "Optional channel index (e.g. '0') or channel name (e.g. 'Primary'). Default is primary channel '0'.",
-                },
+    "name": "mesh_send_broadcast",
+    "description": "Broadcast a text message to all nodes on the primary channel or a specific secondary channel.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "The text message content to broadcast. Keep it brief; longer text is automatically split into numbered ~170-byte LoRa chunks.",
             },
-            "required": ["message"],
-            "additionalProperties": False,
+            "channel": {
+                "type": "string",
+                "description": "Optional channel index (e.g. '0') or channel name (e.g. 'Primary'). Default is primary channel '0'.",
+                "default": "0",
+            },
         },
+        "required": ["message"],
+        "additionalProperties": False,
     },
 }
 
 MESH_TELEMETRY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_telemetry",
-        "description": "Fetch the most recent telemetry readings (battery, voltage, temperature, humidity, pressure, uptime) from a specific sensor-equipped node.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node.",
-                }
-            },
-            "required": ["node_id"],
-            "additionalProperties": False,
+    "name": "mesh_telemetry",
+    "description": "Fetch the most recent telemetry readings (battery, voltage, temperature, humidity, pressure, uptime) from a specific sensor-equipped node.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node.",
+            }
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_TELEMETRY_HISTORY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_telemetry_history",
-        "description": (
-            "Query historical telemetry, position, or signal quality records from the "
-            "persistent SQLite database (retained ~30 days) for analysis. To ask for a "
-            "PERIOD — 'where was this node over the last few days' — use 'since_hours'; "
-            "a row count cannot express a period, because how far back N rows reach "
-            "depends on how often that node transmits. The reply reports 'oldest_returned' "
-            "and 'truncated' so a partial window is never mistaken for a complete one."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node.",
-                },
-                "metric_type": {
-                    "type": "string",
-                    "enum": ["telemetry", "positions", "signal_quality"],
-                    "description": "The type of historical records to fetch. Default is 'telemetry'.",
-                },
-                "since_hours": {
-                    "type": "number",
-                    "description": (
-                        "Return records from the last N hours (e.g. 72 for three days). "
-                        "Capped at 720 (30 days, the retention period). When set, up to "
-                        "500 records are returned instead of 100."
-                    ),
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": (
-                        "Maximum number of records to return (default: 10, max: 100; with "
-                        "'since_hours' the default and cap are 500)."
-                    ),
-                },
+    "name": "mesh_telemetry_history",
+    "description": (
+        "Query historical telemetry, position, or signal quality records from the "
+        "persistent SQLite database (retained ~30 days) for analysis. To ask for a "
+        "PERIOD — 'where was this node over the last few days' — use 'since_hours'; "
+        "a row count cannot express a period, because how far back N rows reach "
+        "depends on how often that node transmits. The reply reports 'oldest_returned' "
+        "and 'truncated' so a partial window is never mistaken for a complete one."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node.",
             },
-            "required": ["node_id"],
-            "additionalProperties": False,
+            "metric_type": {
+                "type": "string",
+                "enum": ["telemetry", "positions", "signal_quality"],
+                "description": "The type of historical records to fetch. Default is 'telemetry'.",
+            },
+            "since_hours": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 720,
+                "description": (
+                    "Return records from the last N hours (e.g. 72 for three days; "
+                    "fractional hours accepted, must be positive). Capped at 720 (30 "
+                    "days, the retention period). When set, up to 500 records are "
+                    "returned instead of 100."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 10,
+                "description": (
+                    "Maximum number of records to return. Up to 500 rows when "
+                    "'since_hours' is set, 100 otherwise (default 10)."
+                ),
+            },
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
@@ -192,131 +186,135 @@ MESH_TELEMETRY_HISTORY_SCHEMA = {
 # turn a question into a mesh-wide sweep.
 
 MESH_REQUEST_TELEMETRY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_request_telemetry",
-        "description": (
-            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
-            "Actively ask ONE node over the air for its current device metrics "
-            "(battery, voltage, uptime) and wait for the reply. This transmits on the "
-            "shared LoRa channel, so use it only when the user asks about a specific "
-            "node's live state; prefer mesh_telemetry for already-known data. A node "
-            "that is out of range or asleep simply will not answer."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Seconds to wait for the reply (default 45, max 120).",
-                },
+    "name": "mesh_request_telemetry",
+    "description": (
+        "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+        "Actively ask ONE node over the air for its current device metrics "
+        "(battery, voltage, uptime) and wait for the reply. This transmits on the "
+        "shared LoRa channel, so use it only when the user asks about a specific "
+        "node's live state; prefer mesh_telemetry for already-known data. A node "
+        "that is out of range or asleep simply will not answer (answered=false). "
+        "answered=true means a matching packet was heard after the request — "
+        "periodic broadcasts from the same node can also satisfy the wait "
+        "(no wire-level requestId correlation)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
             },
-            "required": ["node_id"],
-            "additionalProperties": False,
+            "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 120,
+                "default": 45,
+                "description": "Seconds to wait for the reply (default 45, min 5, max 120).",
+            },
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_REQUEST_POSITION_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_request_position",
-        "description": (
-            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
-            "Actively ask ONE node over the air for its current position and wait for "
-            "the reply. This transmits on the shared LoRa channel — use it only when "
-            "the user asks where a specific node is right now; prefer mesh_node_info "
-            "or mesh_telemetry_history for the last known position."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Seconds to wait for the reply (default 45, max 120).",
-                },
+    "name": "mesh_request_position",
+    "description": (
+        "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+        "Actively ask ONE node over the air for its current position and wait for "
+        "the reply. This transmits on the shared LoRa channel — use it only when "
+        "the user asks where a specific node is right now; prefer mesh_node_info "
+        "or mesh_telemetry_history for the last known position. answered=true "
+        "means a matching packet was heard after the request (periodic "
+        "position broadcasts from the same node can also satisfy the wait)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node to query.",
             },
-            "required": ["node_id"],
-            "additionalProperties": False,
+            "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 120,
+                "default": 45,
+                "description": "Seconds to wait for the reply (default 45, min 5, max 120).",
+            },
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_TRACEROUTE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_traceroute",
-        "description": (
-            "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
-            "Discover the actual radio route to ONE node: which relay nodes carry the "
-            "traffic and the SNR of each hop, in both directions. The best tool for "
-            "diagnosing why messages to a node are slow, unconfirmed, or lost. "
-            "Transmits on the shared LoRa channel, so use it deliberately."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {
-                    "type": "string",
-                    "description": "The node ID (e.g. '!da1b1613') or name of the node to trace.",
-                },
-                "hop_limit": {
-                    "type": "integer",
-                    "description": "Maximum hops to traverse (default 5, max 7).",
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Seconds to wait for the reply (default 60, max 120).",
-                },
+    "name": "mesh_traceroute",
+    "description": (
+        "REQUIRED: node_id (the node's ID like '!9eabacac' or its name). "
+        "Discover the actual radio route to ONE node: which relay nodes carry the "
+        "traffic and the SNR of each hop, in both directions. The best tool for "
+        "diagnosing why messages to a node are slow, unconfirmed, or lost. "
+        "Transmits on the shared LoRa channel, so use it deliberately."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "node_id": {
+                "type": "string",
+                "description": "The node ID (e.g. '!da1b1613') or name of the node to trace.",
             },
-            "required": ["node_id"],
-            "additionalProperties": False,
+            "hop_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7,
+                "default": 5,
+                "description": "Maximum hops to traverse (default 5, min 1, max 7).",
+            },
+            "timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 120,
+                "default": 60,
+                "description": "Seconds to wait for the reply (default 60, min 5, max 120).",
+            },
         },
+        "required": ["node_id"],
+        "additionalProperties": False,
     },
 }
 
 MESH_PAUSE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_pause",
-        "description": (
-            "Release the radio link so another client (phone app, web UI, flasher) can "
-            "connect to the node. The rest of the gateway keeps running; only mesh access "
-            "stops. Outbound mesh messages queue until the link resumes. Prefer a timed "
-            "pause so the mesh cannot stay down by accident."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "minutes": {
-                    "type": "number",
-                    "description": (
-                        "Auto-resume after this many minutes (max 720). Omit to pause "
-                        "until mesh_resume is called explicitly."
-                    ),
-                }
-            },
-            "additionalProperties": False,
+    "name": "mesh_pause",
+    "description": (
+        "Release the radio link so another client (phone app, web UI, flasher) can "
+        "connect to the node. The rest of the gateway keeps running; only mesh access "
+        "stops. Outbound mesh messages queue until the link resumes. Prefer a timed "
+        "pause so the mesh cannot stay down by accident."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "minutes": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 720,
+                "description": (
+                    "Auto-resume after this many minutes (must be positive, max 720). "
+                    "Omit to pause until mesh_resume is called explicitly."
+                ),
+            }
         },
+        "additionalProperties": False,
     },
 }
 
 MESH_RESUME_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "mesh_resume",
-        "description": (
-            "Reconnect to the node after mesh_pause. Reconnection takes about a second; "
-            "queued outbound messages are then delivered."
-        ),
-        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
+    "name": "mesh_resume",
+    "description": (
+        "Reconnect to the node after mesh_pause. Reconnection takes about a second; "
+        "queued outbound messages are then delivered."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }

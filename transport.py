@@ -5,12 +5,14 @@ I/O (sendText / close / open constructors) off the event-loop thread, plus
 target resolution and interface construction for serial/TCP transports.
 """
 
+import asyncio
 import logging
 import os
 import queue
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
@@ -30,17 +32,13 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in tests
     serial = None
 
-# meshtastic / pypubsub may be absent at import time (e.g. a Hermes update
-# rebuilt the runtime venv and dropped the plugin's dependencies). The import
-# is therefore re-runnable: ensure_meshtastic_library() pip-installs the
-# plugin's requirements.txt into the running interpreter, then re-imports.
-# open_interface() reads HAS_MESHTASTIC / pub at CALL time — never snapshot
-# them into an importing module, or a late re-import stays invisible.
+# meshtastic / pypubsub may be absent at import time (a Hermes self-update can
+# rebuild the runtime and drop them), so the import is re-runnable and read at
+# CALL time — never snapshot HAS_MESHTASTIC / pub into an importing module.
 HAS_MESHTASTIC = False
 pub = None
-# The meshtastic package itself, bound at module level so open_interface can
-# reference it even though the import only happens inside the re-runnable
-# _import_meshtastic_libs().
+# The meshtastic package, bound at module level so open_interface can reference
+# it even though the import only happens inside the re-runnable importer.
 meshtastic: Any | None = None
 
 
@@ -68,6 +66,17 @@ _import_meshtastic_libs()
 # Default Meshtastic TCP API port exposed by WiFi/Ethernet-capable nodes.
 DEFAULT_TCP_PORT = 4403
 
+# USB Vendor IDs for known Meshtastic hardware. Mirrors the primary (whitelist)
+# pass of ``meshtastic.util.findPorts`` so the pyserial/glob fallback does not
+# hand non-Meshtastic serial devices (GPS dongles, Arduino console UARTs) to
+# the protocol. Hex for readability; matched against ``ListPortInfo.vid``.
+MESHTASTIC_USB_VIDS = frozenset(
+    {
+        0x239A,  # Adafruit (Feather nRF52 / ESP32 — popular Meshtastic boards).
+        0x303A,  # Espressif (native-USB ESP32-S2/S3 variants).
+    }
+)
+
 # pip install runs at most once per process (only when the library is missing).
 _autoinstall_lock = threading.Lock()
 _autoinstall_attempted = False
@@ -79,10 +88,14 @@ def _requirements_path() -> Path:
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    """Env boolean: only explicit true/false words are authoritative; a blank
+    ``VAR=`` takes ``default`` (so ``MESHTASTIC_MOCK=`` cannot arm the mock)."""
+    value = (os.getenv(name) or "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def _mock_opt_in() -> bool:
@@ -96,21 +109,16 @@ def _autoinstall_enabled() -> bool:
 
 
 def ensure_meshtastic_library() -> None:
-    """Attempt one pip install of requirements.txt when the library is missing.
+    """One pip install of requirements.txt when the library is missing.
 
-    The gateway's Hermes venv has no persistent plugin-dependency story: a
-    Hermes self-update can rebuild the runtime and drop meshtastic/pypubsub,
-    silently wedging the adapter onto the mock interface. This runs exactly
-    once per process, on the transport worker (never the event-loop thread),
-    then re-imports. Disable with MESHTASTIC_AUTOINSTALL=0.
+    Runs once per process on the transport worker, then re-imports.
+    Disable with MESHTASTIC_AUTOINSTALL=0.
     """
     global _autoinstall_attempted
     if HAS_MESHTASTIC:
         return
     with _autoinstall_lock:
-        # Authoritative once-per-process gate: _autoinstall_attempted is only
-        # ever written under this lock (including the disabled path below), so
-        # concurrent callers can never double-run pip or double-log.
+        # Once-per-process gate under this lock — callers can never double-run.
         if HAS_MESHTASTIC or _autoinstall_attempted:
             return
         _autoinstall_attempted = True
@@ -132,21 +140,9 @@ def ensure_meshtastic_library() -> None:
             sys.executable,
         )
         try:
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--quiet",
-                    "-r",
-                    str(req),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
+            cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+            cmd += ["--quiet", "-r", str(req)]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
             logger.error(
                 "pip install of Meshtastic dependencies timed out after 300s; "
@@ -181,30 +177,74 @@ def ensure_meshtastic_library() -> None:
             )
 
 
+class TransportShutdownError(RuntimeError):
+    """A job was submitted to a shut-down transport executor.
+
+    Subclass of ``RuntimeError`` for existing ``except RuntimeError`` handlers;
+    ``send_path.is_executor_shutdown_error`` matches on this type.
+    """
+
+    def __init__(self, message: str = "cannot schedule new futures after shutdown") -> None:
+        super().__init__(message)
+
+
+class TransportBusyError(RuntimeError):
+    """The transport job queue is full (worker likely wedged); ``submit`` rejects
+    instead of buffering without limit. Distinct from ``TransportShutdownError``
+    so callers treat it as transient, not teardown."""
+
+    def __init__(self, message: str = "transport worker job queue is full") -> None:
+        super().__init__(message)
+
+
+class TransportJobBaseError(RuntimeError):
+    """Wraps a non-``Exception`` ``BaseException`` from a job so callers'
+    ``except Exception`` boundaries catch it; ``.original`` holds the cause."""
+
+    def __init__(self, original: BaseException) -> None:
+        self.original = original
+        super().__init__(f"transport job raised {type(original).__name__}: {original}")
+
+
+def _normalize_job_exception(exc: BaseException) -> Exception:
+    """Wrap a non-``Exception`` ``BaseException`` so callers can catch it."""
+    if isinstance(exc, Exception):
+        return exc
+    return TransportJobBaseError(exc)
+
+
+# Bounded so a wedged blocking call cannot grow the job queue without limit.
+TRANSPORT_JOB_QUEUE_MAXSIZE = 256
+
+
 class _DaemonTransportExecutor:
     """Single-worker daemon thread for blocking Meshtastic I/O.
 
-    Daemon so a stuck open/close cannot pin process exit. Callers await via
-    ``asyncio.wrap_future(executor.submit(...))``.
+    Daemon so a stuck open/close cannot pin process exit.
     """
 
     def __init__(self, name: str = "meshtastic-transport") -> None:
         self._jobs: queue.Queue[
             tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any], ConcurrentFuture] | None
-        ] = queue.Queue()
+        ] = queue.Queue(maxsize=TRANSPORT_JOB_QUEUE_MAXSIZE)
         self._closed = False
+        self._stop_after_drain = False
         self._state_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
     def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> ConcurrentFuture:
         fut: ConcurrentFuture = ConcurrentFuture()
-        # Check + enqueue atomically with shutdown's sentinel. Every accepted
-        # job is therefore before the sentinel and cannot be stranded behind it.
+        # Check + enqueue atomically with shutdown's sentinel, so every accepted
+        # job is before the sentinel and cannot be stranded behind it.
         with self._state_lock:
             if self._closed:
-                raise RuntimeError("cannot schedule new futures after shutdown")
-            self._jobs.put((fn, args, kwargs, fut))
+                raise TransportShutdownError()
+            try:
+                self._jobs.put_nowait((fn, args, kwargs, fut))
+            except queue.Full:
+                # Never block the caller on a wedged worker — reject for retry.
+                raise TransportBusyError() from None
         return fut
 
     def _run(self) -> None:
@@ -219,7 +259,7 @@ class _DaemonTransportExecutor:
                 result = fn(*args, **kwargs)
             except BaseException as exc:
                 try:
-                    fut.set_exception(exc)
+                    fut.set_exception(_normalize_job_exception(exc))
                 except ConcurrentInvalidStateError:
                     pass
             else:
@@ -227,13 +267,21 @@ class _DaemonTransportExecutor:
                     fut.set_result(result)
                 except ConcurrentInvalidStateError:
                     pass
+            with self._state_lock:
+                # Shutdown raced a full queue; exit once accepted work drains.
+                if self._stop_after_drain and self._jobs.empty():
+                    return
 
     def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
         """Stop accepting work. Optionally join the worker for up to ``timeout``."""
         with self._state_lock:
             if not self._closed:
                 self._closed = True
-                self._jobs.put(None)
+                try:
+                    self._jobs.put_nowait(None)
+                except queue.Full:
+                    # Wedged with a full queue: flag drain-then-exit in _run.
+                    self._stop_after_drain = True
         if wait:
             self._thread.join(timeout)
 
@@ -241,13 +289,248 @@ class _DaemonTransportExecutor:
         return self._thread.is_alive()
 
 
+# --- serialized interface close machinery (moved from adapter.py) ---
+
+# Logs under the "adapter" logger (like ack_state.py) so the lifecycle tests'
+# assertLogs("adapter", ...) assertions keep matching after the move.
+_close_logger = logging.getLogger("adapter")
+
+
+def close_interfaces_serialized(interfaces: list[Any]) -> None:
+    """Close interfaces on a worker thread, serialized with sendText."""
+    for iface in interfaces:
+        try:
+            iface.close()
+        except Exception as exc:
+            _close_logger.error("Error closing Meshtastic interface: %s", exc)
+
+
+async def await_concurrent_future(future: ConcurrentFuture, timeout: float | None = None) -> Any:
+    """Await without propagating asyncio cancellation into queued worker jobs.
+
+    Polling (rather than shielding) keeps a caller ``CancelledError`` away from
+    the daemon worker job; the 10ms cadence is deliberate.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while not future.done():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError
+        await asyncio.sleep(0.01)
+    return future.result()
+
+
+def _settle_future(fut: ConcurrentFuture, fn: Callable[[], Any]) -> None:
+    """Run ``fn`` and capture its outcome into ``fut`` (thread-safe set)."""
+    try:
+        fn()
+    except BaseException as exc:
+        try:
+            fut.set_exception(_normalize_job_exception(exc))
+        except ConcurrentInvalidStateError:
+            pass
+    else:
+        try:
+            fut.set_result(None)
+        except ConcurrentInvalidStateError:
+            pass
+
+
+async def close_interfaces_on_daemon_thread(interfaces: list[Any], timeout: float) -> None:
+    """Close via a short-lived daemon thread — never on the event-loop thread."""
+    close_fut: ConcurrentFuture = ConcurrentFuture()
+    threading.Thread(
+        target=lambda: _settle_future(close_fut, lambda: close_interfaces_serialized(interfaces)),
+        name="meshtastic-close",
+        daemon=True,
+    ).start()
+    await await_concurrent_future(close_fut, timeout)
+
+
+async def close_interfaces_after_executor(
+    executor: _DaemonTransportExecutor,
+    interfaces: list[Any],
+    timeout: float,
+) -> None:
+    """Close only after a shutting-down worker drains accepted transport work."""
+    close_fut: ConcurrentFuture = ConcurrentFuture()
+
+    def _drain_then_close() -> None:
+        # Unbounded join is deliberate: a bounded one could let close run
+        # concurrently with an in-flight sendText. The caller's await is
+        # time-bounded and this thread is a daemon, so a stuck worker still
+        # cannot pin process exit.
+        executor.shutdown(wait=True)
+        close_interfaces_serialized(interfaces)
+
+    threading.Thread(
+        target=lambda: _settle_future(close_fut, _drain_then_close),
+        name="meshtastic-close-after-worker",
+        daemon=True,
+    ).start()
+    await await_concurrent_future(close_fut, timeout)
+
+
+async def close_interfaces_via_executor(
+    executor: _DaemonTransportExecutor,
+    interfaces: list[Any],
+    timeout: float,
+) -> None:
+    """Close on the transport worker; drain-then-close if it is mid-shutdown.
+
+    Three submit outcomes:
+
+    * success — await the worker close (serialized against ``sendText``).
+    * ``TransportShutdownError`` — the executor is tearing down: drain accepted
+      work first, then close (the only path that permanently marks the worker
+      closed).
+    * ``TransportBusyError`` — the 256-deep job queue is momentarily full
+      (transient backpressure, NOT teardown). Close on a daemon thread without
+      touching executor state, so a wedged-but-recoverable worker is not
+      permanently bricked. The send path treats the same condition as
+      re-queueable (``adapter._send_chunk``); this keeps close consistent.
+    """
+    try:
+        close_fut = executor.submit(close_interfaces_serialized, interfaces)
+    except TransportShutdownError:
+        # Executor shut down mid-read: drain accepted work before closing.
+        await close_interfaces_after_executor(executor, interfaces, timeout)
+        return
+    except TransportBusyError:
+        # Transient full queue: close without disabling the worker for life.
+        await close_interfaces_on_daemon_thread(interfaces, timeout)
+        return
+    await await_concurrent_future(close_fut, timeout)
+
+
+async def close_interfaces(
+    interfaces: list[Any],
+    executor: _DaemonTransportExecutor | None,
+    timeout: float,
+) -> None:
+    """Close interfaces off the event-loop thread, time-bounded.
+
+    Dispatch: via the lifecycle transport worker when one exists (serialized
+    against sendText), else a short-lived daemon thread. A TimeoutError only
+    abandons the *await*; the daemon close still runs.
+    """
+    if not interfaces:
+        return
+    try:
+        if executor is not None:
+            await close_interfaces_via_executor(executor, interfaces, timeout)
+        else:
+            await close_interfaces_on_daemon_thread(interfaces, timeout)
+    except TimeoutError:
+        _close_logger.warning(
+            "Meshtastic interface close still running after %.1fs; disconnect continues "
+            "(daemon transport worker will finish in the background)",
+            timeout,
+        )
+
+
+async def shutdown_transport_executor(executor: _DaemonTransportExecutor, timeout: float) -> None:
+    """Shut down the daemon transport worker without hanging forever."""
+    executor.shutdown(wait=False)
+    deadline = time.monotonic() + timeout
+    # Poll without blocking the platform loop; the daemon worker cannot pin exit.
+    while executor.is_alive() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    if executor.is_alive():
+        _close_logger.warning(
+            "Meshtastic transport executor still busy after %.1fs during disconnect; "
+            "continuing (daemon worker will finish in the background)",
+            timeout,
+        )
+
+
+def drop_interface_if_dead_serialized(
+    target: str,
+    iface: Any,
+    *,
+    interfaces: dict[str, Any],
+    iface_lock: threading.Lock,
+    is_alive: Callable[[Any], bool],
+) -> bool | None:
+    """Atomically probe and close a dead interface.
+
+    Returns None if the target changed, True if alive, False after removal and
+    close. Runs on the daemon worker, serialized against sendText.
+    """
+    with iface_lock:
+        if interfaces.get(target) is not iface:
+            return None
+    if is_alive(iface):
+        return True
+    with iface_lock:
+        if interfaces.get(target) is not iface:
+            return None
+        interfaces.pop(target, None)
+    try:
+        iface.close()
+    except Exception as exc:
+        _close_logger.error("Error closing dropped Meshtastic interface: %s", exc)
+    return False
+
+
+# --- liveness polling (moved from adapter.py) ---
+
+
+def interface_is_alive(iface: Any) -> bool:
+    """Best-effort liveness probe for a connected interface.
+
+    ``MeshInterface.isConnected`` is a ``threading.Event`` *attribute* (not a
+    method), so it is checked LAST and via ``is_set()``: checking it first
+    would shadow the TCP/serial branches, and calling it would raise.
+    """
+    # TCP: the library self-heals dead sockets by swapping in a fresh one
+    # (brief socket=None window), so trust the authoritative isConnected Event.
+    is_connected = getattr(iface, "isConnected", None)
+    if hasattr(iface, "socket"):
+        if is_connected is not None and hasattr(is_connected, "is_set"):
+            return bool(is_connected.is_set())
+        return iface.socket is not None
+    # Serial: pyserial stream exposes is_open / isOpen().
+    stream = getattr(iface, "stream", None)
+    if stream is not None:
+        if hasattr(stream, "isOpen"):
+            return bool(stream.isOpen())
+        if hasattr(stream, "is_open"):
+            return bool(stream.is_open)
+        # A stream with neither probe must not read alive forever on a closed
+        # link — fall through to the isConnected event below.
+    # Fallback: meshtastic's threading.Event liveness flag. Reuses the
+    # is_connected binding from the top of this function (the attribute
+    # hasn't changed); no need to re-read it.
+    if hasattr(is_connected, "is_set"):
+        return bool(is_connected.is_set())
+    # No known liveness handle (e.g. the mock interface) — assume alive.
+    return True
+
+
+def submit_liveness_probe(
+    executor: _DaemonTransportExecutor,
+    target: str,
+    iface: Any,
+    *,
+    interfaces: dict[str, Any],
+    iface_lock: threading.Lock,
+) -> ConcurrentFuture:
+    """Submit one executor-mediated liveness probe for ``target`` (serialized against sendText)."""
+    return executor.submit(
+        drop_interface_if_dead_serialized,
+        target,
+        iface,
+        interfaces=interfaces,
+        iface_lock=iface_lock,
+        is_alive=interface_is_alive,
+    )
+
+
 def connection_targets(tcp_host: str, tcp_port: int, serial_port: str) -> list[str]:
     """Resolve the connection target keys to open.
 
-    A configured TCP host takes precedence over serial: the two transports
-    are mutually exclusive. Targets are opaque keys understood by
-    ``_reconnect_loop`` and ``open_interface`` — a ``tcp://host:port`` URL
-    for TCP, otherwise a serial device path (or ``mock_port`` fallback).
+    A configured TCP host takes precedence over serial; ``auto`` serial
+    discovers ports or falls back to ``mock_port``.
     """
     if tcp_host:
         host = tcp_host
@@ -266,23 +549,30 @@ def connection_targets(tcp_host: str, tcp_port: int, serial_port: str) -> list[s
 
 
 def parse_tcp_target(target: str) -> tuple[str, int]:
-    """Parse a ``tcp://host:port`` target key into ``(host, port)``.
+    """Parse a ``tcp://host:port`` target key into ``(host, port)``, handling
+    bracketed IPv6 literals; malformed ports/unclosed brackets yield the host.
 
-    Handles bracketed IPv6 literals, e.g. ``tcp://[::1]:4403``.
+    The ``tcp://`` prefix is a hard contract: the only caller
+    (``open_interface``) guards with ``target.startswith("tcp://")`` and
+    ``connection_targets`` always emits it. Strip it explicitly via
+    ``removeprefix`` so a future caller that bypasses the guard cannot silently
+    truncate the first 6 bytes of an unprefixed host (a wrong host/port handed
+    to ``TCPInterface``). When the prefix is absent, treat the whole string as
+    a bare host with the default port — loud-but-plausible rather than a
+    silent truncation.
     """
-    rest = target[len("tcp://") :]
+    rest = target.removeprefix("tcp://")
 
     if rest.startswith("["):
         # Bracketed IPv6 literal: "[host]" or "[host]:port".
         host, sep, after = rest[1:].partition("]")
-        if not sep:
-            return rest, DEFAULT_TCP_PORT
-        if after.startswith(":") and after[1:]:
+        if sep and after.startswith(":") and after[1:]:
             try:
                 return host, int(after[1:])
             except ValueError:
                 return host, DEFAULT_TCP_PORT
-        return host, DEFAULT_TCP_PORT
+        # Unclosed bracket or bare "[host]" — de-bracketed host, default port.
+        return (host if sep else rest.lstrip("[")), DEFAULT_TCP_PORT
 
     host, sep, port_str = rest.rpartition(":")
     if not sep:
@@ -290,22 +580,16 @@ def parse_tcp_target(target: str) -> tuple[str, int]:
     try:
         return host, int(port_str)
     except ValueError:
-        return rest, DEFAULT_TCP_PORT
+        return host, DEFAULT_TCP_PORT
 
 
 def open_interface(target: str) -> Any:
-    """Open the serial/TCP interface for a connection target.
+    """Open the serial/TCP interface for a connection target (blocking).
 
-    Runs the blocking Meshtastic constructors; callers offload this to an
-    executor.
-
-    Fails LOUD instead of silently masquerading as production: when the
-    meshtastic library is unavailable and the target is a real serial/TCP
-    device, this raises with install instructions (after one automatic
-    ``pip install -r requirements.txt`` attempt — see
-    ``ensure_meshtastic_library``) unless ``MESHTASTIC_MOCK=1`` explicitly
-    opts into a dry-run mock. Only the explicit ``mock_port`` target (the
-    auto-discovery fallback) and the opt-in produce a mock interface.
+    Fails LOUD instead of silently masquerading as production: a real target
+    with the library missing raises install instructions (after one automatic
+    pip attempt) unless ``MESHTASTIC_MOCK=1`` opts into a dry-run mock. Only
+    ``mock_port`` and the explicit opt-in produce a mock.
     """
     if target == "mock_port":
         logger.warning(
@@ -348,10 +632,10 @@ def open_interface(target: str) -> Any:
 def discover_serial_ports() -> list[str]:
     """Discover likely Meshtastic serial devices cross-platform.
 
-    Prefer ``meshtastic.util.findPorts`` (VID whitelist for known radios,
-    then non-blacklisted ports) so ``auto`` does not open every USB-serial
-    gadget on the host. Fall back to pyserial / glob when the library is
-    unavailable.
+    Prefer ``meshtastic.util.findPorts`` (VID whitelist); fall back to pyserial
+    (filtered by the known Meshtastic USB VIDs so a non-Meshtastic device —
+    GPS dongle, Arduino, console UART — is not sent protocol bytes) and finally
+    a ``/dev`` glob when the library is unavailable.
     """
     if HAS_MESHTASTIC:
         try:
@@ -364,7 +648,15 @@ def discover_serial_ports() -> list[str]:
             logger.debug("meshtastic.util.findPorts discovery failed: %s", e)
     try:
         if serial is not None:
-            ports = [p.device for p in serial.tools.list_ports.comports()]
+            # Mirror findPorts's primary intent: only likely-Meshtastic VIDs.
+            # A port without a resolvable vid is skipped (findPorts also
+            # requires ``port.vid is not None``), so an empty result falls
+            # through to the glob last resort rather than opening a wrong device.
+            ports = [
+                p.device
+                for p in serial.tools.list_ports.comports()
+                if p.vid is not None and p.vid in MESHTASTIC_USB_VIDS
+            ]
             if ports:
                 return ports
     except Exception as e:

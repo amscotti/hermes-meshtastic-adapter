@@ -1,6 +1,6 @@
 [project]
 name = "hermes-meshtastic-adapter"
-version = "1.0.0"
+version = "1.2.0"
 description = "Hermes Agent platform plugin for Meshtastic LoRa mesh networks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,18 +19,50 @@ extend-exclude = ["_deps"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+# Focused security subset (flake8-bandit): the adapter's primary threat model
+# is untrusted mesh-radio packets, so the cheap wins matter — hardcoded
+# secrets (S105-S107), silent except-pass/continue (S110/S112), SQL
+# injection via f-strings (S608). Deliberately NOT the full S family: S101
+# (assert) and S113 (missing timeout) would flag intentional code in this
+# repo; keep the ignore list explicit.
+extend-select = ["S105", "S106", "S107", "S110", "S112", "S608"]
 ignore = [
     # Hermes plugin handlers and tests lean on dynamic framework objects.
     "B008",
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"test_*.py" = [
+    # Test fixtures/teardown, not untrusted-input handling: teardown
+    # deliberately swallows os.unlink OSError (S110), fake "secret" strings
+    # (S105), and literal SQL fixtures (S608) are all intentional.
+    "S105",
+    "S110",
+    "S608",
+]
 "test_meshtastic.py" = [
     # Tests patch sys.path before importing Hermes and local plugin modules.
     "E402",
 ]
 "test_ack_state.py" = [
     # Test patches sys.path before importing the gateway and local plugin modules.
+    "E402",
+]
+"test_inbound.py" = [
+    # Test patches sys.path before importing the gateway and local plugin modules.
+    "E402",
+]
+"test_send.py" = [
+    # Test patches sys.path before importing the gateway and local plugin modules.
+    "E402",
+]
+"test_lifecycle.py" = [
+    # Test patches sys.path before importing the gateway and local plugin modules.
+    "E402",
+]
+"test_mesh_tools.py" = [
+    # Test patches sys.path before importing Hermes' tools.registry and the
+    # local plugin modules (schema-contract tests, C11).
     "E402",
 ]
 
@@ -42,14 +74,21 @@ line-ending = "auto"
 [tool.coverage.run]
 # mesh_tools.py is loaded dynamically as `meshtastic_tools` (see test_meshtastic.py
 # and adapter._load_tools_module) to avoid colliding with Hermes' `tools` pkg.
-source = ["adapter", "ack_state", "chunking", "meshtastic_tools", "mock_interface", "node_freshness", "telemetry_db", "schemas", "transport"]
-branch = false
+source = ["adapter", "ack_state", "chunking", "connection", "inbound", "mesh_helpers", "meshtastic_tools", "mock_interface", "node_freshness", "send_path", "solicited", "telemetry_db", "schemas", "transport"]
+# Branch measurement guards the mixed defensive legs (except-pass swallows,
+# repr fallbacks) that a 100%-line module could otherwise hide. The suite
+# holds ~97% branch coverage, far above the 80% floor.
+branch = true
 
 [tool.coverage.report]
-# NOTE: setting exclude_lines replaces coverage's default, so re-include
-# "pragma: no cover" alongside our additions.
+# NOTE: setting exclude_lines replaces coverage's documented defaults
+# ["pragma: no cover", "if TYPE_CHECKING:", "if __name__ == .__main__.:"],
+# so each default must be re-included explicitly. Omitting one silently
+# counts the omitted construct as uncovered (e.g. the LifecycleHost Protocol
+# block in ack_state.py used to show as missing lines).
 exclude_lines = [
     "pragma: no cover",
+    "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
 ]
 
@@ -59,15 +98,23 @@ exclude_lines = [
 # a project root pyrefly resolves its relative imports (`from .adapter import …`)
 # to `__unknown__` and errors. The shim's symbols are still type-checked via
 # adapter.py / mesh_tools.py.
+# NOTE: the list must cover EVERY top-level module (14 today) — a module left
+# out of project-includes is silently skipped by `pyrefly check`, so it can
+# accumulate type errors CI never sees. Add new sibling modules here.
 project-includes = [
     "adapter.py",
     "ack_state.py",
     "chunking.py",
+    "connection.py",
+    "inbound.py",
+    "mesh_helpers.py",
     "mock_interface.py",
     "node_freshness.py",
     "schemas.py",
     "telemetry_db.py",
     "mesh_tools.py",
+    "send_path.py",
+    "solicited.py",
     "transport.py",
 ]
 project-excludes = [
@@ -80,6 +127,11 @@ project-excludes = [
     "/.venv",
 ]
 search-path = ["."]
+# Pinning the platform makes CI's type-check deterministic, but it means the
+# macOS/Windows keepalive branches in adapter.py (socket.TCP_KEEPALIVE /
+# SIO_KEEPALIVE_VALS) are checked only against the Linux socket stub. Those
+# branches are guarded by hasattr at runtime, so a typo there would only fail
+# on the affected platform — accepted trade-off for reproducible CI.
 python-platform = "linux"
 python-version = "3.11"
 ignore-missing-imports = [

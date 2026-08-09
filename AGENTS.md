@@ -1,8 +1,9 @@
 # AGENTS.md
 
-Compact guidance for AI agents working in this repo. Deep architecture
-(inbound/outbound paths, connection lifecycle, freshness overlay) is in
-`CLAUDE.md` — read it alongside this file.
+Compact guidance for AI agents working in this repo. **Read
+`docs/ARCHITECTURE.md` first** (where code goes, layering, anti-god-class rules),
+then `CLAUDE.md` for deep conventions (inbound/outbound paths, dual loops,
+freshness, delivery gotchas). Do not grow `adapter.py` with new domain logic.
 
 ## Setup gotcha: where the tooling actually lives
 
@@ -31,18 +32,75 @@ Compact guidance for AI agents working in this repo. Deep architecture
 .venv/bin/python -m pyrefly check \
   --python-interpreter-path .venv/bin/python \
   --search-path ~/.hermes/hermes-agent --min-severity warn
-.venv/bin/python -m coverage run -m unittest \
-  test_meshtastic.py test_chunking.py test_node_freshness.py \
-  test_transport.py test_ack_state.py \
+.venv/bin/python -m coverage run -m unittest discover -s . -p "test_*.py" \
   && .venv/bin/python -m coverage report -m
 
 # Single test:
 .venv/bin/python -m unittest test_meshtastic.TestMeshtasticPlatform.<method>
+
+# Architecture gates — complexity, layering, extraction (named; no letter codes).
+# Stdlib-only; CI runs them after the four format/lint/type/test gates:
+.venv/bin/python scripts/check_arch_gates.py
 ```
 
-CI's four gates: `ruff format --check`, `ruff check`,
-`pyrefly check --min-severity warn`, and `coverage`+`unittest`. Coverage
-enforces `--fail-under=80` (currently ~92% overall).
+`unittest discover` (not a file list) — CI uses the same invocation, so a new
+`test_*.py` (including the four arch-gate tests) can never silently drop out of
+the suite.
+
+CI's gates: `ruff format --check`, `ruff check`,
+`pyrefly check --min-severity warn`, `coverage`+`unittest`, and the architecture
+gates (`scripts/check_arch_gates.py`: complexity / layering / extraction).
+Coverage enforces `--fail-under=80` (currently ~97% overall).
+
+## Architecture gates
+
+Three permanent CI gates. Names match what they check (no F1/F2 letter codes —
+those were temporary extraction-phase labels and were retired).
+
+Each gate is one stdlib-only script in `scripts/`, runnable standalone or via
+the combined runner above:
+
+- **Complexity** (`cc_gate.py`) — McCabe cyclomatic complexity
+  (if/elif/for/while/except/with/assert/bool-op/ternary/comprehension +
+  comprehension-if filters/async loops/lambda/match): any function cc ≥ 20
+  fails (grandfather allowlist is **empty** — re-adding an entry requires an
+  explicit decision and a drifted re-added entry FAILS). `adapter.py` mean cc
+  must stay ≤ 4.5. Primary anti-god-class guard for AI-assisted PRs.
+- **Layering** (`layer_gate.py`) — AST import check: leaf modules (chunking,
+  schemas, telemetry_db, node_freshness, mock_interface) must not import any
+  repo module; ack_state/mesh_tools/inbound/mesh_helpers/send_path/connection/
+  solicited/transport must not import adapter; adapter may import anything.
+- **Extraction** (`extraction_gate.py`) — every top-level module must be in
+  `[tool.coverage.run].source` (the coverage-drops-to-0% gotcha) and have a
+  `test_<module>.py` file (4 modules — adapter, mock_interface, schemas,
+  telemetry_db — are still grandfathered to test_meshtastic.py; must shrink,
+  and the gate fails if a grandfathered module ever gains its own test file
+  without the shrink being acknowledged).
+
+## Rules for AI-assisted changes (do not recreate a god class)
+
+1. **Read `docs/ARCHITECTURE.md` "Where new code goes" before editing.** Put
+   pure decisions in `send_path` / `connection` / helpers; state machines in
+   `ack_state` / `solicited` / `inbound`; blocking I/O in `transport`. Put
+   **only** Hermes orchestration / lifecycle wiring in `adapter.py`.
+2. **Do not add domain logic to `adapter.py`.** Prefer a pure helper or a
+   sibling module with constructor injection. New one-line delegates and
+   property bridges on the adapter are last resort (tests/call sites should
+   import the owning module).
+3. **Never raise a function to cc ≥ 20** and never re-open the complexity-gate allowlist
+   without an explicit human decision recorded in the PR.
+4. **Never `import adapter` from a non-hub module** (layering gate). Tools reach the
+   adapter only via the `mesh_tools` singleton; trackers use Protocols /
+   injected callables.
+5. **New top-level module checklist:** dual-import pattern, coverage `source`
+   entry (use `meshtastic_tools` for `mesh_tools.py`), `test_<module>.py`,
+   mention in `docs/ARCHITECTURE.md` + `CLAUDE.md` module maps.
+6. **Keep `test_meshtastic.py` thin** — per-domain tests live in
+   `test_<module>.py`; integration is for Hermes-bridge smoke only.
+
+## Commit hygiene
+
+PRs merge with a merge commit (not rebase) so history is not duplicated.
 
 ## Pyrefly hides warnings by default
 
@@ -54,15 +112,21 @@ pyrefly `>=1.1.1` (pinned in `requirements-dev.txt`).
 ## Coverage config gotcha
 
 The source list in `[tool.coverage.run]` is
-`["adapter", "meshtastic_tools", "telemetry_db", "schemas", "chunking",
-"mock_interface", "node_freshness", "transport", "ack_state"]` — note
-**`meshtastic_tools`, not `tools`** (see the dynamic-load convention below),
-and that every extracted sibling module must be added here or its coverage
-silently drops to 0%. `coverage run -m unittest ...` reads this config; no
-`--source` flag needed. Tests are split across `test_meshtastic.py`
-(integration) plus `test_chunking.py` / `test_node_freshness.py` /
-`test_transport.py` / `test_ack_state.py` (per-domain unit tests); run them
-all together for an accurate number.
+`["adapter", "ack_state", "chunking", "connection", "inbound",
+"mesh_helpers", "meshtastic_tools", "mock_interface", "node_freshness",
+"send_path", "solicited", "telemetry_db", "schemas", "transport"]` (14
+entries, one per top-level module) — note **`meshtastic_tools`, not
+`tools`** (see the dynamic-load convention below), and that every extracted
+sibling module must be added here or its coverage silently drops to 0%.
+`coverage run -m unittest ...` reads this config; no `--source` flag needed.
+Tests are split across `test_meshtastic.py` (integration) plus
+`test_inbound.py` / `test_ack_state.py` / `test_mesh_tools.py` /
+`test_mesh_helpers.py` / `test_transport.py` / `test_chunking.py` /
+`test_node_freshness.py` / `test_send.py` / `test_lifecycle.py` /
+`test_send_path.py` / `test_connection.py` / `test_solicited.py` /
+`test_project_config.py` (CI/config invariants) plus the four arch-gate
+tests (`test_cc_gate.py` / `test_extraction_gate.py` / `test_layer_gate.py` /
+`test_arch_gates.py`); run them all together for an accurate number.
 
 ## Payload ceiling is 233 bytes
 
@@ -94,12 +158,12 @@ all together for an accurate number.
   library can be pip-installed and re-imported after import (see the bullet
   above), and stale snapshots would silently skip pubsub subscription. Tests
   must patch `transport.X`, not `adapter.X`.
-- **`MESHTASTIC_HOME_CHANNEL` is normalized in `__init__`**
-  (`_expand_home_channel_env_for_gateway`): a bare node id (`!node` or bare
-  8-hex) / `channel:N` value is rewritten to `meshtastic:!node` /
-  `meshtastic:channel:N` with a warning, because Hermes cron delivery passes
-  the env value through as the chat id and the send path requires the
-  `meshtastic:` prefix.
+- **`MESHTASTIC_HOME_CHANNEL` is normalized in `MeshtasticAdapter.__init__`**
+  (`_expand_home_channel_env_for_gateway` in `adapter.py`): a bare node id
+  (`!node` or bare 8-hex) / `channel:N` value is rewritten to
+  `meshtastic:!node` / `meshtastic:channel:N` with a warning, because Hermes
+  cron delivery passes the env value through as the chat id and the send path
+  requires the `meshtastic:` prefix.
 - **Threading boundary**: meshtastic `pubsub` delivers on a background thread;
   all asyncio-loop state is touched only via `_schedule_on_loop` /
   `loop.call_soon_threadsafe`. `_on_receive` runs on the platform loop, not
@@ -139,8 +203,10 @@ all together for an accurate number.
     tasks via `call_soon_threadsafe`).
 - **Dual imports everywhere**: `try: from . import x / except ImportError: import x`
   so the plugin works both as a package (in Hermes) and flat modules (in tests).
-  Now covers nine modules — `adapter`, `mesh_tools`, `schemas`, `telemetry_db`,
-  `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`.
+  Now covers fourteen modules — `adapter`, `mesh_tools`, `schemas`,
+  `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`,
+  `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`,
+  `solicited`.
 - **Adapter↔tools link is a module-level singleton** (`mesh_tools.set_adapter` /
   `_get_adapter`). Handlers return `{"error": ...}` JSON when no adapter is
   active. Node IDs are `!`-prefixed 8-hex; the allowlist matches with/without
@@ -154,6 +220,16 @@ touching authz or output:
 - `enforces_own_access_policy = True` + `_dm_policy` / `_group_policy` (return
   `"allowlist"` when a node allowlist is active) — read by the gateway's
   `_is_user_authorized` trust path.
-- `format_tool_event → None` suppresses tool-progress chrome over LoRa (airtime).
+- **Tool progress (airtime):** short emoji blurbs only — not full query/args
+  dumps and not one permanent packet per tool step.
+  - `format_tool_event` → `🔍 Searching the web` (emoji + verb).
+  - `send()` applies `_compact_tool_progress_line` for the gateway
+    `progress_callback` path (strips ` for <preview>`).
+  - `edit_message` → success, no radio (so Hermes does not fall back to
+    re-sending every progress update).
+  - `SUPPORTS_MESSAGE_EDITING = False`.
+  - Recommended Hermes config: `display.platforms.meshtastic.tool_progress:
+    new` (one blurb per tool). Multi-line approval walls are separate from
+    tool chrome.
 - `splits_long_messages = True` — `send()` chunks natively; do NOT also chunk
   upstream.

@@ -1,5 +1,7 @@
 # Hermes Meshtastic Adapter
 
+**Languages:** [English](README.md) · [Español](README.es-ES.md) · [Français](README.fr-FR.md)
+
 `hermes-meshtastic-adapter` is a Hermes Agent platform plugin that connects Hermes to a Meshtastic LoRa mesh. It receives plain-text messages from mesh nodes, forwards them into Hermes sessions, and sends replies back over LoRa as direct messages or channel broadcasts.
 
 <p align="center">
@@ -66,6 +68,14 @@ hermes plugins enable meshtastic-platform
 
 Restart the Hermes gateway after changing plugin files or environment variables.
 
+### Plugin installation & updates
+
+`plugin.yaml`'s `version` is display-only — `hermes plugins update` is a `git pull`, so `main` is the update channel. `optional_env` does not render in `hermes config` for user-installed plugins; set env vars via `.env` / config instead. With the symlink install used here, update by directory basename: `hermes plugins update meshtastic` (not `meshtastic-platform`).
+
+## Development
+
+Contributors: [`docs/DEVELOPING.md`](docs/DEVELOPING.md) covers the workflow — repo `.venv` setup, running the test suite and gates (format/lint/types/coverage plus lightweight architecture gates complexity / layering / extraction), the mock-interface smoke test, and a hardware checklist. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps the modules, data flows, and **anti-god-class rules for AI-assisted PRs**. Read both before editing code.
+
 ## Configuration
 
 Copy the bundled template and edit it for your node and mesh:
@@ -104,6 +114,10 @@ Environment variables:
 | `MESHTASTIC_SEND_RETRIES` | No | `0` | Extra delivery attempts for un-ACKed **direct-message** chunks. `> 0` implies waiting for the ACK; transient failures (timeout, no-route) are re-sent, permanent ones (e.g. `TOO_LARGE`) are not. Broadcasts are never retried. |
 | `MESHTASTIC_RETRY_BACKOFF` | No | `5.0` | Seconds to wait between delivery retries. |
 | `MESHTASTIC_TELEMETRY_RETENTION_DAYS` | No | `30` | Age (days) at which persisted telemetry/position/signal rows are pruned from SQLite. `0` disables pruning. Pruning runs at most hourly, lazily on writes. |
+| `MESHTASTIC_TELEMETRY_MAX_ROWS` | No | `100000` | Hard ceiling on rows **per SQLite table** (`telemetry` / `positions` / `signal_quality`), newest first — not per node. Under a flood one chatty node can crowd out others. `0` disables the cap. Age-based retention (`MESHTASTIC_TELEMETRY_RETENTION_DAYS`) still applies. |
+| `MESHTASTIC_OPEN_TIMEOUT` | No | `20` | Seconds to bound the success-path interface open before treating it as a connect failure (the constructor still runs on the daemon worker). `0` disables the bound (wait indefinitely). Relevant on slow serial/WiFi where discovery can hang. |
+| `MESHTASTIC_OPEN_CANCEL_TIMEOUT` | No | `5` | Seconds to wait for a cancelled in-flight interface open to settle. `0` abandons the cancelled open immediately. |
+| `MESHTASTIC_EXECUTOR_SHUTDOWN_TIMEOUT` | No | `5` | Seconds to wait for the transport worker thread to drain pending interface close/liveness jobs during disconnect. `0` does not wait. |
 | `MESHTASTIC_MOCK` | No | `false` | `true` runs the adapter against the mock interface (dry-run, no real radio traffic). Only relevant when the meshtastic library is missing; otherwise the adapter always opens the real serial/TCP interface. |
 | `MESHTASTIC_AUTOINSTALL` | No | `true` | When the meshtastic library is missing, the adapter runs `pip install -r requirements.txt` into the gateway's Python environment once per process (Hermes updates can wipe plugin deps). Set `0`/`false` to disable and fail with install instructions instead. |
 
@@ -144,10 +158,42 @@ The plugin registers these Hermes tools:
 - `mesh_send_broadcast`: send a channel broadcast.
 - `mesh_telemetry`: read recent telemetry from a node.
 - `mesh_telemetry_history`: query persisted telemetry, position, or signal history.
+- `mesh_request_telemetry`: ask a node to send fresh telemetry (solicited request).
+- `mesh_request_position`: ask a node to send its current position (solicited request).
+- `mesh_traceroute`: trace the route to a node, with per-hop SNR in both directions (solicited request).
+- `mesh_pause`: pause the radio — release the gateway node's connection so the phone app or web UI can use it (timed pauses auto-resume; capped at `PAUSE_MAX_MINUTES`, 12h).
+- `mesh_resume`: resume the radio after `mesh_pause`.
 
 ### Node Freshness
 
 The meshtastic library only refreshes a node's `lastHeard` from periodic **NodeInfo** packets, so it lags a node's actual transmissions. The adapter therefore tracks a live overlay from the packet stream: on every received packet it updates the sender's `last_heard` (from the packet's `rxTime`) and, for direct (0-hop) packets, its `snr`/`rssi` — mirroring the official Meshtastic client. This is done for **every** heard node (including ones not on the allowlist, so you can watch a node you don't bridge), and `mesh_list_nodes` / `mesh_node_info` / `mesh_signal_quality` report the freshest of the library value and this overlay. `mesh_node_info` also returns `last_heard` / `last_heard_epoch`.
+
+## Tool progress (short blurbs, not step dumps)
+
+When the agent uses tools (web search, terminal, …), Hermes can emit
+**tool-progress** lines. On platforms with message editing those update in
+place; on LoRa they would become permanent radio traffic.
+
+This plugin keeps mesh airtime low:
+
+- Progress is a **short emoji blurb** per tool (e.g. `🔍 Searching the web`),
+  not the full query, URL, or shell command.
+- Later progress “edits” do **not** re-transmit over the radio.
+- The final answer is still delivered in full (chunked as usual).
+
+Recommended Hermes display config (`~/.hermes/config.yaml`):
+
+```yaml
+display:
+  platforms:
+    meshtastic:
+      tool_progress: new    # one blurb per tool
+      streaming: false
+```
+
+Dangerous-command **approval** prompts are separate from tool-progress chrome
+and may still appear as longer multi-line messages; reply with `/approve` (or
+your configured approval flow) when prompted.
 
 ## Delivery Semantics
 
@@ -155,12 +201,12 @@ Meshtastic and LoRa delivery are best-effort.
 
 - The adapter requests ACKs with `wantAck=True` for outbound packets.
 - The adapter registers an `onAckNak` callback and records/logs ACK/NACK responses by packet ID when Meshtastic surfaces them.
-- The adapter distinguishes a **real** end-to-end ACK (sent by the destination itself) from an **implicit** ACK relayed by another node (the packet reached the mesh but the destination did not confirm receipt) — mirroring the official client's RECEIVED vs DELIVERED. Only a real ACK counts as delivered; an implicit-only ACK is treated as un-confirmed (and, with retries enabled, re-sent).
+- The adapter distinguishes a **real** end-to-end ACK (sent by the destination itself) from an **implicit** ACK relayed by another node (the packet reached the mesh but the destination did not confirm receipt) — mirroring the official client's RECEIVED vs DELIVERED. Both a real ACK and an implicit-only ACK count as **delivered** (`send_path.classify_ack_outcome`); an implicit ACK is never retried — the mesh carried the packet, so non-delivery isn't established. The price of keeping the real-ACK upgrade window open is that an implicit-only reply waits out the full ACK timeout before the send returns.
 - By default, sends are non-blocking: `sendText()` returning success means the local radio accepted the packet, and later ACK/NACK callbacks are logged if they arrive.
 - Set `MESHTASTIC_ACK_TIMEOUT=30` or pass send metadata `meshtastic_ack_timeout` to wait for ACK/NACK per chunk. In this mode, NAKs and timeouts make `SendResult.success` false.
 - ACK results are exposed in `SendResult.raw_response["chunks"][i]["ack"]` for waited sends, and can be inspected later in code with `adapter.get_ack_status(packet_id)`.
 - Set `MESHTASTIC_SEND_RETRIES=3` to automatically re-send un-ACKed **direct-message** chunks. A retry only fires on a transient failure (ACK timeout, no-route, max-retransmit); permanent NAKs (`TOO_LARGE`, `NO_CHANNEL`, auth/PKI errors) are not retried, and broadcasts are never retried (no per-recipient ACK). Each retry waits `MESHTASTIC_RETRY_BACKOFF` seconds; the per-chunk attempt count is exposed in `SendResult.raw_response["chunks"][i]["attempts"]`. Note: if a message was actually delivered but its ACK was lost, a retry sends a duplicate.
-- Long responses are split and paced, but any chunk may still be dropped by the mesh.
+- Long responses are split and paced, but any chunk may still be dropped by the mesh. A permanent chunk failure **aborts the rest of the sequence** for both DMs and broadcasts (`SendResult.success` is `false`, already-sent packet ids are preserved for diagnostics). That avoids flooding the shared channel after a hard error. Empty/whitespace-only content fails the send rather than reporting a false success.
 
 Even with ACK waiting enabled, delivery is still best-effort because ACK behavior depends on route quality, node firmware behavior, and whether the destination is awake.
 
@@ -251,55 +297,6 @@ The target node may not have initialized public key metadata. Pair the node with
 ### Battery Nodes Miss Messages
 
 Sleeping or power-saving nodes may not receive messages immediately. Configure device-side power behavior in Meshtastic.
-
-## Development
-
-Dev tooling lives in the repo's `.venv` (uv-managed); use `.venv/bin/python`
-for the commands below. The Hermes venv at `~/.hermes/hermes-agent/venv` does
-**not** include ruff/pyrefly/coverage.
-
-```bash
-uv sync   # or: uv venv && uv pip install -r requirements.txt -r requirements-dev.txt
-```
-
-Run the full test suite (five test modules, mock serial + temp SQLite):
-
-```bash
-.venv/bin/python -m unittest \
-  test_meshtastic.py test_chunking.py test_node_freshness.py \
-  test_transport.py test_ack_state.py
-```
-
-Run formatting, linting, and type checks:
-
-```bash
-.venv/bin/python -m ruff format .
-.venv/bin/python -m ruff check .
-.venv/bin/python -m pyrefly check \
-  --python-interpreter-path .venv/bin/python \
-  --search-path ~/.hermes/hermes-agent --min-severity warn
-```
-
-Pull requests are checked by GitHub Actions for Ruff formatting, Ruff linting, Pyrefly type checking, and unit tests with an 80% coverage floor.
-
-### Repository layout
-
-Flat modules, no package nesting (the plugin is loaded by Hermes both as a package and as flat files):
-
-| File | Responsibility |
-| --- | --- |
-| `adapter.py` | `MeshtasticAdapter` — orchestrator: lifecycle, inbound→Hermes bridge, outbound `send()` path, Hermes policy hooks. |
-| `ack_state.py` | `AckTracker` — ACK/NACK state machine (real vs implicit ACKs, waiters, retries). |
-| `transport.py` | Daemon transport executor, serial/TCP target resolution, interface construction, lazy `meshtastic`/`pubsub` imports. |
-| `chunking.py` | UTF-8-byte message chunking (`[i/n]` prefixes, 233-byte ceiling). |
-| `node_freshness.py` | Live per-node `last_heard`/`snr`/`rssi` overlay. |
-| `mock_interface.py` | Fallback mock node/interface when no hardware or deps are present. |
-| `mesh_tools.py` | The seven `mesh_*` tool handlers (loaded as module `meshtastic_tools`). |
-| `schemas.py` | JSON function schemas for the tools. |
-| `telemetry_db.py` | SQLite persistence for telemetry/positions/signal quality. |
-| `__init__.py` | `register(ctx)` plugin entry point. |
-
-Tests: `test_meshtastic.py` holds integration tests against the assembled adapter; `test_chunking.py`, `test_node_freshness.py`, `test_transport.py`, and `test_ack_state.py` hold per-domain unit tests.
 
 ## Known Limitations
 
