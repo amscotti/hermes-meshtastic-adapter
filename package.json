@@ -4,6 +4,6 @@
   "private": true,
   "description": "Dependabot manifest for the CI tooling only — the Python package metadata lives in pyproject.toml. opencode-review.yml installs exactly the pinned opencode-ai devDependency so the reviewer is reproducible.",
   "devDependencies": {
-    "opencode-ai": "1.18.19"
+    "opencode-ai": "1.18.27"
   }
 }
