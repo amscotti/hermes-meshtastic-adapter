@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A **Hermes Agent platform plugin** (`meshtastic-platform`) that bridges a Meshtastic LoRa mesh to Hermes. It is not a standalone app — it is loaded by the Hermes gateway, which calls `register(ctx)` in `__init__.py`. That entry point registers the platform adapter (`adapter.register`) and the twelve `mesh_*` tools.
+A **Hermes Agent platform plugin** (`meshtastic-platform`) that bridges a Meshtastic LoRa mesh to Hermes. It is not a standalone app — it is loaded by the Hermes gateway, which calls `register(ctx)` in `__init__.py`. That entry point registers the platform adapter (`adapter.register`) and the thirteen `mesh_*` tools.
 
 The naming is intentionally three-way: GitHub repo `hermes-meshtastic-adapter`, Hermes plugin `meshtastic-platform`, Hermes platform `meshtastic`.
 
@@ -144,7 +144,7 @@ modules (in tests/CI).
   tests, `mock_port` targets, and explicit `MESHTASTIC_MOCK=1` dry-runs. Real
   serial/TCP targets NEVER fall back to it: a missing meshtastic library
   raises at connect instead (see transport.py above).
-- **`mesh_tools.py`** — the twelve `mesh_*` async tool handlers exposed to the
+- **`mesh_tools.py`** — the thirteen `mesh_*` async tool handlers exposed to the
   agent. Seven are read-only (they serve already-heard data); three are
   **solicited requests** that transmit — see below. `mesh_send_dm` /
   `mesh_send_broadcast` are the direct-send pair. Named `mesh_tools`, **not**

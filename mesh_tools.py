@@ -28,6 +28,7 @@ PAUSE_MAX_MINUTES = 12 * 60  # 12h cap on a timed pause
 # JSON Schemas are imported for exposure in __init__.py
 try:
     from .schemas import (
+        MESH_LIST_CHANNELS_SCHEMA,
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
         MESH_PAUSE_SCHEMA,
@@ -43,6 +44,7 @@ try:
     )
 except ImportError:
     from schemas import (
+        MESH_LIST_CHANNELS_SCHEMA,
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
         MESH_PAUSE_SCHEMA,
@@ -58,6 +60,7 @@ except ImportError:
     )
 
 __all__ = [
+    "MESH_LIST_CHANNELS_SCHEMA",
     "MESH_LIST_NODES_SCHEMA",
     "MESH_NODE_INFO_SCHEMA",
     "MESH_PAUSE_SCHEMA",
@@ -71,6 +74,7 @@ __all__ = [
     "MESH_TELEMETRY_SCHEMA",
     "MESH_TRACEROUTE_SCHEMA",
     "set_adapter",
+    "handle_mesh_list_channels",
     "handle_mesh_list_nodes",
     "handle_mesh_node_info",
     "handle_mesh_pause",
@@ -95,6 +99,7 @@ _adapter_lock = threading.RLock()
 try:
     from .mesh_helpers import (
         assess_signal_quality,
+        channel_entry,
         clamp,
         coerce_float,
         decode_snr_value,
@@ -115,6 +120,7 @@ try:
 except ImportError:
     from mesh_helpers import (
         assess_signal_quality,
+        channel_entry,
         clamp,
         coerce_float,
         decode_snr_value,
@@ -748,3 +754,31 @@ async def handle_mesh_resume(args: dict, **kwargs) -> str:
 
     state = adapter_inst.resume_link()
     return json.dumps({**state, "note": "Reconnecting to the node; it takes a second."}, indent=2)
+
+
+async def handle_mesh_list_channels(args: dict, **kwargs) -> str:
+    """List the channels configured on the locally connected node."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    channels: list[dict[str, Any]] = []
+    for iface in adapter_inst.get_interfaces():
+        local_node = getattr(iface, "localNode", None)
+        for ch in getattr(local_node, "channels", None) or []:
+            entry = channel_entry(ch, iface)
+            if entry is not None:
+                channels.append(entry)
+
+    if not channels:
+        return json.dumps(
+            {"error": "No channel configuration available yet (node not connected or not loaded)."}
+        )
+    return json.dumps(
+        {
+            "channels": channels,
+            "channel_replies_enabled": bool(getattr(adapter_inst, "allow_channels", False)),
+        },
+        indent=2,
+        ensure_ascii=False,
+    )

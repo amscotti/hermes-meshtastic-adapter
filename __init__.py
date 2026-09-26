@@ -14,6 +14,7 @@ instead of silently registering nothing at plugin-load time.
 
 from .adapter import register as register_platform
 from .mesh_tools import (
+    MESH_LIST_CHANNELS_SCHEMA,
     MESH_LIST_NODES_SCHEMA,
     MESH_NODE_INFO_SCHEMA,
     MESH_PAUSE_SCHEMA,
@@ -26,6 +27,7 @@ from .mesh_tools import (
     MESH_TELEMETRY_HISTORY_SCHEMA,
     MESH_TELEMETRY_SCHEMA,
     MESH_TRACEROUTE_SCHEMA,
+    handle_mesh_list_channels,
     handle_mesh_list_nodes,
     handle_mesh_node_info,
     handle_mesh_pause,
@@ -146,4 +148,12 @@ def register(ctx):
         handler=handle_mesh_resume,
         is_async=True,
         emoji="▶️",
+    )
+    ctx.register_tool(
+        name="mesh_list_channels",
+        toolset="meshtastic",
+        schema=MESH_LIST_CHANNELS_SCHEMA,
+        handler=handle_mesh_list_channels,
+        is_async=True,
+        emoji="📻",
     )

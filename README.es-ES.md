@@ -152,6 +152,7 @@ meshtastic:channel:Primary
 El complemento registra estas herramientas de Hermes:
 
 - `mesh_list_nodes`: lista nodos visibles y estado de señal.
+- `mesh_list_channels`: lista los canales del nodo de la puerta de enlace (nombre, rol, tipo de cifrado — nunca la clave).
 - `mesh_node_info`: inspecciona un nodo por ID o nombre.
 - `mesh_signal_quality`: verifica SNR/RSSI actuales y recientes.
 - `mesh_send_dm`: envía un mensaje directo a un nodo.

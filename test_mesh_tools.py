@@ -100,6 +100,7 @@ class _StubAdapter:
       - send_dm/broadcast:   send(chat_id, content)
       - request_*:           request_telemetry / request_position / request_traceroute
       - pause/resume:        pause_link(minutes) / resume_link()
+      - list_channels:       get_interfaces() (localNode.channels), allow_channels
     """
 
     def __init__(self) -> None:
@@ -1343,6 +1344,38 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not a valid node ID", payload["error"])
         self.assertEqual(self.adapter.traceroute_calls, [])
 
+    # --- mesh_list_channels -------------------------------------------------
+
+    async def test_list_channels_reports_local_node_channels(self) -> None:
+        iface = _make_iface({})
+        iface.localNode = SimpleNamespace(
+            channels=[
+                {"index": 0, "name": "Primary", "psk": "AES128"},
+                {"index": 1, "name": "Ops", "psk": "AES128"},
+            ]
+        )
+        self._install_nodes(iface)
+        self.adapter.allow_channels = True
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_list_channels({}))
+        self.assertEqual([ch["name"] for ch in payload["channels"]], ["Primary", "Ops"])
+        self.assertEqual(payload["channels"][1]["role"], "SECONDARY")
+        self.assertTrue(payload["channel_replies_enabled"])
+
+    async def test_list_channels_skips_disabled_and_errors_when_empty(self) -> None:
+        disabled = SimpleNamespace(index=1, role=0, settings=SimpleNamespace(name="x"))
+        iface = _make_iface({})
+        iface.localNode = SimpleNamespace(channels=[disabled])
+        self._install_nodes(iface)
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_list_channels({}))
+        self.assertIn("No channel configuration", payload["error"])
+
+    async def test_list_channels_without_local_node(self) -> None:
+        self._install_nodes(_make_iface({}))
+        payload = json.loads(await meshtastic_tools.handle_mesh_list_channels({}))
+        self.assertIn("error", payload)
+
     # --- mesh_pause / mesh_resume ------------------------------------------
 
     async def test_pause_passthrough_and_note(self) -> None:
@@ -1399,6 +1432,7 @@ class TestMeshToolsNoAdapter(unittest.IsolatedAsyncioTestCase):
     """
 
     _CASES = [
+        ("handle_mesh_list_channels", {}),
         ("handle_mesh_list_nodes", {}),
         ("handle_mesh_node_info", {"node_id": "!aaaa1111"}),
         ("handle_mesh_signal_quality", {"node_id": "!aaaa1111"}),
@@ -1447,6 +1481,7 @@ class TestSchemaContracts(unittest.TestCase):
     """
 
     SCHEMA_CONSTANTS = [
+        "MESH_LIST_CHANNELS_SCHEMA",
         "MESH_LIST_NODES_SCHEMA",
         "MESH_NODE_INFO_SCHEMA",
         "MESH_SIGNAL_QUALITY_SCHEMA",
@@ -1608,13 +1643,13 @@ class TestInitShim(unittest.TestCase):
     package name, so ``__init__.py`` is excluded from pyrefly's project-includes
     and the flat test layout never imports it. This loads it the way the Hermes
     plugin loader does (``hermes_plugins.meshtastic``) and runs ``register``
-    against a fake ctx — the 12-schema / 12-handler import list is resolved
+    against a fake ctx — the 13-schema / 13-handler import list is resolved
     against the real ``mesh_tools`` module, so a renamed handler/schema that
     diverges from the shim fails the suite instead of silently registering
     nothing at plugin-load time (the loader wraps the failure).
     """
 
-    def test_register_forwards_platform_and_all_12_tools(self) -> None:
+    def test_register_forwards_platform_and_all_13_tools(self) -> None:
         import types
 
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1656,8 +1691,8 @@ class TestInitShim(unittest.TestCase):
         self.assertEqual(platform_kwargs["name"], "meshtastic")
         self.assertEqual(platform_kwargs["max_message_length"], 233)
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 12)
-        self.assertEqual(len(set(names)), 12)
+        self.assertEqual(len(names), 13)
+        self.assertEqual(len(set(names)), 13)
         for tool in tools:
             with self.subTest(tool=tool["name"]):
                 self.assertEqual(tool["toolset"], "meshtastic")

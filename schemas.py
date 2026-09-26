@@ -318,3 +318,16 @@ MESH_RESUME_SCHEMA = {
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
+
+MESH_LIST_CHANNELS_SCHEMA = {
+    "name": "mesh_list_channels",
+    "description": (
+        "List the channels configured on the gateway's own Meshtastic node: index, name, "
+        "role (PRIMARY/SECONDARY), encryption kind (never the key), MQTT uplink/downlink "
+        "and position precision. An unnamed primary channel reports the modem-preset name "
+        "the apps show (e.g. 'LongFast', with name_from_preset). 'channel_replies_enabled' "
+        "says whether the agent answers messages on channels. Use the index or name with "
+        "mesh_send_broadcast."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}

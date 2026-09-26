@@ -151,7 +151,7 @@ Flat layout, dual-loadable. Names matter more than sizes.
 | **`solicited.py`** | Response-waiter registry for the three transmit tools. Inject normalize / interfaces / executor / link-lost; never import the adapter. |
 | **`connection.py`** | Pure lifecycle *decisions*: backoff, reconnect step, pause UX, link-drop classification, teardown planning. Orchestration stays on the adapter. |
 | **`transport.py`** | Blocking I/O: daemon executor, open serial/TCP/mock, serialized close, liveness, library autoinstall. Fail loud for real targets when the library is missing. |
-| **`mesh_tools.py`** | The twelve `mesh_*` async handlers. Loaded as logical name **`meshtastic_tools`** (never `tools` — shadows Hermes). Singleton link to the adapter. |
+| **`mesh_tools.py`** | The thirteen `mesh_*` async handlers. Loaded as logical name **`meshtastic_tools`** (never `tools` — shadows Hermes). Singleton link to the adapter. |
 | **`mesh_helpers.py`** | Pure formatting and resolution helpers for tools (hops, signal provenance, history windows). Imports only `telemetry_db` among repo modules. |
 | **`telemetry_db.py`** | SQLite at `~/.hermes/meshtastic_telemetry.db` (telemetry / positions / signal_quality). Age retention + optional row ceiling. Express staleness in payloads; do not wipe history to “fix” age. |
 | **`chunking.py`** | UTF-8-byte-bounded `[i/n]` chunks; 233-byte ceiling; env clamp. |

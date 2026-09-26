@@ -152,6 +152,7 @@ meshtastic:channel:Primary
 The plugin registers these Hermes tools:
 
 - `mesh_list_nodes`: list visible nodes and signal status.
+- `mesh_list_channels`: list the gateway node's channels (name, role, encryption kind — never the key).
 - `mesh_node_info`: inspect a node by ID or name.
 - `mesh_signal_quality`: check current and recent SNR/RSSI.
 - `mesh_send_dm`: send a direct message to a node.

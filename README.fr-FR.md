@@ -152,6 +152,7 @@ meshtastic:channel:Primary
 Le plugin enregistre ces outils Hermes :
 
 - `mesh_list_nodes` : liste les nœuds visibles et l’état du signal.
+- `mesh_list_channels` : liste les canaux du nœud passerelle (nom, rôle, type de chiffrement — jamais la clé).
 - `mesh_node_info` : inspecte un nœud par ID ou nom.
 - `mesh_signal_quality` : consulte le SNR/RSSI actuel et récent.
 - `mesh_send_dm` : envoie un message direct à un nœud.
