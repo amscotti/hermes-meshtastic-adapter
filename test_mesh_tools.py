@@ -428,7 +428,9 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
             pos={"latitude": 37.77, "longitude": -122.41, "time": now - 600},
             deviceMetrics={"batteryLevel": 88, "voltage": 4.12, "uptimeSeconds": 12345},
         )
-        self._install_nodes(_make_iface({"!aaaa1111": node}))
+        iface = _make_iface({"!aaaa1111": node})
+        iface.getMyNodeId = lambda: "!aaaa1111"
+        self._install_nodes(iface)
 
         payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
         self.assertEqual(payload["long_name"], "Alpha Node")
@@ -442,6 +444,40 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["has_public_key"])
         self.assertEqual(payload["last_heard"], "Never")
         self.assertIsNone(payload["last_heard_epoch"])
+
+    async def test_node_info_firmware_reads_protobuf_metadata(self) -> None:
+        # Real hardware: iface.metadata is a protobuf DeviceMetadata, which has
+        # no .get() — this used to crash with "AttributeError: get".
+        iface = _make_iface({"!aaaa1111": _make_node("!aaaa1111", "Alpha", "ALPH")})
+        iface.metadata = SimpleNamespace(firmware_version="2.7.10.abcdef")
+        iface.getMyNodeId = lambda: "!aaaa1111"
+        self._install_nodes(iface)
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
+        self.assertEqual(payload["firmware_version"], "2.7.10.abcdef")
+
+    async def test_node_info_firmware_unknown_before_metadata_arrives(self) -> None:
+        iface = _make_iface({"!aaaa1111": _make_node("!aaaa1111", "Alpha", "ALPH")})
+        iface.metadata = None
+        iface.getMyNodeId = lambda: "!aaaa1111"
+        self._install_nodes(iface)
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
+        self.assertEqual(payload["firmware_version"], "Unknown")
+
+    async def test_node_info_firmware_not_attributed_to_remote_node(self) -> None:
+        # iface.metadata is the local radio's; a remote node must not inherit it.
+        iface = _make_iface(
+            {
+                "!aaaa1111": _make_node("!aaaa1111", "Local", "LOCL"),
+                "!bbbb2222": _make_node("!bbbb2222", "Remote", "REMO"),
+            }
+        )
+        iface.getMyNodeId = lambda: "!aaaa1111"
+        self._install_nodes(iface)
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!bbbb2222"}))
+        self.assertEqual(payload["firmware_version"], "Unknown")
 
     async def test_node_info_marks_old_position_stale(self) -> None:
         now = time.time()
