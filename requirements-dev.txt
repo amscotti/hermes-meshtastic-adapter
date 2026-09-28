@@ -2,3 +2,11 @@ ruff>=0.8.0
 pyrefly>=1.1.1
 types-pyserial>=3.5.0
 coverage>=7.0
+# Mirrors Hermes' own pin: hermes-agent gates ALL of its dependencies on
+# python_version >= '3.14', so `pip install -e _deps/hermes-agent` on CI's
+# Python 3.11 installs none of them — yet gateway.config /
+# gateway.platforms.base (imported by adapter.py and the suite) pull
+# hermes_yaml -> ruamel. Without this, drift CI fails with
+# "ModuleNotFoundError: No module named 'ruamel'". Pinned ==0.18.16 like
+# Hermes (0.18.17 needs ruamel.yaml.clib on 3.14, which has no Windows ARM64 wheel).
+ruamel.yaml==0.18.16

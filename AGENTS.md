@@ -17,11 +17,26 @@ freshness, delivery gotchas). Do not grow `adapter.py` with new domain logic.
   `sys.path` are expected, not a bug. The `.venv` resolves it locally via
   `~/.hermes/hermes-agent`; CI checks out `NousResearch/hermes-agent` into
   `_deps/`. Set `HERMES_AGENT_PATH` if Hermes lives elsewhere.
+- **Keep `_deps/hermes-agent` fresh** (it is gitignored, but Hermes' plugin
+  compat scanner walks the whole plugin dir and does NOT skip `_deps/`).
+  A stale checkout makes `hermes plugins compat` attribute Hermes' own
+  pre-decomposition imports to `meshtastic-platform` (e.g. 155 hits) and
+  disables the plugin after the removal date. Fix: `git -C
+  _deps/hermes-agent fetch origin && git -C _deps/hermes-agent checkout
+  <installed-upstream-commit>` (see `hermes --version`), then re-run
+  `hermes plugins compat`.
 - **Hermes self-updates can rebuild the runtime venv and drop the plugin's
   pip deps** (meshtastic/pypubsub). The adapter auto-installs them once per
   process on connect (`MESHTASTIC_AUTOINSTALL=0` disables); for diagnosis,
   a real connection logs `SerialInterface(...)`, a missing library now raises
   instead of silently using the mock.
+- **CI's Python 3.11 Hermes install ships zero Hermes deps** (upstream gates
+  them all on `python_version >= '3.14'`), so `requirements-dev.txt` carries
+  `ruamel.yaml` for the `gateway.*` import surface the adapter/tests use.
+  If drift CI fails with `ModuleNotFoundError` for another Hermes dep, add
+  it there too — a clean-room venv + `pip install -e _deps/hermes-agent`
+  reproduces drift exactly (2026-09-28: `gateway.config` → `hermes_yaml`
+  → `ruamel`, issue #42).
 
 ## Commands (run with `.venv/bin/python`)
 
