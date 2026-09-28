@@ -203,6 +203,28 @@ async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     return json.dumps({"nodes": results}, indent=2)
 
 
+def _local_firmware_version(iface: Any, node_id: str, adapter_inst: Any) -> str:
+    """Firmware version of the interface's own node, or ``"Unknown"``.
+
+    ``iface.metadata`` describes only the locally connected radio — remote
+    nodes never report firmware — so it is returned only when ``node_id`` is
+    that node. On real hardware it is ``None`` until the radio sends it, then a
+    protobuf ``DeviceMetadata`` (``firmware_version``, no ``.get()``); the mock
+    and test stubs use a dict (``firmwareVersion``).
+    """
+    if iface is None or not node_id:
+        return "Unknown"
+    local_id = inbound.interface_node_id(iface, normalize_id=adapter_inst._normalize_node_id)
+    if not local_id or local_id != adapter_inst._normalize_node_id(node_id):
+        return "Unknown"
+    metadata = getattr(iface, "metadata", None)
+    if isinstance(metadata, dict):
+        version = metadata.get("firmwareVersion") or metadata.get("firmware_version")
+    else:
+        version = getattr(metadata, "firmware_version", None)
+    return str(version) if version else "Unknown"
+
+
 async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     """Retrieve detailed configuration and hardware status for a specific node."""
     node_id_query = args.get("node_id")
@@ -253,7 +275,7 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         "short_name": user.get("shortName"),
         "hardware_model": user.get("hwModel"),
         "role": user.get("role"),
-        "firmware_version": getattr(iface, "metadata", {}).get("firmwareVersion", "Unknown"),
+        "firmware_version": _local_firmware_version(iface, node_id, adapter_inst),
         "battery_level": metrics.get("batteryLevel"),
         "voltage": metrics.get("voltage"),
         "uptime": device_uptime(metrics),
