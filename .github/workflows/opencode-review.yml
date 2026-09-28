@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
           opencode run \
-            --model openrouter/deepseek/deepseek-v4-pro \
+            --model openrouter/deepseek/deepseek-v4.1-flash \
             "Review PR #${PR_NUMBER} on this repository.
 
           Using the gh CLI (the only commands you may run):
