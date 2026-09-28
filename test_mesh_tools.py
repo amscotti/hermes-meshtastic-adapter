@@ -1505,7 +1505,7 @@ class TestMeshToolsNoAdapter(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSchemaContracts(unittest.TestCase):
-    """The 12 tool schemas are a machine-readable contract (C11).
+    """The 13 tool schemas are a machine-readable contract (C11).
 
     Pins the HIGH finding's fix: the schemas were pre-wrapped in the OpenAI
     ``{"type": "function", "function": {...}}`` envelope, which Hermes'
