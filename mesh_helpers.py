@@ -693,3 +693,76 @@ def format_route(route: list, snr: list, adapter_inst: Any) -> list[dict[str, An
                 entry["snr"] = decode_snr_value(raw)
         hops.append(entry)
     return hops
+
+
+# Channel.Role enum values (protobuf); the mock stores plain dicts without a role.
+_CHANNEL_ROLES = {0: "DISABLED", 1: "PRIMARY", 2: "SECONDARY"}
+
+
+def psk_kind(psk: Any) -> str:
+    """Describe a channel PSK without exposing it.
+
+    Firmware semantics: empty = unencrypted, one byte = a well-known key
+    (``0x01`` is the default ``AQ==`` key, others are "simple" variants),
+    16/32 bytes = AES-128/256. The mock stores a label string, passed through.
+    """
+    if isinstance(psk, str):
+        return psk or "none"
+    if not psk:
+        return "none"
+    if len(psk) == 1:
+        return "default" if psk[0] == 1 else "simple"
+    return {16: "aes128", 32: "aes256"}.get(len(psk), "custom")
+
+
+def preset_channel_name(iface: Any) -> str | None:
+    """Name the firmware shows for an unnamed primary channel (e.g. ``LongFast``)."""
+    local_config = getattr(getattr(iface, "localNode", None), "localConfig", None)
+    lora = getattr(local_config, "lora", None)
+    if lora is None:
+        return None
+    try:
+        from meshtastic.protobuf import config_pb2
+
+        preset = config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
+    except Exception:
+        return None
+    return "".join(part.capitalize() for part in preset.split("_"))
+
+
+def channel_entry(ch: Any, iface: Any) -> dict[str, Any] | None:
+    """Normalize one ``localNode.channels`` entry; ``None`` for a disabled slot.
+
+    Dict under the mock, protobuf ``Channel`` (``index``/``role``/``settings``)
+    on hardware. The PSK itself is never returned — only its kind.
+    """
+    if isinstance(ch, dict):
+        index = ch.get("index")
+        return {
+            "index": index,
+            "name": ch.get("name") or "",
+            "role": ch.get("role") or ("PRIMARY" if index == 0 else "SECONDARY"),
+            "encryption": psk_kind(ch.get("psk")),
+        }
+    raw_role = getattr(ch, "role", 0)
+    role = _CHANNEL_ROLES.get(raw_role, str(raw_role))
+    if role == "DISABLED":
+        return None
+    settings = getattr(ch, "settings", None)
+    name = getattr(settings, "name", "") or ""
+    entry: dict[str, Any] = {
+        "index": getattr(ch, "index", None),
+        "name": name,
+        "role": role,
+        "encryption": psk_kind(getattr(settings, "psk", b"")),
+        "uplink_enabled": bool(getattr(settings, "uplink_enabled", False)),
+        "downlink_enabled": bool(getattr(settings, "downlink_enabled", False)),
+    }
+    module_settings = getattr(settings, "module_settings", None)
+    precision = getattr(module_settings, "position_precision", None)
+    if precision is not None:
+        entry["position_precision"] = precision
+    if not name and role == "PRIMARY":
+        entry["name"] = preset_channel_name(iface) or ""
+        entry["name_from_preset"] = True
+    return entry

@@ -68,11 +68,12 @@ Scoping works identically to Telegram's chat partition rules:
 
 ## Network & Management Tools
 
-Once configured, the AI agent is equipped with the following **12** tools:
+Once configured, the AI agent is equipped with the following **13** tools:
 
 ### Read-only (already-heard data; no transmit)
 
 - **`mesh_list_nodes`**: Visible nodes with hop distance, direct-range flags, and signal provenance.
+- **`mesh_list_channels`**: The gateway node's channels — index, name, role, encryption kind (never the key), MQTT flags.
 - **`mesh_node_info`**: Hardware model, firmware, position, battery for a specific node.
 - **`mesh_signal_quality`**: SNR/RSSI and historic quality trends (direct vs relayed provenance).
 - **`mesh_telemetry`**: Latest device metrics and sensor telemetry (battery, voltage, environment).

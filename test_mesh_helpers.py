@@ -187,6 +187,82 @@ class TestResolveNode(unittest.TestCase):
         self.assertEqual(info["user"]["id"], "!aaaa1111")
 
 
+class TestChannelEntry(unittest.TestCase):
+    """mesh_list_channels normalization: mock dicts and real protobuf Channels."""
+
+    def test_psk_kind_never_returns_key_material(self) -> None:
+        cases = [
+            (b"", "none"),
+            (None, "none"),
+            (b"", "default"),
+            (b"", "simple"),
+            (bytes(16), "aes128"),
+            (bytes(32), "aes256"),
+            (bytes(7), "custom"),
+            ("AES128", "AES128"),
+            ("", "none"),
+        ]
+        for psk, expected in cases:
+            with self.subTest(psk=psk):
+                self.assertEqual(mesh_helpers.psk_kind(psk), expected)
+
+    def test_mock_dict_channel(self) -> None:
+        entry = mesh_helpers.channel_entry({"index": 1, "name": "Ops", "psk": "AES128"}, None)
+        self.assertEqual(
+            entry, {"index": 1, "name": "Ops", "role": "SECONDARY", "encryption": "AES128"}
+        )
+        primary = mesh_helpers.channel_entry({"index": 0, "name": "Primary"}, None)
+        self.assertEqual(primary["role"], "PRIMARY")
+
+    def test_protobuf_channels(self) -> None:
+        from meshtastic.protobuf import channel_pb2, config_pb2, localonly_pb2
+
+        local_config = localonly_pb2.LocalConfig()
+        local_config.lora.modem_preset = config_pb2.Config.LoRaConfig.MEDIUM_FAST
+        iface = SimpleNamespace(localNode=SimpleNamespace(localConfig=local_config))
+
+        primary = channel_pb2.Channel(index=0, role=channel_pb2.Channel.PRIMARY)
+        primary.settings.psk = b""
+        primary.settings.module_settings.position_precision = 13
+        entry = mesh_helpers.channel_entry(primary, iface)
+        self.assertEqual(entry["name"], "MediumFast")
+        self.assertTrue(entry["name_from_preset"])
+        self.assertEqual(entry["role"], "PRIMARY")
+        self.assertEqual(entry["encryption"], "default")
+        self.assertEqual(entry["position_precision"], 13)
+
+        secondary = channel_pb2.Channel(index=1, role=channel_pb2.Channel.SECONDARY)
+        secondary.settings.name = "Ops"
+        secondary.settings.psk = bytes(range(32))
+        secondary.settings.uplink_enabled = True
+        entry = mesh_helpers.channel_entry(secondary, iface)
+        self.assertEqual(entry["name"], "Ops")
+        self.assertNotIn("name_from_preset", entry)
+        self.assertEqual(entry["encryption"], "aes256")
+        self.assertTrue(entry["uplink_enabled"])
+        self.assertFalse(entry["downlink_enabled"])
+        self.assertNotIn("psk", entry)
+
+        disabled = channel_pb2.Channel(index=2, role=channel_pb2.Channel.DISABLED)
+        self.assertIsNone(mesh_helpers.channel_entry(disabled, iface))
+
+    def test_unnamed_primary_without_lora_config(self) -> None:
+        primary = SimpleNamespace(index=0, role=1, settings=SimpleNamespace(name="", psk=b""))
+        entry = mesh_helpers.channel_entry(primary, SimpleNamespace())
+        self.assertEqual(entry["name"], "")
+        self.assertTrue(entry["name_from_preset"])
+        self.assertEqual(entry["encryption"], "none")
+        self.assertNotIn("position_precision", entry)
+
+    def test_preset_name_tolerates_unknown_enum(self) -> None:
+        iface = SimpleNamespace(
+            localNode=SimpleNamespace(
+                localConfig=SimpleNamespace(lora=SimpleNamespace(modem_preset=999))
+            )
+        )
+        self.assertIsNone(mesh_helpers.preset_channel_name(iface))
+
+
 class TestMeshHelpersPure(unittest.TestCase):
     """Tiny pure helpers — pinned here so the threshold constants can't drift
     without a test noticing (moved from test_mesh_tools.py with the helpers)."""
