@@ -1218,6 +1218,51 @@ class TestLifecycle(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    async def test_reconnect_loop_pause_releases_healthy_polled_link(self):
+        """A pause taken while the link is up and polling still frees the node.
+
+        The liveness poller loops for as long as the link stays healthy, so a
+        pause it never looks at only took effect after an unrelated drop — on a
+        stable link, never: the tool reported "radio released" while the
+        gateway kept the node's TCP slot (live 2026-10-18).
+        """
+        real_sleep = asyncio.sleep
+        probes = 0
+
+        def tick(_seconds):
+            return real_sleep(0.001)  # collapse 1s/2s loop sleeps; still yields
+
+        def healthy_probe(executor, target, iface, **_kwargs):
+            nonlocal probes
+            probes += 1
+            done: ConcurrentFuture = ConcurrentFuture()
+            done.set_result(True)
+            return done
+
+        with (
+            patch("asyncio.sleep", new=tick),
+            patch.object(transport, "submit_liveness_probe", side_effect=healthy_probe),
+        ):
+            task = asyncio.create_task(
+                self.adapter._reconnect_loop("mock_port", self.adapter._lifecycle_id)
+            )
+            try:
+                for _ in range(200):
+                    if probes >= 3:
+                        break
+                    await real_sleep(0.01)
+                self.assertGreaterEqual(probes, 3, "loop never reached the poller")
+                self.adapter.pause_link()
+                for _ in range(200):
+                    if not self.adapter.get_interfaces():
+                        break
+                    await real_sleep(0.01)
+                self.assertEqual(self.adapter.get_interfaces(), [])
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
     async def test_pubsub_packet_from_detached_interface_is_ignored(self):
         """A packet from an interface no longer registered is dropped."""
         foreign_iface = SimpleNamespace()

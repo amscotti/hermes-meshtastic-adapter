@@ -1358,11 +1358,17 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         Returns True when the link dropped (the outer loop reconnects with
         backoff); False when the poller should exit (lifecycle ended, executor
-        gone, or the interface was replaced under us). A drop is timestamped
-        here; the outer loop owns the serialized close (interfaces must not be
-        closed on the loop thread).
+        gone, the interface was replaced under us, or a pause was requested —
+        the outer loop's RELEASE step then frees the node). A drop is
+        timestamped here; the outer loop owns the serialized close (interfaces
+        must not be closed on the loop thread).
         """
         while self._lifecycle_is_active(lifecycle_id):
+            # A healthy link keeps us in this loop indefinitely, so the pause
+            # flag must be checked here too — not only by the outer loop.
+            with self._pause_lock:
+                if self._paused:
+                    return False
             with self._iface_lock:
                 if target not in self._interfaces:
                     return False
