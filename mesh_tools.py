@@ -109,6 +109,7 @@ try:
         format_node_summary,
         format_route,
         history_window_params,
+        json_safe,
         link_facts,
         node_display_name,
         normalize_position_payload,
@@ -130,6 +131,7 @@ except ImportError:
         format_node_summary,
         format_route,
         history_window_params,
+        json_safe,
         link_facts,
         node_display_name,
         normalize_position_payload,
@@ -303,7 +305,7 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         ),
         "last_heard_epoch": last_heard,
         "has_public_key": has_public_key,
-        "raw_info": info,
+        "raw_info": json_safe(info),
     }
 
     return json.dumps(details, indent=2)
