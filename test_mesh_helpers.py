@@ -8,6 +8,7 @@ Handler-level behavior stays pinned in test_mesh_tools.py / test_meshtastic.py,
 which import these helpers back through mesh_tools.
 """
 
+import json
 import time
 import unittest
 from types import SimpleNamespace
@@ -261,6 +262,34 @@ class TestChannelEntry(unittest.TestCase):
             )
         )
         self.assertIsNone(mesh_helpers.preset_channel_name(iface))
+
+
+class TestJsonSafe(unittest.TestCase):
+    def test_drops_unencodable_values_at_any_depth(self) -> None:
+        proto = object()
+        info = {
+            "num": 1,
+            "user": {"longName": "A", "raw": proto, "flags": [1, proto, {"x": proto}]},
+            "position": {"latitudeI": 5, "raw": proto},
+            "snr": None,
+        }
+        safe = mesh_helpers.json_safe(info)
+        self.assertEqual(
+            safe,
+            {
+                "num": 1,
+                "user": {"longName": "A", "flags": [1, {}]},
+                "position": {"latitudeI": 5},
+                "snr": None,
+            },
+        )
+        json.dumps(safe)  # must not raise
+        self.assertIs(info["user"]["raw"], proto)  # input not mutated
+
+    def test_scalars_and_tuples_pass_through(self) -> None:
+        self.assertEqual(mesh_helpers.json_safe("x"), "x")
+        self.assertEqual(mesh_helpers.json_safe((1, "a")), [1, "a"])
+        self.assertEqual(mesh_helpers.json_safe({2: True}), {"2": True})
 
 
 class TestMeshHelpersPure(unittest.TestCase):

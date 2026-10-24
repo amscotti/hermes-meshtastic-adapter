@@ -457,6 +457,30 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
         self.assertEqual(payload["firmware_version"], "2.7.10.abcdef")
 
+    async def test_node_info_survives_library_raw_protobufs(self) -> None:
+        # Real hardware: a node heard live has the decoded protobuf attached
+        # under "raw" in its user/position dicts, which used to crash
+        # json.dumps with "Object of type User is not JSON serializable".
+        node = _make_node(
+            "!aaaa1111",
+            "Alpha",
+            "ALPH",
+            user_extra={"raw": object()},
+            pos={"latitude": 37.77, "longitude": -122.41, "latitudeI": 377700000},
+        )
+        node["position"]["raw"] = object()
+        self._install_nodes(_make_iface({"!aaaa1111": node}))
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
+        self.assertEqual(payload["long_name"], "Alpha")
+        self.assertEqual(payload["latitude"], 37.77)
+        self.assertNotIn("raw", payload["raw_info"]["user"])
+        self.assertNotIn("raw", payload["raw_info"]["position"])
+        self.assertEqual(payload["raw_info"]["user"]["longName"], "Alpha")
+        self.assertEqual(payload["raw_info"]["position"]["latitudeI"], 377700000)
+        # The library's own node DB is left untouched.
+        self.assertIn("raw", node["user"])
+
     async def test_node_info_firmware_unknown_before_metadata_arrives(self) -> None:
         iface = _make_iface({"!aaaa1111": _make_node("!aaaa1111", "Alpha", "ALPH")})
         iface.metadata = None

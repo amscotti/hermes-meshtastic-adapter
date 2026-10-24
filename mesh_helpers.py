@@ -50,6 +50,7 @@ __all__ = [
     "format_node_summary",
     "format_route",
     "history_window_params",
+    "json_safe",
     "link_facts",
     "node_display_name",
     "normalize_position_payload",
@@ -600,6 +601,28 @@ def normalize_position_payload(pos: Any) -> dict[str, Any]:
     if lon is not None:
         lon = min(180.0, max(-180.0, lon))
     return {"latitude": lat, "longitude": lon, "altitude": alt}
+
+
+def json_safe(value: Any) -> Any:
+    """Copy a library node-DB entry with only JSON-encodable values kept.
+
+    When a NodeInfo or Position packet arrives live, the meshtastic library
+    stores the decoded dict in its node DB with the source protobuf attached
+    under ``raw`` (``node["user"]["raw"]`` is a ``User``, ``node["position"]
+    ["raw"]`` a ``Position``). ``json.dumps`` cannot encode those, so echoing
+    the entry crashed the tool — but only for nodes heard since connect, which
+    is why some nodes worked. Those objects duplicate the dict fields beside
+    them, so they are dropped rather than converted.
+    """
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items() if _json_encodable(v)}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value if _json_encodable(v)]
+    return value
+
+
+def _json_encodable(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool, dict, list, tuple))
 
 
 def requested_node(args: dict, adapter_inst: Any) -> tuple[str | None, str | None]:
