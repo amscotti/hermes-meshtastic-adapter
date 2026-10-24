@@ -291,6 +291,19 @@ class TestJsonSafe(unittest.TestCase):
         self.assertEqual(mesh_helpers.json_safe((1, "a")), [1, "a"])
         self.assertEqual(mesh_helpers.json_safe({2: True}), {"2": True})
 
+    def test_raw_node_info_omits_the_last_packet(self) -> None:
+        """lastReceived carries decoded.text. The tool record must not."""
+        proto = object()
+        info = {
+            "user": {"longName": "A", "raw": proto},
+            "lastReceived": {"decoded": {"text": "secret dm", "payload": b"\x00"}},
+            "adminSessionPassKey": b"\x01\x02",
+        }
+        safe = mesh_helpers.raw_node_info(info)
+        self.assertEqual(safe, {"user": {"longName": "A"}})
+        self.assertEqual(info["lastReceived"]["decoded"]["text"], "secret dm")
+        self.assertIs(info["user"]["raw"], proto)
+
 
 class TestMeshHelpersPure(unittest.TestCase):
     """Tiny pure helpers — pinned here so the threshold constants can't drift

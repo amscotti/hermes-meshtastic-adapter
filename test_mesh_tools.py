@@ -481,6 +481,26 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         # The library's own node DB is left untouched.
         self.assertIn("raw", node["user"])
 
+    async def test_node_info_omits_last_received_text(self) -> None:
+        """The library's last packet includes decrypted text. raw_info must not.
+
+        Text is recorded on the node before the allowlist runs, and this tool
+        can be asked about any heard node, so echoing lastReceived would return
+        a body the inbound path dropped.
+        """
+        node = _make_node("!aaaa1111", "Alpha", "ALPH")
+        node["lastReceived"] = {
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "secret dm", "payload": b"\x00"}
+        }
+        node["adminSessionPassKey"] = b"\x01\x02"
+        self._install_nodes(_make_iface({"!aaaa1111": node}))
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
+        self.assertNotIn("lastReceived", payload["raw_info"])
+        self.assertNotIn("adminSessionPassKey", payload["raw_info"])
+        self.assertNotIn("secret dm", json.dumps(payload))
+        self.assertEqual(node["lastReceived"]["decoded"]["text"], "secret dm")
+
     async def test_node_info_firmware_unknown_before_metadata_arrives(self) -> None:
         iface = _make_iface({"!aaaa1111": _make_node("!aaaa1111", "Alpha", "ALPH")})
         iface.metadata = None

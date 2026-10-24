@@ -56,6 +56,7 @@ __all__ = [
     "normalize_position_payload",
     "numeric_epoch",
     "position_age",
+    "raw_node_info",
     "requested_node",
     "resolve_node",
     "signal_source_for_hops",
@@ -623,6 +624,19 @@ def json_safe(value: Any) -> Any:
 
 def _json_encodable(value: Any) -> bool:
     return value is None or isinstance(value, (str, int, float, bool, dict, list, tuple))
+
+
+def raw_node_info(info: dict[str, Any]) -> Any:
+    """JSON-safe node DB entry for ``mesh_node_info``, without the last packet.
+
+    The library stores that packet on ``lastReceived``. A text packet, and
+    range-test or detection-sensor packets that share its handler, carries
+    the plaintext in ``decoded.text``. The allowlist drops unauthorized text
+    before it reaches the agent, and echoing the packet would hand that body
+    back for any heard node. ``json_safe`` still drops the protobuf ``raw``
+    objects and the binary ``adminSessionPassKey``.
+    """
+    return json_safe({key: value for key, value in info.items() if key != "lastReceived"})
 
 
 def requested_node(args: dict, adapter_inst: Any) -> tuple[str | None, str | None]:
