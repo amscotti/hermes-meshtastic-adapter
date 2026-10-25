@@ -73,6 +73,11 @@ try:
 except ImportError:
     import solicited
 
+try:
+    from . import forwarding
+except ImportError:
+    import forwarding
+
 logger = logging.getLogger(__name__)
 
 # Value snapshots re-exported so existing imports/tests keep resolving.
@@ -490,6 +495,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # the chat id; fix the all-too-common missing-prefix misconfiguration.
         self._expand_home_channel_env_for_gateway()
 
+        # Opt-in relay of DMs from non-allowlisted nodes to the owner's node,
+        # with a rate-limited auto-reply to the sender. Off by default.
+        self._forward_gate = forwarding.forward_gate(os.environ, extra, allowed_nodes_raw)
+
         # Nodes already warned about unauthorized access, mapped to the last
         # warn time — a per-node re-warn window bounds the log volume.
         self._unauthorized_warned: dict[str, float] = {}
@@ -858,6 +867,100 @@ class MeshtasticAdapter(BasePlatformAdapter):
             logger.warning("Unauthorized node ID %s skipped.", sender)
         else:
             logger.debug("Unauthorized node ID %s skipped (repeated).", sender)
+
+    def _forward_unauthorized_dm(self, result: Any, interface: Any, my_node_id: str | None) -> None:
+        """Relay an unauthorized DM to the owner's node and notify the sender.
+
+        Opt-in (``MESHTASTIC_FORWARD_UNKNOWN``); the decisions and rate limits
+        live in forwarding.py. The text goes to the owner, never to the agent.
+        """
+        sender = result.sender
+        text = inbound.extract_text(result.decoded)
+        if sender is None or text is None or not text.strip():
+            return
+        _, is_broadcast = inbound.canonicalize_to_id(result.to_id)
+        gate = self._forward_gate
+        decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
+        target = gate.config.target
+        if not decision.forward or target is None:
+            if gate.config.enabled and not is_broadcast:
+                logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
+            return
+        logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
+        body = forwarding.format_forward(
+            sender, inbound.resolve_sender_name(interface, sender), text
+        )
+        notice = None
+        if decision.auto_reply:
+            notice = forwarding.format_auto_reply(
+                inbound.resolve_sender_name(interface, target), gate.config.language
+            )
+        relay = self._relay_unauthorized_dm(sender, target, body, notice)
+        if not self._spawn_send_task(relay) and notice is not None:
+            gate.reply_done(sender, delivered=False)
+
+    async def _relay_unauthorized_dm(
+        self, sender: str, target: str, body: str, notice: str | None
+    ) -> None:
+        """Forward to the owner, then auto-reply once the forward is through.
+
+        Sent in the same instant as the forward, right after the sender's own
+        packet, the notice went out while the air was busy with that packet's
+        ACK and relay rebroadcasts — on the live mesh it was never rebroadcast
+        at all. So it waits for the forward and ``AUTO_REPLY_DELAY_SECS`` more,
+        and is skipped if the forward failed (it would claim one that did not
+        happen).
+        """
+        delivered = False
+        try:
+            forwarded = await self.send(
+                f"meshtastic:{target}", body, metadata={"meshtastic_verbatim": True}
+            )
+            if notice is None:
+                return
+            if not forwarded.success:
+                logger.info("No auto-reply to %s: forwarding to %s failed", sender, target)
+                return
+            await asyncio.sleep(forwarding.AUTO_REPLY_DELAY_SECS)
+            delivered = await self._send_auto_reply(sender, notice)
+        finally:
+            if notice is not None:
+                self._forward_gate.reply_done(sender, delivered=delivered)
+
+    async def _send_auto_reply(self, sender: str, notice: str) -> bool:
+        """Send the auto-reply; True when the sender really ACKed it.
+
+        No airtime retries — an unconfirmed notice is simply sent again with
+        the sender's next forwarded message, and only a confirmed one starts
+        the cooldown.
+        """
+        result = await self.send(
+            f"meshtastic:{sender}",
+            notice,
+            metadata={
+                "meshtastic_verbatim": True,
+                "meshtastic_send_retries": 0,
+                "meshtastic_wait_for_ack": True,
+            },
+        )
+        delivered = forwarding.confirmed_delivery(result.success, result.raw_response)
+        logger.info(
+            "Auto-reply to %s %s",
+            sender,
+            "confirmed by the sender" if delivered else "not confirmed; will reply again",
+        )
+        return delivered
+
+    def _spawn_send_task(self, coro: Any) -> bool:
+        """Run an adapter-initiated send as a tracked, bounded message task."""
+        if len(self._message_tasks) >= self.MESSAGE_TASK_LIMIT:
+            coro.close()
+            logger.warning("Dropping adapter-initiated send: too many in-flight tasks")
+            return False
+        task = asyncio.create_task(coro)
+        self._message_tasks.add(task)
+        task.add_done_callback(self._handle_message_done)
+        return True
 
     @staticmethod
     def _normalize_node_id(node_id: Any) -> str | None:
@@ -1908,6 +2011,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             if not result.authorized:
                 self._warn_unauthorized_node(sender)
+                self._forward_unauthorized_dm(result, interface, my_node_id)
                 return
 
             text = result.text
@@ -2145,7 +2249,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # (emoji). ASCII punctuation (markdown bullets "-", "*", quotes, parens)
         # is never compacted — those are plausible single-line agent replies, and
         # _compact_tool_progress_line's " for " / ": " splits would mangle them.
-        if content and "\n" not in content and content.strip():
+        # Adapter-composed messages (forwarding) opt out via meshtastic_verbatim.
+        verbatim = bool(metadata and metadata.get("meshtastic_verbatim"))
+        if not verbatim and content and "\n" not in content and content.strip():
             lead = content.strip()[0]
             if not lead.isascii():
                 compacted = self._compact_tool_progress_line(content)
