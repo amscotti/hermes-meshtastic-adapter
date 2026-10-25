@@ -110,7 +110,7 @@ Environment variables:
 | `MESHTASTIC_FORWARD_UNKNOWN` | No | `false` | If true, a **direct message from a node that is not allowlisted** is forwarded to the owner's node (`✉ Name (!id): text`) and the sender gets a one-line auto-reply naming where it went. The agent never sees that text. Channel/broadcast messages are never forwarded. |
 | `MESHTASTIC_FORWARD_TO` | No | First allowlisted node | Node that receives forwarded messages. |
 | `MESHTASTIC_FORWARD_LANG` | No | `en` | Language of the auto-reply: `en` or `ru`. |
-| `MESHTASTIC_FORWARD_REPLY_COOLDOWN_HOURS` | No | `6` | Auto-reply to one sender at most once per this many hours (also stops two auto-responders answering each other). |
+| `MESHTASTIC_FORWARD_REPLY_COOLDOWN_HOURS` | No | `6` | Auto-reply to one sender at most once per this many hours, counted from the sender's real ACK of the last auto-reply; an unconfirmed one is sent again with the next message (the cooldown also stops two auto-responders answering each other). |
 | `MESHTASTIC_FORWARD_PER_HOUR` | No | `5` | Forward at most this many messages per sender per hour; the rest are only logged. |
 | `MESHTASTIC_HOME_CHANNEL` | No | Empty | Cron/default delivery target, such as `meshtastic:!da1b1613` or `meshtastic:channel:0`. A bare node id (`!da1b1613` or `da1b1613`) / `channel:N` value is auto-prefixed to `meshtastic:` with a warning. |
 | `MESHTASTIC_CHUNK_BYTES` | No | `170` | Max UTF-8 bytes per outbound LoRa chunk. `170` is conservative for multi-hop reliability and leaves headroom for encrypted-DM (PKI) overhead; the raw protocol payload ceiling (and the clamp for this value) is `233`. |

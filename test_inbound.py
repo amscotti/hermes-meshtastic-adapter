@@ -30,6 +30,7 @@ if os.path.isdir(hermes_agent_path):
 
 # Register the platform inside the registry so that Platform("meshtastic") resolves correctly in venv
 from gateway.platform_registry import PlatformEntry, platform_registry
+from gateway.platforms.base import SendResult
 
 platform_registry.register(
     PlatformEntry(
@@ -446,9 +447,42 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(forward.args[1].endswith(": hello base"))
         self.assertEqual(notice.args[0], "meshtastic:!bad55555")
         self.assertIn("Автоответ", notice.args[1])
-        self.assertEqual(notice.kwargs["metadata"], {"meshtastic_send_retries": 0})
+        self.assertEqual(
+            notice.kwargs["metadata"],
+            {
+                "meshtastic_verbatim": True,
+                "meshtastic_send_retries": 0,
+                "meshtastic_wait_for_ack": True,
+            },
+        )
+        self.assertEqual(forward.kwargs["metadata"], {"meshtastic_verbatim": True})
         # The agent still never sees the stranger's text.
         await self._assert_handle_message_never_called()
+
+    async def test_forwarded_text_reaches_the_radio_intact(self):
+        # Through the real send(): its tool-progress compaction would cut an
+        # emoji- or Cyrillic-led line at ": " and drop the message itself.
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=True, target="!ab12cd34", language="ru")
+        )
+        iface = self.adapter.get_interfaces()[0]
+        sent: list[tuple[str, str]] = []
+
+        def capture(text, **kwargs):
+            sent.append((kwargs.get("destinationId"), text))
+            return SimpleNamespace(id=len(sent))
+
+        iface.sendText = MagicMock(side_effect=capture)
+        text = "are you around this weekend? need a hand with the antenna mast"
+        self.adapter._on_receive(self._stranger_dm(text.encode()), iface)
+        deadline = time.monotonic() + 2.0
+        while len(sent) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        by_dest = dict(sent)
+        self.assertTrue(by_dest["!ab12cd34"].endswith(": " + text))
+        self.assertTrue(by_dest["!bad55555"].startswith("Автоответ: "))
+        self.assertTrue(by_dest["!bad55555"].endswith("Ответ может прийти позже."))
 
     async def test_repeat_dm_forwarded_without_second_auto_reply(self):
         send = self._enable_forwarding()
@@ -459,6 +493,29 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         targets = [c.args[0] for c in send.call_args_list]
         self.assertEqual(targets.count("meshtastic:!ab12cd34"), 2)
         self.assertEqual(targets.count("meshtastic:!bad55555"), 1)
+
+    async def test_auto_reply_cooldown_starts_only_on_real_ack(self):
+        send = self._enable_forwarding()
+        iface = self.adapter.get_interfaces()[0]
+        gate = self.adapter._forward_gate
+
+        send.return_value = SendResult(
+            success=True, raw_response={"chunks": [{"ack": {"status": "implicit_ack"}}]}
+        )
+        self.adapter._on_receive(self._stranger_dm(b"one"), iface)
+        await self._poll_send_calls(send, 2)
+        self.assertNotIn("!bad55555", gate._last_reply)
+
+        send.return_value = SendResult(
+            success=True, raw_response={"chunks": [{"ack": {"status": "ack"}}]}
+        )
+        self.adapter._on_receive(self._stranger_dm(b"two"), iface)
+        await self._poll_send_calls(send, 4)
+        self.assertIn("!bad55555", gate._last_reply)
+
+        self.adapter._on_receive(self._stranger_dm(b"three"), iface)
+        await self._poll_send_calls(send, 5)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
 
     async def test_unauthorized_broadcast_not_forwarded(self):
         send = self._enable_forwarding()

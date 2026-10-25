@@ -96,11 +96,30 @@ class TestForwardGate(unittest.TestCase):
     def test_auto_reply_once_per_cooldown(self) -> None:
         gate, clock = _gate(reply_cooldown_secs=3600)
         self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
+        gate.reply_done("!stranger", delivered=True)
         clock.now += 60
         second = gate.decide("!stranger", is_broadcast=False)
         self.assertTrue(second.forward)
         self.assertFalse(second.auto_reply)
         clock.now += 3600
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
+
+    def test_unconfirmed_auto_reply_is_sent_again(self) -> None:
+        # The cooldown starts only on the sender's real ACK; a lost notice
+        # is retried with the next forwarded message.
+        gate, clock = _gate()
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
+        gate.reply_done("!stranger", delivered=False)
+        clock.now += 60
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
+
+    def test_one_auto_reply_in_flight_per_sender(self) -> None:
+        gate, _ = _gate()
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
+        second = gate.decide("!stranger", is_broadcast=False)
+        self.assertTrue(second.forward)
+        self.assertFalse(second.auto_reply)
+        gate.reply_done("!stranger", delivered=False)
         self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
 
     def test_hourly_forward_cap_is_sliding(self) -> None:
@@ -129,8 +148,29 @@ class TestForwardGate(unittest.TestCase):
         gate, _ = _gate()
         for i in range(forwarding.SENDER_LIMIT + 50):
             gate.decide(f"!{i:08x}", is_broadcast=False)
+            gate.reply_done(f"!{i:08x}", delivered=True)
         self.assertEqual(len(gate._forwards), forwarding.SENDER_LIMIT)
         self.assertEqual(len(gate._last_reply), forwarding.SENDER_LIMIT)
+        self.assertEqual(gate._reply_inflight, set())
+
+
+class TestConfirmedDelivery(unittest.TestCase):
+    def test_real_ack_on_every_chunk(self) -> None:
+        raw = {"chunks": [{"ack": {"status": "ack"}}, {"ack": {"status": "ack"}}]}
+        self.assertTrue(forwarding.confirmed_delivery(True, raw))
+
+    def test_implicit_ack_or_failure_is_not_confirmation(self) -> None:
+        implicit = {"chunks": [{"ack": {"status": "ack"}}, {"ack": {"status": "implicit_ack"}}]}
+        cases = [
+            (True, implicit),
+            (False, {"chunks": [{"ack": {"status": "ack"}}]}),
+            (True, {"chunks": [{"packet_id": "1"}]}),
+            (True, {"chunks": []}),
+            (True, {"chunks": ["junk"]}),
+            (True, None),
+        ]
+        for success, raw in cases:
+            self.assertFalse(forwarding.confirmed_delivery(success, raw), raw)
 
 
 class TestFormatting(unittest.TestCase):

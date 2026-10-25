@@ -8,8 +8,9 @@ the sender gets a one-line auto-reply naming where it went. The agent never
 sees the text — this path runs where the inbound gate drops it.
 
 Both transmissions spend shared airtime, so both are rate limited per sender:
-the auto-reply goes out at most once per ``reply_cooldown_secs`` (which also
-stops two auto-responders from answering each other forever), and at most
+the auto-reply goes out at most once per ``reply_cooldown_secs``, counted from
+the sender's real ACK of the last one (which also stops two auto-responders
+from answering each other forever), and at most
 ``forwards_per_hour`` messages per sender reach the owner. Channel/broadcast
 text is never forwarded or answered.
 
@@ -125,6 +126,7 @@ class ForwardGate:
         self._config = config
         self._clock = clock
         self._last_reply: OrderedDict[str, float] = OrderedDict()
+        self._reply_inflight: set[str] = set()
         self._forwards: OrderedDict[str, deque[float]] = OrderedDict()
 
     @property
@@ -152,17 +154,49 @@ class ForwardGate:
             sent.append(now)
 
         # The notice says the message was forwarded, so it never goes out for
-        # one the hourly cap held back.
+        # one the hourly cap held back. The cooldown starts only once the
+        # sender confirms a notice (reply_done); until then one is in flight
+        # at a time and the next forwarded message gets another try.
         last = self._last_reply.get(sender)
-        auto_reply = forward and (last is None or now - last >= cfg.reply_cooldown_secs)
+        auto_reply = (
+            forward
+            and sender not in self._reply_inflight
+            and (last is None or now - last >= cfg.reply_cooldown_secs)
+        )
         if auto_reply:
-            self._last_reply[sender] = now
-            self._last_reply.move_to_end(sender)
+            self._reply_inflight.add(sender)
 
         for store in (self._forwards, self._last_reply):
             while len(store) > SENDER_LIMIT:
                 store.popitem(last=False)
         return ForwardDecision(forward=forward, auto_reply=auto_reply)
+
+    def reply_done(self, sender: str, *, delivered: bool) -> None:
+        """Close an in-flight auto-reply; a confirmed one starts the cooldown."""
+        self._reply_inflight.discard(sender)
+        if delivered:
+            self._last_reply[sender] = self._clock()
+            self._last_reply.move_to_end(sender)
+            while len(self._last_reply) > SENDER_LIMIT:
+                self._last_reply.popitem(last=False)
+
+
+def confirmed_delivery(success: bool, raw_response: Any) -> bool:
+    """Whether every chunk of a send got a real end-to-end ACK.
+
+    An implicit ACK only means a relay rebroadcast the packet, so it does
+    not count: the sender has not confirmed seeing the notice.
+    """
+    if not success or not isinstance(raw_response, dict):
+        return False
+    chunks = raw_response.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return False
+    for chunk in chunks:
+        ack = chunk.get("ack") if isinstance(chunk, dict) else None
+        if not isinstance(ack, dict) or ack.get("status") != "ack":
+            return False
+    return True
 
 
 def forward_gate(

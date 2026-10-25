@@ -887,27 +887,54 @@ class MeshtasticAdapter(BasePlatformAdapter):
             body = forwarding.format_forward(
                 sender, inbound.resolve_sender_name(interface, sender), text
             )
-            self._spawn_send_task(self.send(f"meshtastic:{target}", body))
+            self._spawn_send_task(
+                self.send(f"meshtastic:{target}", body, metadata={"meshtastic_verbatim": True})
+            )
         elif gate.config.enabled and not is_broadcast:
             logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
         if decision.auto_reply and target is not None:
             notice = forwarding.format_auto_reply(
                 inbound.resolve_sender_name(interface, target), gate.config.language
             )
-            # A notice is not worth airtime retries; the sender can write again.
-            self._spawn_send_task(
-                self.send(f"meshtastic:{sender}", notice, metadata={"meshtastic_send_retries": 0})
-            )
+            if not self._spawn_send_task(self._send_auto_reply(sender, notice)):
+                gate.reply_done(sender, delivered=False)
 
-    def _spawn_send_task(self, coro: Any) -> None:
+    async def _send_auto_reply(self, sender: str, notice: str) -> None:
+        """Send the auto-reply; only a real ACK from the sender starts its cooldown.
+
+        No airtime retries — an unconfirmed notice is simply sent again with
+        the sender's next forwarded message.
+        """
+        delivered = False
+        try:
+            result = await self.send(
+                f"meshtastic:{sender}",
+                notice,
+                metadata={
+                    "meshtastic_verbatim": True,
+                    "meshtastic_send_retries": 0,
+                    "meshtastic_wait_for_ack": True,
+                },
+            )
+            delivered = forwarding.confirmed_delivery(result.success, result.raw_response)
+        finally:
+            self._forward_gate.reply_done(sender, delivered=delivered)
+        logger.info(
+            "Auto-reply to %s %s",
+            sender,
+            "confirmed by the sender" if delivered else "not confirmed; will reply again",
+        )
+
+    def _spawn_send_task(self, coro: Any) -> bool:
         """Run an adapter-initiated send as a tracked, bounded message task."""
         if len(self._message_tasks) >= self.MESSAGE_TASK_LIMIT:
             coro.close()
             logger.warning("Dropping adapter-initiated send: too many in-flight tasks")
-            return
+            return False
         task = asyncio.create_task(coro)
         self._message_tasks.add(task)
         task.add_done_callback(self._handle_message_done)
+        return True
 
     @staticmethod
     def _normalize_node_id(node_id: Any) -> str | None:
@@ -2196,7 +2223,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # (emoji). ASCII punctuation (markdown bullets "-", "*", quotes, parens)
         # is never compacted — those are plausible single-line agent replies, and
         # _compact_tool_progress_line's " for " / ": " splits would mangle them.
-        if content and "\n" not in content and content.strip():
+        # Adapter-composed messages (forwarding) opt out via meshtastic_verbatim.
+        verbatim = bool(metadata and metadata.get("meshtastic_verbatim"))
+        if not verbatim and content and "\n" not in content and content.strip():
             lead = content.strip()[0]
             if not lead.isascii():
                 compacted = self._compact_tool_progress_line(content)

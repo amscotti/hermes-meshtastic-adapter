@@ -2911,6 +2911,26 @@ class TestSendPath(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0], "🔍 Searching the web")
 
+    async def test_send_verbatim_metadata_skips_compaction(self):
+        """Adapter-composed messages that merely look like progress chrome
+        (emoji or Cyrillic lead, ": " separator) are delivered in full."""
+        iface = self.adapter.get_interfaces()[0]
+        sent: list[str] = []
+
+        def capture(text, **_kwargs):
+            sent.append(text)
+            return SimpleNamespace(id=len(sent))
+
+        iface.sendText = MagicMock(side_effect=capture)
+        content = "✉ Crocodile router (!49b555ec): are you around this weekend?"
+        res = await self.adapter.send(
+            chat_id="meshtastic:!ab12cd34",
+            content=content,
+            metadata={"meshtastic_verbatim": True},
+        )
+        self.assertTrue(res.success)
+        self.assertEqual(sent, [content])
+
     async def test_send_does_not_compact_ascii_punctuation_single_line(self):
         """Single-line agent replies starting with ASCII punctuation (markdown
         bullets, quoted strings) are delivered verbatim — the compaction
