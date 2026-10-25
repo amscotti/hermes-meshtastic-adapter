@@ -33,6 +33,9 @@ FORWARD_WINDOW_SECS = 3600.0
 SENDER_LIMIT = 512
 LANGUAGES = ("en", "ru")
 DEFAULT_LANGUAGE = "en"
+# Pause between the forward completing and the auto-reply, so the notice is
+# not transmitted into the burst around the sender's own packet.
+AUTO_REPLY_DELAY_SECS = 5.0
 
 AUTO_REPLIES = {
     "en": "Auto-reply: your message was forwarded to {name}. A reply may come later.",

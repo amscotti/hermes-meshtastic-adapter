@@ -882,48 +882,74 @@ class MeshtasticAdapter(BasePlatformAdapter):
         gate = self._forward_gate
         decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         target = gate.config.target
-        if decision.forward:
-            logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
-            body = forwarding.format_forward(
-                sender, inbound.resolve_sender_name(interface, sender), text
-            )
-            self._spawn_send_task(
-                self.send(f"meshtastic:{target}", body, metadata={"meshtastic_verbatim": True})
-            )
-        elif gate.config.enabled and not is_broadcast:
-            logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
-        if decision.auto_reply and target is not None:
+        if not decision.forward or target is None:
+            if gate.config.enabled and not is_broadcast:
+                logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
+            return
+        logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
+        body = forwarding.format_forward(
+            sender, inbound.resolve_sender_name(interface, sender), text
+        )
+        notice = None
+        if decision.auto_reply:
             notice = forwarding.format_auto_reply(
                 inbound.resolve_sender_name(interface, target), gate.config.language
             )
-            if not self._spawn_send_task(self._send_auto_reply(sender, notice)):
-                gate.reply_done(sender, delivered=False)
+        relay = self._relay_unauthorized_dm(sender, target, body, notice)
+        if not self._spawn_send_task(relay) and notice is not None:
+            gate.reply_done(sender, delivered=False)
 
-    async def _send_auto_reply(self, sender: str, notice: str) -> None:
-        """Send the auto-reply; only a real ACK from the sender starts its cooldown.
+    async def _relay_unauthorized_dm(
+        self, sender: str, target: str, body: str, notice: str | None
+    ) -> None:
+        """Forward to the owner, then auto-reply once the forward is through.
 
-        No airtime retries — an unconfirmed notice is simply sent again with
-        the sender's next forwarded message.
+        Sent in the same instant as the forward, right after the sender's own
+        packet, the notice went out while the air was busy with that packet's
+        ACK and relay rebroadcasts — on the live mesh it was never rebroadcast
+        at all. So it waits for the forward and ``AUTO_REPLY_DELAY_SECS`` more,
+        and is skipped if the forward failed (it would claim one that did not
+        happen).
         """
         delivered = False
         try:
-            result = await self.send(
-                f"meshtastic:{sender}",
-                notice,
-                metadata={
-                    "meshtastic_verbatim": True,
-                    "meshtastic_send_retries": 0,
-                    "meshtastic_wait_for_ack": True,
-                },
+            forwarded = await self.send(
+                f"meshtastic:{target}", body, metadata={"meshtastic_verbatim": True}
             )
-            delivered = forwarding.confirmed_delivery(result.success, result.raw_response)
+            if notice is None:
+                return
+            if not forwarded.success:
+                logger.info("No auto-reply to %s: forwarding to %s failed", sender, target)
+                return
+            await asyncio.sleep(forwarding.AUTO_REPLY_DELAY_SECS)
+            delivered = await self._send_auto_reply(sender, notice)
         finally:
-            self._forward_gate.reply_done(sender, delivered=delivered)
+            if notice is not None:
+                self._forward_gate.reply_done(sender, delivered=delivered)
+
+    async def _send_auto_reply(self, sender: str, notice: str) -> bool:
+        """Send the auto-reply; True when the sender really ACKed it.
+
+        No airtime retries — an unconfirmed notice is simply sent again with
+        the sender's next forwarded message, and only a confirmed one starts
+        the cooldown.
+        """
+        result = await self.send(
+            f"meshtastic:{sender}",
+            notice,
+            metadata={
+                "meshtastic_verbatim": True,
+                "meshtastic_send_retries": 0,
+                "meshtastic_wait_for_ack": True,
+            },
+        )
+        delivered = forwarding.confirmed_delivery(result.success, result.raw_response)
         logger.info(
             "Auto-reply to %s %s",
             sender,
             "confirmed by the sender" if delivered else "not confirmed; will reply again",
         )
+        return delivered
 
     def _spawn_send_task(self, coro: Any) -> bool:
         """Run an adapter-initiated send as a tracked, bounded message task."""

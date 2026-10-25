@@ -411,6 +411,9 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         """Turn forwarding on toward !ab12cd34 and capture outbound sends."""
         cfg = forwarding.ForwardConfig(enabled=True, target="!ab12cd34", **overrides)
         self.adapter._forward_gate = forwarding.ForwardGate(cfg)
+        delay = patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
         send = AsyncMock()
         self.adapter.send = send
         return send
@@ -465,6 +468,9 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         self.adapter._forward_gate = forwarding.ForwardGate(
             forwarding.ForwardConfig(enabled=True, target="!ab12cd34", language="ru")
         )
+        delay = patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
         iface = self.adapter.get_interfaces()[0]
         sent: list[tuple[str, str]] = []
 
@@ -516,6 +522,40 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         self.adapter._on_receive(self._stranger_dm(b"three"), iface)
         await self._poll_send_calls(send, 5)
         self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+
+    async def test_auto_reply_waits_for_the_forward_and_the_delay(self):
+        send = self._enable_forwarding()
+        order: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_send(chat_id, *_args, **_kwargs):
+            order.append(chat_id)
+            return SendResult(success=True)
+
+        async def fake_sleep(secs):
+            order.append(f"sleep {secs}")
+            await real_sleep(0)
+
+        send.side_effect = fake_send
+        with (
+            patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 5.0),
+            patch("asyncio.sleep", side_effect=fake_sleep),
+        ):
+            self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+            deadline = time.monotonic() + 1.0
+            while len(order) < 3 and time.monotonic() < deadline:
+                await real_sleep(0.01)
+        self.assertEqual(order[:3], ["meshtastic:!ab12cd34", "sleep 5.0", "meshtastic:!bad55555"])
+
+    async def test_no_auto_reply_when_the_forward_failed(self):
+        send = self._enable_forwarding()
+        send.return_value = SendResult(success=False, error="timeout")
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 1)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+        # The sender stays eligible for a notice with its next message.
+        self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
+        self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
 
     async def test_unauthorized_broadcast_not_forwarded(self):
         send = self._enable_forwarding()
