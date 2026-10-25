@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
@@ -2141,13 +2142,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Send a message, queueing if not connected; oversized payloads are chunked."""
         # Gateway tool-progress path bypasses format_tool_event and builds long
         # verb+preview lines; compact those to a short emoji blurb before chunking.
-        # Only rewrite single-line chrome that starts with a non-ASCII symbol
-        # (emoji). ASCII punctuation (markdown bullets "-", "*", quotes, parens)
-        # is never compacted — those are plausible single-line agent replies, and
-        # _compact_tool_progress_line's " for " / ": " splits would mangle them.
+        # Only rewrite single-line chrome that starts with a symbol (emoji,
+        # Unicode category "So"). Anything else is a plausible single-line agent
+        # reply that _compact_tool_progress_line's " for " / ": " splits would
+        # mangle: ASCII punctuation (markdown bullets "-", "*", quotes, parens),
+        # a letter in any script (a Russian reply starts with a non-ASCII
+        # letter), and non-ASCII punctuation such as «, • or —.
         if content and "\n" not in content and content.strip():
             lead = content.strip()[0]
-            if not lead.isascii():
+            if unicodedata.category(lead) == "So":
                 compacted = self._compact_tool_progress_line(content)
                 if compacted != content and len(compacted) < len(content):
                     content = compacted
