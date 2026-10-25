@@ -74,7 +74,7 @@ line-ending = "auto"
 [tool.coverage.run]
 # mesh_tools.py is loaded dynamically as `meshtastic_tools` (see test_meshtastic.py
 # and adapter._load_tools_module) to avoid colliding with Hermes' `tools` pkg.
-source = ["adapter", "ack_state", "chunking", "connection", "inbound", "mesh_helpers", "meshtastic_tools", "mock_interface", "node_freshness", "send_path", "solicited", "telemetry_db", "schemas", "transport"]
+source = ["adapter", "ack_state", "chunking", "connection", "forwarding", "inbound", "mesh_helpers", "meshtastic_tools", "mock_interface", "node_freshness", "send_path", "solicited", "telemetry_db", "schemas", "transport"]
 # Branch measurement guards the mixed defensive legs (except-pass swallows,
 # repr fallbacks) that a 100%-line module could otherwise hide. The suite
 # holds ~97% branch coverage, far above the 80% floor.
@@ -98,7 +98,7 @@ exclude_lines = [
 # a project root pyrefly resolves its relative imports (`from .adapter import …`)
 # to `__unknown__` and errors. The shim's symbols are still type-checked via
 # adapter.py / mesh_tools.py.
-# NOTE: the list must cover EVERY top-level module (14 today) — a module left
+# NOTE: the list must cover EVERY top-level module (15 today) — a module left
 # out of project-includes is silently skipped by `pyrefly check`, so it can
 # accumulate type errors CI never sees. Add new sibling modules here.
 project-includes = [
@@ -106,6 +106,7 @@ project-includes = [
     "ack_state.py",
     "chunking.py",
     "connection.py",
+    "forwarding.py",
     "inbound.py",
     "mesh_helpers.py",
     "mock_interface.py",

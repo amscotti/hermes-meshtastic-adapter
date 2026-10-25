@@ -73,6 +73,11 @@ try:
 except ImportError:
     import solicited
 
+try:
+    from . import forwarding
+except ImportError:
+    import forwarding
+
 logger = logging.getLogger(__name__)
 
 # Value snapshots re-exported so existing imports/tests keep resolving.
@@ -490,6 +495,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # the chat id; fix the all-too-common missing-prefix misconfiguration.
         self._expand_home_channel_env_for_gateway()
 
+        # Opt-in relay of DMs from non-allowlisted nodes to the owner's node,
+        # with a rate-limited auto-reply to the sender. Off by default.
+        self._forward_gate = forwarding.forward_gate(os.environ, extra, allowed_nodes_raw)
+
         # Nodes already warned about unauthorized access, mapped to the last
         # warn time — a per-node re-warn window bounds the log volume.
         self._unauthorized_warned: dict[str, float] = {}
@@ -858,6 +867,47 @@ class MeshtasticAdapter(BasePlatformAdapter):
             logger.warning("Unauthorized node ID %s skipped.", sender)
         else:
             logger.debug("Unauthorized node ID %s skipped (repeated).", sender)
+
+    def _forward_unauthorized_dm(self, result: Any, interface: Any, my_node_id: str | None) -> None:
+        """Relay an unauthorized DM to the owner's node and notify the sender.
+
+        Opt-in (``MESHTASTIC_FORWARD_UNKNOWN``); the decisions and rate limits
+        live in forwarding.py. The text goes to the owner, never to the agent.
+        """
+        sender = result.sender
+        text = inbound.extract_text(result.decoded)
+        if sender is None or text is None or not text.strip():
+            return
+        _, is_broadcast = inbound.canonicalize_to_id(result.to_id)
+        gate = self._forward_gate
+        decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
+        target = gate.config.target
+        if decision.forward:
+            logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
+            body = forwarding.format_forward(
+                sender, inbound.resolve_sender_name(interface, sender), text
+            )
+            self._spawn_send_task(self.send(f"meshtastic:{target}", body))
+        elif gate.config.enabled and not is_broadcast:
+            logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
+        if decision.auto_reply and target is not None:
+            notice = forwarding.format_auto_reply(
+                inbound.resolve_sender_name(interface, target), gate.config.language
+            )
+            # A notice is not worth airtime retries; the sender can write again.
+            self._spawn_send_task(
+                self.send(f"meshtastic:{sender}", notice, metadata={"meshtastic_send_retries": 0})
+            )
+
+    def _spawn_send_task(self, coro: Any) -> None:
+        """Run an adapter-initiated send as a tracked, bounded message task."""
+        if len(self._message_tasks) >= self.MESSAGE_TASK_LIMIT:
+            coro.close()
+            logger.warning("Dropping adapter-initiated send: too many in-flight tasks")
+            return
+        task = asyncio.create_task(coro)
+        self._message_tasks.add(task)
+        task.add_done_callback(self._handle_message_done)
 
     @staticmethod
     def _normalize_node_id(node_id: Any) -> str | None:
@@ -1908,6 +1958,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             if not result.authorized:
                 self._warn_unauthorized_node(sender)
+                self._forward_unauthorized_dm(result, interface, my_node_id)
                 return
 
             text = result.text

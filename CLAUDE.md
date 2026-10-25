@@ -57,7 +57,7 @@ rules for AI-assisted PRs, and "where new code goes". Do not grow
 `adapter.py` with new domain logic — put pure decisions / state machines /
 blocking I/O in sibling modules and keep the adapter as orchestration only.
 
-Fourteen source modules, no package nesting. `adapter.py` is the orchestrator;
+Fifteen source modules, no package nesting. `adapter.py` is the orchestrator;
 the siblings below were extracted to keep each concern testable in isolation.
 Every cross-module import uses the dual-import convention (see "Conventions
 and gotchas") so the plugin works both as a package (in Hermes) and as flat
@@ -130,6 +130,10 @@ modules (in tests/CI).
   link-drop classification (`classify_link_drop`) and teardown planning
   (`teardown_owner_current`, `teardown_task_list`, `tasks_on_loop`). Stdlib
   only — no repo imports; everything adapter-specific is parameter-passed.
+- **`forwarding.py`** — opt-in relay of DMs from non-allowlisted nodes to
+  the owner's node (`forward_config`, `ForwardGate`, `format_forward`,
+  `format_auto_reply`). Stdlib only (a leaf); the adapter's
+  `_forward_unauthorized_dm` resolves names and does the two sends.
 - **`chunking.py`** — `chunk_message` / `split_utf8` plus `MAX_MESSAGE_LENGTH`
   (233, the `DATA_PAYLOAD_LEN` ceiling) and `DEFAULT_CHUNK_BYTES` (170).
   `MESHTASTIC_CHUNK_BYTES` is clamped to a `MIN_CHUNK_BYTES` (30) floor;
@@ -239,6 +243,8 @@ Do not "clean" the database to deal with staleness. It is ~0.3 MB, `maybe_prune(
 
 **Channels are opt-in.** By default `_on_receive` bridges **DMs only** — a broadcast/channel message is logged and dropped so the agent never replies into a shared channel's airtime. `MESHTASTIC_ALLOW_CHANNELS=true` (or `allow_channels` in plugin extra) enables answering channels.
 
+**Forwarding unknown DMs is opt-in too.** With `MESHTASTIC_FORWARD_UNKNOWN=true` a DM from a node that is not allowlisted is not just dropped: `_forward_unauthorized_dm` sends it to the owner's node (`MESHTASTIC_FORWARD_TO`, default the first allowlisted node) as `✉ Name (!id): text`, and sends the sender a one-line auto-reply (`MESHTASTIC_FORWARD_LANG` `en`/`ru`, no retries). It runs where the gate drops the text, so the agent still never sees it. Both sends cost shared airtime and are rate limited per sender in `forwarding.ForwardGate`: one auto-reply per `MESHTASTIC_FORWARD_REPLY_COOLDOWN_HOURS` (6h; this is also what stops two auto-responders answering each other forever) and `MESHTASTIC_FORWARD_PER_HOUR` (5) forwards on a sliding hour. No auto-reply goes out for a message the hourly cap held back — it would claim a forward that did not happen. Broadcasts, the target itself and our own node are never forwarded.
+
 ### Outbound path (Hermes → mesh)
 
 The send/retry/ACK-outcome **decisions** live in `send_path.py`'s pure
@@ -328,7 +334,7 @@ The node accepts only a couple of TCP clients, so connecting from the phone app 
 - **The tool module is `mesh_tools.py`, loaded under the logical name `meshtastic_tools`.** It must NOT be named `tools.py`: Hermes' own code imports `tools.registry` transitively while `gateway` is imported, and a top-level `tools.py` in this repo (which sits first on `sys.path` in the flat test/CI layout) shadows Hermes' `tools` package and breaks the whole import. Loading it dynamically as `meshtastic_tools` was not enough — the collision is at *Hermes'* import site, not ours — hence the distinct filename. `adapter._load_tools_module` and `test_meshtastic.py` both load `mesh_tools.py`; preserve the naming.
 - **The adapter↔tools link is a module-level singleton.** `connect()` calls `mesh_tools.set_adapter(self)`; handlers reach it via `_get_adapter()`. Tools return `{"error": ...}` JSON when no adapter is active.
 - **The adapter↔AckTracker link is a back-reference.** `AckTracker.__init__(self, adapter)` stores `self._adapter`; lifecycle lock/state, the platform loop, and `_normalize_node_id` are reached via that reference. The lock-ordering in `_record_ack_response` (lifecycle_lock → ack_lock via `ExitStack`) must be preserved exactly. `adapter.py` also exposes 8 read-only `@property` bridges (`_pending_acks`, `_ack_responses`, `_ack_tokens`, `_ack_response_tokens`, `_ack_inflight_tokens`, `_early_ack_packets`, `_ack_futures`, `_ack_lock`) returning the tracker's internals so `send()` and tests that do item-level access (`self._ack_futures[id] = ...`, `with self._ack_lock:`) keep working — never reassign the properties themselves.
-- **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` so the plugin works both as a package (in Hermes) and as flat modules (in tests/CI). This now covers fourteen modules (`adapter`, `mesh_tools`, `schemas`, `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`, `solicited`) — keep the pattern when adding modules.
+- **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` so the plugin works both as a package (in Hermes) and as flat modules (in tests/CI). This now covers fifteen modules (`adapter`, `mesh_tools`, `schemas`, `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`, `solicited`, `forwarding`) — keep the pattern when adding modules.
 - **Logger routing caveat**: `ack_state.py` logs under its own name —
   `logging.getLogger(__name__)` (`ack_state.py:53`) since A11 moved it off
   the `"adapter"` logger (its tests assert on `assertLogs("ack_state")`).
