@@ -387,6 +387,79 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
             self.adapter.handle_message.call_args[0][0].source.chat_id, "meshtastic:!ab12cd34"
         )
 
+    def _owner_dm(self, text: str) -> dict:
+        return {
+            "fromId": "!ab12cd34",
+            "toId": "!da1b1613",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": text.encode()},
+        }
+
+    async def _open_model_picker(self) -> tuple[AsyncMock, AsyncMock]:
+        """Run send_model_picker for the owner's DM, capturing sends and the switch."""
+        send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="1"))
+        self.adapter.send = send
+        on_selected = AsyncMock(return_value="Switched to claude-fable-5")
+        providers = [
+            {"slug": "local", "name": "localhost:8080", "models": ["qwen"], "is_current": True},
+            {"slug": "anthropic", "name": "Anthropic", "models": ["claude-fable-5"]},
+        ]
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=providers,
+            current_model="qwen",
+            current_provider="local",
+            session_key="s",
+            on_model_selected=on_selected,
+        )
+        self.assertTrue(result.success)
+        return send, on_selected
+
+    async def _poll_calls(self, mock: AsyncMock, expected: int) -> None:
+        deadline = time.monotonic() + 1.0
+        while mock.call_count < expected and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertEqual(mock.call_count, expected)
+
+    async def test_model_picker_menu_is_short_numbered_text(self):
+        send, _ = await self._open_model_picker()
+        chat_id, menu = send.call_args.args[:2]
+        self.assertEqual(chat_id, "meshtastic:!ab12cd34")
+        self.assertIn("1 localhost:8080 (1) *", menu)
+        self.assertIn("2 Anthropic (1)", menu)
+        self.assertNotIn("**", menu)
+        self.assertLess(len(menu.encode()), 170)
+
+    async def test_model_picker_answers_switch_without_reaching_the_agent(self):
+        send, on_selected = await self._open_model_picker()
+        iface = self.adapter.get_interfaces()[0]
+
+        self.adapter._on_receive(self._owner_dm("2"), iface)
+        await self._poll_calls(send, 2)
+        self.assertTrue(send.call_args.args[1].startswith("Anthropic\n1 claude-fable-5"))
+
+        self.adapter._on_receive(self._owner_dm("1"), iface)
+        await self._poll_calls(on_selected, 1)
+        on_selected.assert_awaited_once_with("meshtastic:!ab12cd34", "claude-fable-5", "anthropic")
+        await self._poll_calls(send, 3)
+        self.assertEqual(send.call_args.args[1], "Switched to claude-fable-5")
+        await self._assert_handle_message_never_called()
+
+    async def test_model_picker_lets_ordinary_text_through(self):
+        await self._open_model_picker()
+        self.adapter._on_receive(self._owner_dm("hello"), self.adapter.get_interfaces()[0])
+        await self._poll_handle_message_calls(1)
+
+    async def test_model_picker_with_nothing_to_pick_falls_back(self):
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=[{"slug": "x", "name": "X", "models": []}],
+            current_model="qwen",
+            current_provider="x",
+            session_key="s",
+            on_model_selected=AsyncMock(),
+        )
+        self.assertFalse(result.success)
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node

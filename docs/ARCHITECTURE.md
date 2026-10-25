@@ -79,7 +79,7 @@ live in siblings so they can be unit-tested without hardware.
 | --- | --- | --- |
 | **Hub** | `adapter.py` | May import any sibling. |
 | **Siblings** | `inbound`, `ack_state`, `send_path`, `solicited`, `connection`, `transport`, `mesh_tools`, `mesh_helpers` | Never `import adapter`. Adapter-specific needs are injected or parameter-passed. |
-| **Leaves** | `chunking`, `schemas`, `telemetry_db`, `node_freshness`, `mock_interface` | Import no other repo modules (stdlib only, except as already established). |
+| **Leaves** | `chunking`, `model_picker`, `schemas`, `telemetry_db`, `node_freshness`, `mock_interface` | Import no other repo modules (stdlib only, except as already established). |
 
 Typical sibling edges today (directional, not exhaustive): `inbound` →
 `chunking` / `mesh_helpers` / `telemetry_db`; `mesh_tools` → helpers + schemas
@@ -154,6 +154,7 @@ Flat layout, dual-loadable. Names matter more than sizes.
 | **`mesh_tools.py`** | The thirteen `mesh_*` async handlers. Loaded as logical name **`meshtastic_tools`** (never `tools` — shadows Hermes). Singleton link to the adapter. |
 | **`mesh_helpers.py`** | Pure formatting and resolution helpers for tools (hops, signal provenance, history windows). Imports only `telemetry_db` among repo modules. |
 | **`telemetry_db.py`** | SQLite at `~/.hermes/meshtastic_telemetry.db` (telemetry / positions / signal_quality). Age retention + optional row ceiling. Express staleness in payloads; do not wipe history to “fix” age. |
+| **`model_picker.py`** | Numbered two-step `/model` picker (provider → model) behind `send_model_picker`; pending state per chat, TTL, cancel. Pure; the adapter sends and routes numeric replies. |
 | **`chunking.py`** | UTF-8-byte-bounded `[i/n]` chunks; 233-byte ceiling; env clamp. |
 | **`node_freshness.py`** | Live per-node overlay (`last_heard` / `snr` / `rssi`); SNR/RSSI only from direct (0-hop) packets. |
 | **`schemas.py`** | JSON function schemas for tools (airtime notes for the model). No logic. |
@@ -285,6 +286,7 @@ Other invariants pinned by tests or code:
 LoRa is shared medium. Features should prefer:
 
 - Short tool-progress blurbs over full tool chrome (both Hermes progress paths)
+- A numbered `/model` menu (`send_model_picker`) instead of Hermes' Markdown model list
 - Successful no-op `edit_message` (never “fail the edit to skip progress”)
 - DMs by default; channels opt-in (`MESHTASTIC_ALLOW_CHANNELS`)
 - One-node solicited requests, no automatic mesh sweeps
