@@ -73,6 +73,11 @@ try:
 except ImportError:
     import solicited
 
+try:
+    from . import model_picker
+except ImportError:
+    import model_picker
+
 logger = logging.getLogger(__name__)
 
 # Value snapshots re-exported so existing imports/tests keep resolving.
@@ -493,6 +498,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Nodes already warned about unauthorized access, mapped to the last
         # warn time — a per-node re-warn window bounds the log volume.
         self._unauthorized_warned: dict[str, float] = {}
+
+        # Pending numbered /model pickers (send_model_picker), keyed by chat id.
+        self._model_picker = model_picker.ModelPicker()
 
         if not transport.HAS_MESHTASTIC:
             logger.error(
@@ -1851,6 +1859,46 @@ class MeshtasticAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("Error in incoming queue consumer: %s", e, exc_info=True)
 
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Answer a bare ``/model`` with a numbered provider → model menu.
+
+        Hermes' fallback text list is ~900 chars of Markdown (six LoRa chunks)
+        and still truncates the model lists; Telegram gets an inline-keyboard
+        drill-down through this same hook. The state lives in model_picker.py;
+        a failed result makes Hermes fall back to its text list.
+        """
+        menu = self._model_picker.open(chat_id, providers, current_model, on_model_selected)
+        if menu is None:
+            return SendResult(success=False, error="No models to pick from")
+        return await self.send(chat_id, menu, metadata=metadata)
+
+    def _answer_model_picker(self, chat_id: str, text: str) -> bool:
+        """Handle ``text`` as a picker answer; True when it was one."""
+        reply = self._model_picker.answer(chat_id, text)
+        if not reply.handled:
+            return False
+        task = asyncio.create_task(self._finish_model_pick(chat_id, reply))
+        self._message_tasks.add(task)
+        task.add_done_callback(self._handle_message_done)
+        return True
+
+    async def _finish_model_pick(self, chat_id: str, reply: Any) -> None:
+        """Send the next menu, or run Hermes' switch and send its confirmation."""
+        text = reply.text
+        if reply.model is not None:
+            text = await reply.on_selected(chat_id, reply.model, reply.provider_slug)
+        if text:
+            await self.send(chat_id, text)
+
     def _handle_message_done(self, task: asyncio.Task):
         """Callback to discard finished task and log exceptions."""
         self._message_tasks.discard(task)
@@ -1947,6 +1995,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # Private direct message session
                 chat_id = f"meshtastic:{sender}"
                 chat_type = "dm"
+
+            # A numbered answer to a pending /model picker never reaches the agent.
+            if self._answer_model_picker(chat_id, text):
+                return
 
             # Fetch sender display names
             sender_name = inbound.resolve_sender_name(interface, sender)

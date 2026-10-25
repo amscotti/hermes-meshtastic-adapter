@@ -57,7 +57,7 @@ rules for AI-assisted PRs, and "where new code goes". Do not grow
 `adapter.py` with new domain logic — put pure decisions / state machines /
 blocking I/O in sibling modules and keep the adapter as orchestration only.
 
-Fourteen source modules, no package nesting. `adapter.py` is the orchestrator;
+Fifteen source modules, no package nesting. `adapter.py` is the orchestrator;
 the siblings below were extracted to keep each concern testable in isolation.
 Every cross-module import uses the dual-import convention (see "Conventions
 and gotchas") so the plugin works both as a package (in Hermes) and as flat
@@ -130,6 +130,9 @@ modules (in tests/CI).
   link-drop classification (`classify_link_drop`) and teardown planning
   (`teardown_owner_current`, `teardown_task_list`, `tasks_on_loop`). Stdlib
   only — no repo imports; everything adapter-specific is parameter-passed.
+- **`model_picker.py`** — `ModelPicker`, the numbered two-step `/model`
+  drill-down (provider → model) behind the adapter's `send_model_picker`
+  hook. Stdlib only (a leaf); see "Tool progress over LoRa" below.
 - **`chunking.py`** — `chunk_message` / `split_utf8` plus `MAX_MESSAGE_LENGTH`
   (233, the `DATA_PAYLOAD_LEN` ceiling) and `DEFAULT_CHUNK_BYTES` (170).
   `MESHTASTIC_CHUNK_BYTES` is clamped to a `MIN_CHUNK_BYTES` (30) floor;
@@ -284,6 +287,8 @@ adapter keeps airtime low:
   fall back to a new permanent mesh packet per tool step. Emulating edits by
   re-sending would flood the mesh; pretending success is intentional.
 
+**`/model` is a numbered menu, not Hermes' text list.** A bare `/model` falls back to ~900 chars of Markdown (six chunks, and the model lists are still truncated with "(+N more)") on platforms without a picker. The adapter implements Hermes' `send_model_picker` hook instead — the same two-step drill-down Telegram renders as inline buttons — as plain numbered text from `model_picker.py`. `_on_receive` routes a numeric reply in that chat to the pending picker (before building the `MessageEvent`, so it never reaches the agent); the final pick calls Hermes' own `on_model_selected`, so the switch is Hermes' logic. `0` cancels, any non-numeric message ends the picker and goes to the agent as usual, and a picker expires after `PICKER_TTL_SECS` (5 min).
+
 Final answers still go through `send()` and are chunked as usual. Multi-line
 dumps (e.g. dangerous-command approval walls) are not compacted — only
 single-line tool chrome.
@@ -328,7 +333,7 @@ The node accepts only a couple of TCP clients, so connecting from the phone app 
 - **The tool module is `mesh_tools.py`, loaded under the logical name `meshtastic_tools`.** It must NOT be named `tools.py`: Hermes' own code imports `tools.registry` transitively while `gateway` is imported, and a top-level `tools.py` in this repo (which sits first on `sys.path` in the flat test/CI layout) shadows Hermes' `tools` package and breaks the whole import. Loading it dynamically as `meshtastic_tools` was not enough — the collision is at *Hermes'* import site, not ours — hence the distinct filename. `adapter._load_tools_module` and `test_meshtastic.py` both load `mesh_tools.py`; preserve the naming.
 - **The adapter↔tools link is a module-level singleton.** `connect()` calls `mesh_tools.set_adapter(self)`; handlers reach it via `_get_adapter()`. Tools return `{"error": ...}` JSON when no adapter is active.
 - **The adapter↔AckTracker link is a back-reference.** `AckTracker.__init__(self, adapter)` stores `self._adapter`; lifecycle lock/state, the platform loop, and `_normalize_node_id` are reached via that reference. The lock-ordering in `_record_ack_response` (lifecycle_lock → ack_lock via `ExitStack`) must be preserved exactly. `adapter.py` also exposes 8 read-only `@property` bridges (`_pending_acks`, `_ack_responses`, `_ack_tokens`, `_ack_response_tokens`, `_ack_inflight_tokens`, `_early_ack_packets`, `_ack_futures`, `_ack_lock`) returning the tracker's internals so `send()` and tests that do item-level access (`self._ack_futures[id] = ...`, `with self._ack_lock:`) keep working — never reassign the properties themselves.
-- **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` so the plugin works both as a package (in Hermes) and as flat modules (in tests/CI). This now covers fourteen modules (`adapter`, `mesh_tools`, `schemas`, `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`, `solicited`) — keep the pattern when adding modules.
+- **Dual imports everywhere**: every cross-module import is wrapped `try: from . import x / except ImportError: import x` so the plugin works both as a package (in Hermes) and as flat modules (in tests/CI). This now covers fifteen modules (`adapter`, `mesh_tools`, `schemas`, `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`, `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`, `solicited`, `model_picker`) — keep the pattern when adding modules.
 - **Logger routing caveat**: `ack_state.py` logs under its own name —
   `logging.getLogger(__name__)` (`ack_state.py:53`) since A11 moved it off
   the `"adapter"` logger (its tests assert on `assertLogs("ack_state")`).
