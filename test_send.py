@@ -2937,6 +2937,32 @@ class TestSendPath(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sent), 1)
             self.assertEqual(sent[0], content)
 
+    async def test_send_does_not_compact_non_latin_or_non_ascii_punctuation(self):
+        """A single-line reply led by a letter in any script, or by non-ASCII
+        punctuation, is delivered verbatim. Only a symbol (emoji) lead marks
+        tool-progress chrome; a Cyrillic first letter used to be enough to cut
+        a Russian reply at its first ": " or " for "."""
+        iface = self.adapter.get_interfaces()[0]
+        sent: list[str] = []
+
+        def capture(text, **_kwargs):
+            sent.append(text)
+            return SimpleNamespace(id=len(sent))
+
+        iface.sendText = MagicMock(side_effect=capture)
+        cases = [
+            "Погода на завтра: ясно, +12, ветер северный 3 м/с, без осадков весь день",
+            "Ответ for you, без сокращений",
+            "«Цитата: должна дойти целиком, со всеми словами после двоеточия»",
+            "• пункт: сначала проверить антенну, потом питание ноды",
+            "— тире: продолжение ответа, которое нельзя обрезать",
+        ]
+        for content in cases:
+            sent.clear()
+            res = await self.adapter.send(chat_id="meshtastic:!ab12cd34", content=content)
+            self.assertTrue(res.success, f"send failed for {content!r}: {res.error}")
+            self.assertEqual(sent, [content])
+
     async def test_wait_for_ack_timeout_does_not_overwrite_concurrent_ack(self):
         """Timeout must not stamp TIMEOUT over a real ACK that landed in the race window."""
         self.adapter.loop = asyncio.get_running_loop()
