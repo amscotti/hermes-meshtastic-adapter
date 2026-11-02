@@ -511,6 +511,12 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         await self._poll_handle_message_calls(1)
         self.assertEqual(self.adapter.handle_message.call_args[0][0].text, "1")
 
+    async def test_model_picker_state_is_cleared_on_disconnect(self):
+        await self._open_model_picker()
+        self.assertTrue(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+        await self.adapter.disconnect()
+        self.assertFalse(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node
@@ -676,6 +682,23 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         # The sender stays eligible for a notice with its next message.
         self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
         self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
+
+    async def test_forward_to_our_own_node_warns_once_and_sends_nothing(self):
+        iface = self.adapter.get_interfaces()[0]
+        my_node_id = self.adapter._get_interface_node_id(iface)
+        self.assertIsNotNone(my_node_id)
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=True, target=my_node_id)
+        )
+        send = AsyncMock()
+        self.adapter.send = send
+        with self.assertLogs("adapter", level="WARNING") as logs:
+            self.adapter._on_receive(self._stranger_dm(), iface)
+            self.adapter._on_receive(self._stranger_dm(), iface)
+        await self._poll_send_calls(send, 0)
+        self.assertEqual(
+            sum("MESHTASTIC_FORWARD_TO points at this node" in line for line in logs.output), 1
+        )
 
     async def test_no_auto_reply_when_the_forward_was_only_queued(self):
         send = self._enable_forwarding()

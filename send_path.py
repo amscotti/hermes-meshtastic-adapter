@@ -38,9 +38,11 @@ DEFAULT_CHUNK_DELAY = 4.0
 # ACK timeout forced on when delivery retries are enabled without one.
 DEFAULT_RETRY_ACK_TIMEOUT = 30.0
 
-# Unicode category "So" also covers ordinary text symbols (©, ®, °, ™), which
-# can legitimately lead a one-line reply. They are not tool-progress chrome.
-NON_CHROME_SYMBOL_LEADS = frozenset("©®°™")
+# Unicode category "So" also covers ordinary text symbols (©, ®, °, ™, №, ★,
+# hearts/card suits), which can legitimately lead a one-line reply. They are
+# not tool-progress chrome. This is a pragmatic denylist, not a full emoji
+# property check; compaction also requires a " for " / ": " separator.
+NON_CHROME_SYMBOL_LEADS = frozenset("©®°™№★♥♦♣♠")
 
 
 def is_tool_progress_chrome(content: str, metadata: Mapping[str, Any] | None = None) -> bool:

@@ -503,6 +503,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # Opt-in relay of DMs from non-allowlisted nodes to the owner's node,
         # with a rate-limited auto-reply to the sender. Off by default.
         self._forward_gate = forwarding.forward_gate(os.environ, extra, allowed_nodes_raw)
+        self._forward_self_target_warned = False
 
         # Nodes already warned about unauthorized access, mapped to the last
         # warn time — a per-node re-warn window bounds the log volume.
@@ -888,12 +889,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return
         _, is_broadcast = inbound.canonicalize_to_id(result.to_id)
         gate = self._forward_gate
-        decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         target = gate.config.target
+        if target is not None and target == my_node_id:
+            if not self._forward_self_target_warned:
+                logger.warning(
+                    "MESHTASTIC_FORWARD_TO points at this node (%s); forwarding is ignored",
+                    target,
+                )
+                self._forward_self_target_warned = True
+            return
+        decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         if not decision.forward or target is None:
             if (
                 gate.config.enabled
                 and not is_broadcast
+                and target is not None
                 and target != my_node_id
                 and sender not in (target, my_node_id)
             ):
