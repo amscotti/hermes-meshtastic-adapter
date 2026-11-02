@@ -700,6 +700,22 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
             sum("MESHTASTIC_FORWARD_TO points at this node" in line for line in logs.output), 1
         )
 
+    async def test_disabled_forwarding_does_not_warn_about_a_self_target(self):
+        iface = self.adapter.get_interfaces()[0]
+        my_node_id = self.adapter._get_interface_node_id(iface)
+        self.assertIsNotNone(my_node_id)
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=False, target=my_node_id)
+        )
+        send = AsyncMock()
+        self.adapter.send = send
+        with self.assertLogs("adapter", level="WARNING") as logs:
+            self.adapter._on_receive(self._stranger_dm(), iface)
+        await self._poll_send_calls(send, 0)
+        self.assertFalse(
+            any("MESHTASTIC_FORWARD_TO points at this node" in line for line in logs.output)
+        )
+
     async def test_no_auto_reply_when_the_forward_was_only_queued(self):
         send = self._enable_forwarding()
         send.return_value = SendResult(success=True, message_id="queued")

@@ -167,6 +167,32 @@ class TestSendReachedRadio(unittest.TestCase):
         self.assertFalse(forwarding.send_reached_radio(True, "queued"))
         self.assertTrue(forwarding.send_reached_radio(True, "42"))
         self.assertFalse(forwarding.send_reached_radio(False, None))
+        # The adapter passes the canonical marker so the literal cannot drift.
+        self.assertFalse(forwarding.send_reached_radio(True, "held", queued_id="held"))
+
+
+class TestHourlyCapLog(unittest.TestCase):
+    def test_only_a_real_cap_drop_is_reported(self) -> None:
+        def capped(sender, enabled=True, target="!0wner000", broadcast=False, mine="!me"):
+            return forwarding.hourly_cap_reached(
+                sender,
+                enabled=enabled,
+                target=target,
+                is_broadcast=broadcast,
+                my_node_id=mine,
+            )
+
+        self.assertTrue(capped("!stranger"))
+        cases = [
+            capped("!stranger", enabled=False),
+            capped("!stranger", broadcast=True),
+            capped("!0wner000"),  # target itself
+            capped("!me"),  # our own node
+            capped("!stranger", mine="!0wner000"),  # target == our node
+            capped("!stranger", target=None),
+        ]
+        for result in cases:
+            self.assertFalse(result)
 
 
 class TestConfirmedDelivery(unittest.TestCase):

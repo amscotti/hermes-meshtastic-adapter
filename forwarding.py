@@ -188,14 +188,37 @@ class ForwardGate:
                 self._last_reply.popitem(last=False)
 
 
-def send_reached_radio(success: bool, message_id: str | None) -> bool:
+def send_reached_radio(success: bool, message_id: str | None, *, queued_id: str = "queued") -> bool:
     """Whether a forward actually left the queue for the radio.
 
     ``send()`` reports success for a message queued while disconnected
     (``message_id == "queued"``); the auto-reply must not claim that message
-    was forwarded before it has gone out.
+    was forwarded before it has gone out. ``queued_id`` lets the adapter pass
+    the canonical send-path marker instead of duplicating the literal.
     """
-    return success and message_id != "queued"
+    return success and message_id != queued_id
+
+
+def hourly_cap_reached(
+    sender: str,
+    *,
+    enabled: bool,
+    target: str | None,
+    is_broadcast: bool,
+    my_node_id: str | None,
+) -> bool:
+    """Whether ``decide`` declined this DM specifically because of the cap.
+
+    Used for the adapter's log line: target/self/broadcast/disabled decisions
+    are expected and must not be reported as a rate limit.
+    """
+    return (
+        enabled
+        and not is_broadcast
+        and target is not None
+        and target != my_node_id
+        and sender not in (target, my_node_id)
+    )
 
 
 def confirmed_delivery(success: bool, raw_response: Any) -> bool:

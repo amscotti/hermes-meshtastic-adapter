@@ -890,7 +890,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         _, is_broadcast = inbound.canonicalize_to_id(result.to_id)
         gate = self._forward_gate
         target = gate.config.target
-        if target is not None and target == my_node_id:
+        if gate.config.enabled and target is not None and target == my_node_id:
             if not self._forward_self_target_warned:
                 logger.warning(
                     "MESHTASTIC_FORWARD_TO points at this node (%s); forwarding is ignored",
@@ -900,12 +900,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return
         decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         if not decision.forward or target is None:
-            if (
-                gate.config.enabled
-                and not is_broadcast
-                and target is not None
-                and target != my_node_id
-                and sender not in (target, my_node_id)
+            if forwarding.hourly_cap_reached(
+                sender,
+                enabled=gate.config.enabled,
+                target=target,
+                is_broadcast=is_broadcast,
+                my_node_id=my_node_id,
             ):
                 logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
             return
@@ -941,7 +941,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
             if notice is None:
                 return
-            if not forwarding.send_reached_radio(forwarded.success, forwarded.message_id):
+            if not forwarding.send_reached_radio(
+                forwarded.success,
+                forwarded.message_id,
+                queued_id=send_path.QUEUED_MESSAGE_ID,
+            ):
                 reason = "queued while disconnected" if forwarded.success else "failed"
                 logger.info("No auto-reply to %s: forwarding to %s %s", sender, target, reason)
                 return
@@ -2473,7 +2477,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 {"chat_id": chat_id, "content": chunk, "timestamp": time.time()}
             )
         logger.info("Outbound connection down. Message successfully queued.")
-        return SendResult(success=True, message_id="queued")
+        return SendResult(success=True, message_id=send_path.QUEUED_MESSAGE_ID)
 
     def _send_text_serialized(
         self,

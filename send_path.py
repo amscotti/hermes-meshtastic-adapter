@@ -38,6 +38,9 @@ DEFAULT_CHUNK_DELAY = 4.0
 # ACK timeout forced on when delivery retries are enabled without one.
 DEFAULT_RETRY_ACK_TIMEOUT = 30.0
 
+# ``SendResult.message_id`` for a chunk queued because the link is down.
+QUEUED_MESSAGE_ID = "queued"
+
 # Unicode category "So" also covers ordinary text symbols (©, ®, °, ™, №, ★,
 # hearts/card suits), which can legitimately lead a one-line reply. They are
 # not tool-progress chrome. This is a pragmatic denylist, not a full emoji
