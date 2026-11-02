@@ -900,13 +900,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return
         decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         if not decision.forward or target is None:
-            if forwarding.hourly_cap_reached(
-                sender,
-                enabled=gate.config.enabled,
-                target=target,
-                is_broadcast=is_broadcast,
-                my_node_id=my_node_id,
-            ):
+            if decision.reason == "hourly_cap":
                 logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
             return
         logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
@@ -919,8 +913,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 inbound.resolve_sender_name(interface, target), gate.config.language
             )
         relay = self._relay_unauthorized_dm(sender, target, body, notice)
-        if not self._spawn_send_task(relay) and notice is not None:
-            gate.reply_done(sender, delivered=False)
+        if not self._spawn_send_task(relay):
+            # The slot was recorded at decide() time; release it because no
+            # relay task was ever started.
+            gate.forward_cancelled(sender)
+            if notice is not None:
+                gate.reply_done(sender, delivered=False)
 
     async def _relay_unauthorized_dm(
         self, sender: str, target: str, body: str, notice: str | None
@@ -2016,11 +2014,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         reply = self._model_picker.answer(chat_id, text)
         if not reply.handled:
             return False
-        if not self._spawn_send_task(self._finish_model_pick(chat_id, reply)):
-            # Under task pressure, let the text reach the agent instead of
-            # silently swallowing it.
-            self._model_picker.close(chat_id)
-            return False
+        # Deliberately bypass MESSAGE_TASK_LIMIT: this is the direct answer to
+        # a menu we sent, and the inbound cap below would otherwise drop the
+        # number silently. One short extra task is better than losing the pick.
+        task = asyncio.create_task(self._finish_model_pick(chat_id, reply))
+        self._message_tasks.add(task)
+        task.add_done_callback(self._handle_message_done)
         return True
 
     async def _finish_model_pick(self, chat_id: str, reply: Any) -> None:

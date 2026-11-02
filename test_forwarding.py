@@ -79,6 +79,7 @@ class TestForwardGate(unittest.TestCase):
         decision = gate.decide("!stranger", is_broadcast=False)
         self.assertFalse(decision.forward)
         self.assertFalse(decision.auto_reply)
+        self.assertEqual(decision.reason, "disabled")
 
     def test_first_dm_forwards_and_replies(self) -> None:
         gate, _ = _gate()
@@ -88,10 +89,16 @@ class TestForwardGate(unittest.TestCase):
 
     def test_broadcast_target_and_self_are_ignored(self) -> None:
         gate, _ = _gate()
-        for sender, broadcast in (("!stranger", True), ("!0wner000", False), ("!me", False)):
-            decision = gate.decide(sender, is_broadcast=broadcast, my_node_id="!me")
+        cases = [
+            ("!stranger", True, "!me", "broadcast"),
+            ("!0wner000", False, "!me", "self"),
+            ("!me", False, "!me", "self"),
+        ]
+        for sender, broadcast, my_node_id, reason in cases:
+            decision = gate.decide(sender, is_broadcast=broadcast, my_node_id=my_node_id)
             self.assertFalse(decision.forward, sender)
             self.assertFalse(decision.auto_reply, sender)
+            self.assertEqual(decision.reason, reason, sender)
 
     def test_target_that_is_our_own_node_is_ignored(self) -> None:
         # A misconfigured FORWARD_TO pointing at us must never put a DM back
@@ -100,6 +107,7 @@ class TestForwardGate(unittest.TestCase):
         decision = gate.decide("!stranger", is_broadcast=False, my_node_id="!0wner000")
         self.assertFalse(decision.forward)
         self.assertFalse(decision.auto_reply)
+        self.assertEqual(decision.reason, "self_target")
 
     def test_auto_reply_once_per_cooldown(self) -> None:
         gate, clock = _gate(reply_cooldown_secs=3600)
@@ -151,6 +159,14 @@ class TestForwardGate(unittest.TestCase):
         decision = gate.decide("!a", is_broadcast=False)
         self.assertFalse(decision.forward)
         self.assertFalse(decision.auto_reply)
+        self.assertEqual(decision.reason, "hourly_cap")
+
+    def test_cancelled_forward_releases_its_hourly_slot(self) -> None:
+        gate, _ = _gate(forwards_per_hour=1)
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).forward)
+        self.assertFalse(gate.decide("!stranger", is_broadcast=False).forward)
+        gate.forward_cancelled("!stranger")
+        self.assertTrue(gate.decide("!stranger", is_broadcast=False).forward)
 
     def test_tracked_senders_are_bounded(self) -> None:
         gate, _ = _gate()
@@ -169,30 +185,6 @@ class TestSendReachedRadio(unittest.TestCase):
         self.assertFalse(forwarding.send_reached_radio(False, None))
         # The adapter passes the canonical marker so the literal cannot drift.
         self.assertFalse(forwarding.send_reached_radio(True, "held", queued_id="held"))
-
-
-class TestHourlyCapLog(unittest.TestCase):
-    def test_only_a_real_cap_drop_is_reported(self) -> None:
-        def capped(sender, enabled=True, target="!0wner000", broadcast=False, mine="!me"):
-            return forwarding.hourly_cap_reached(
-                sender,
-                enabled=enabled,
-                target=target,
-                is_broadcast=broadcast,
-                my_node_id=mine,
-            )
-
-        self.assertTrue(capped("!stranger"))
-        cases = [
-            capped("!stranger", enabled=False),
-            capped("!stranger", broadcast=True),
-            capped("!0wner000"),  # target itself
-            capped("!me"),  # our own node
-            capped("!stranger", mine="!0wner000"),  # target == our node
-            capped("!stranger", target=None),
-        ]
-        for result in cases:
-            self.assertFalse(result)
 
 
 class TestConfirmedDelivery(unittest.TestCase):

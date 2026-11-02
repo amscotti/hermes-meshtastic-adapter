@@ -44,7 +44,7 @@ class TestToolProgressChrome(unittest.TestCase):
 
     def test_text_symbols_and_letters_are_not_chrome(self):
         # So covers text symbols beyond emoji; those are plausible reply leads.
-        for lead in "©®°™№★♥♦♣♠":
+        for lead in "©®°™№★♥♦♣♠☀✈☎☺℠☕":
             with self.subTest(lead=lead):
                 self.assertFalse(send_path.is_tool_progress_chrome(f"{lead} 2026: full reply text"))
         self.assertFalse(send_path.is_tool_progress_chrome("Погода: ясно"))

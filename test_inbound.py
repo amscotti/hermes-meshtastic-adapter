@@ -498,18 +498,23 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         await self._poll_calls(send, 2)
         self.assertEqual(send.call_args.args[1], "Model switch failed; try again.")
 
-    async def test_model_picker_task_pressure_lets_the_number_reach_the_agent(self):
-        await self._open_model_picker()
+    async def test_model_picker_answer_is_processed_at_task_limit(self):
+        send, _ = await self._open_model_picker()
         iface = self.adapter.get_interfaces()[0]
-
-        def drop(coro):
-            coro.close()  # the real helper closes a coroutine it cannot run
-            return False
-
-        with patch.object(self.adapter, "_spawn_send_task", side_effect=drop):
-            self.adapter._on_receive(self._owner_dm("1"), iface)
-        await self._poll_handle_message_calls(1)
-        self.assertEqual(self.adapter.handle_message.call_args[0][0].text, "1")
+        blocker = asyncio.create_task(asyncio.sleep(60))
+        self.adapter._message_tasks.add(blocker)
+        try:
+            with patch.object(self.adapter, "MESSAGE_TASK_LIMIT", 1):
+                self.adapter._on_receive(self._owner_dm("1"), iface)
+                await self._poll_calls(send, 2)
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+            self.adapter._message_tasks.discard(blocker)
+        # The picker reply is processed even at the inbound task cap, and the
+        # bare number is not also delivered to the agent.
+        self.assertTrue(send.call_args.args[1].startswith("localhost:8080"))
+        await self._assert_handle_message_never_called()
 
     async def test_model_picker_state_is_cleared_on_disconnect(self):
         await self._open_model_picker()
