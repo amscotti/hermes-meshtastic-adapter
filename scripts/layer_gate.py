@@ -38,6 +38,7 @@ REPO_MODULES = {
     "schemas",
     "telemetry_db",
     "chunking",
+    "forwarding",
     "mock_interface",
     "node_freshness",
     "transport",
@@ -47,6 +48,7 @@ REPO_MODULES = {
 # depend on any sibling, or the adapter coupling grows back.
 LEAF_MODULES = {
     "chunking",
+    "forwarding",
     "schemas",
     "telemetry_db",
     "node_freshness",

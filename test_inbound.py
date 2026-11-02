@@ -30,6 +30,7 @@ if os.path.isdir(hermes_agent_path):
 
 # Register the platform inside the registry so that Platform("meshtastic") resolves correctly in venv
 from gateway.platform_registry import PlatformEntry, platform_registry
+from gateway.platforms.base import SendResult
 
 platform_registry.register(
     PlatformEntry(
@@ -58,6 +59,7 @@ else:
     sys.modules["meshtastic_tools"] = meshtastic_tools
     tools_spec.loader.exec_module(meshtastic_tools)
 
+import forwarding
 import telemetry_db
 from adapter import MeshtasticAdapter
 from inbound import (
@@ -118,6 +120,8 @@ _BLANK_ENV = {
     "MESHTASTIC_TELEMETRY_RETENTION_DAYS": "",
     "MESHTASTIC_TCP_HOST": "",
     "MESHTASTIC_TCP_PORT": "",
+    "MESHTASTIC_FORWARD_UNKNOWN": "",
+    "MESHTASTIC_FORWARD_TO": "",
 }
 
 
@@ -402,6 +406,161 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         # Verify handler was never called
         self.adapter.handle_message.assert_not_called()
+
+    def _enable_forwarding(self, **overrides) -> AsyncMock:
+        """Turn forwarding on toward !ab12cd34 and capture outbound sends."""
+        cfg = forwarding.ForwardConfig(enabled=True, target="!ab12cd34", **overrides)
+        self.adapter._forward_gate = forwarding.ForwardGate(cfg)
+        delay = patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+        send = AsyncMock()
+        self.adapter.send = send
+        return send
+
+    async def _poll_send_calls(self, send: AsyncMock, expected: int) -> None:
+        deadline = time.monotonic() + 1.0
+        while send.call_count < expected and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        self.assertEqual(send.call_count, expected)
+
+    def _stranger_dm(self, text: bytes = b"hello base", to_id: str = "!da1b1613") -> dict:
+        return {
+            "fromId": "!bad55555",
+            "toId": to_id,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": text},
+        }
+
+    async def test_unauthorized_dm_not_forwarded_by_default(self):
+        send = AsyncMock()
+        self.adapter.send = send
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 0)
+
+    async def test_unauthorized_dm_forwarded_to_owner_with_auto_reply(self):
+        send = self._enable_forwarding(language="ru")
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 2)
+
+        forward, notice = send.call_args_list
+        self.assertEqual(forward.args[0], "meshtastic:!ab12cd34")
+        self.assertTrue(forward.args[1].startswith("✉ "))
+        self.assertIn("!bad55555", forward.args[1])
+        self.assertTrue(forward.args[1].endswith(": hello base"))
+        self.assertEqual(notice.args[0], "meshtastic:!bad55555")
+        self.assertIn("Автоответ", notice.args[1])
+        self.assertEqual(
+            notice.kwargs["metadata"],
+            {
+                "meshtastic_verbatim": True,
+                "meshtastic_send_retries": 0,
+                "meshtastic_wait_for_ack": True,
+            },
+        )
+        self.assertEqual(forward.kwargs["metadata"], {"meshtastic_verbatim": True})
+        # The agent still never sees the stranger's text.
+        await self._assert_handle_message_never_called()
+
+    async def test_forwarded_text_reaches_the_radio_intact(self):
+        # Through the real send(): its tool-progress compaction would cut an
+        # emoji- or Cyrillic-led line at ": " and drop the message itself.
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=True, target="!ab12cd34", language="ru")
+        )
+        delay = patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+        iface = self.adapter.get_interfaces()[0]
+        sent: list[tuple[str, str]] = []
+
+        def capture(text, **kwargs):
+            sent.append((kwargs.get("destinationId"), text))
+            return SimpleNamespace(id=len(sent))
+
+        iface.sendText = MagicMock(side_effect=capture)
+        text = "are you around this weekend? need a hand with the antenna mast"
+        self.adapter._on_receive(self._stranger_dm(text.encode()), iface)
+        deadline = time.monotonic() + 2.0
+        while len(sent) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        by_dest = dict(sent)
+        self.assertTrue(by_dest["!ab12cd34"].endswith(": " + text))
+        self.assertTrue(by_dest["!bad55555"].startswith("Автоответ: "))
+        self.assertTrue(by_dest["!bad55555"].endswith("Ответ может прийти позже."))
+
+    async def test_repeat_dm_forwarded_without_second_auto_reply(self):
+        send = self._enable_forwarding()
+        iface = self.adapter.get_interfaces()[0]
+        self.adapter._on_receive(self._stranger_dm(b"one"), iface)
+        self.adapter._on_receive(self._stranger_dm(b"two"), iface)
+        await self._poll_send_calls(send, 3)
+        targets = [c.args[0] for c in send.call_args_list]
+        self.assertEqual(targets.count("meshtastic:!ab12cd34"), 2)
+        self.assertEqual(targets.count("meshtastic:!bad55555"), 1)
+
+    async def test_auto_reply_cooldown_starts_only_on_real_ack(self):
+        send = self._enable_forwarding()
+        iface = self.adapter.get_interfaces()[0]
+        gate = self.adapter._forward_gate
+
+        send.return_value = SendResult(
+            success=True, raw_response={"chunks": [{"ack": {"status": "implicit_ack"}}]}
+        )
+        self.adapter._on_receive(self._stranger_dm(b"one"), iface)
+        await self._poll_send_calls(send, 2)
+        self.assertNotIn("!bad55555", gate._last_reply)
+
+        send.return_value = SendResult(
+            success=True, raw_response={"chunks": [{"ack": {"status": "ack"}}]}
+        )
+        self.adapter._on_receive(self._stranger_dm(b"two"), iface)
+        await self._poll_send_calls(send, 4)
+        self.assertIn("!bad55555", gate._last_reply)
+
+        self.adapter._on_receive(self._stranger_dm(b"three"), iface)
+        await self._poll_send_calls(send, 5)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+
+    async def test_auto_reply_waits_for_the_forward_and_the_delay(self):
+        send = self._enable_forwarding()
+        order: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_send(chat_id, *_args, **_kwargs):
+            order.append(chat_id)
+            return SendResult(success=True)
+
+        async def fake_sleep(secs):
+            order.append(f"sleep {secs}")
+            await real_sleep(0)
+
+        send.side_effect = fake_send
+        with (
+            patch.object(forwarding, "AUTO_REPLY_DELAY_SECS", 5.0),
+            patch("asyncio.sleep", side_effect=fake_sleep),
+        ):
+            self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+            deadline = time.monotonic() + 1.0
+            while len(order) < 3 and time.monotonic() < deadline:
+                await real_sleep(0.01)
+        self.assertEqual(order[:3], ["meshtastic:!ab12cd34", "sleep 5.0", "meshtastic:!bad55555"])
+
+    async def test_no_auto_reply_when_the_forward_failed(self):
+        send = self._enable_forwarding()
+        send.return_value = SendResult(success=False, error="timeout")
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 1)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+        # The sender stays eligible for a notice with its next message.
+        self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
+        self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
+
+    async def test_unauthorized_broadcast_not_forwarded(self):
+        send = self._enable_forwarding()
+        self.adapter._on_receive(self._stranger_dm(to_id="^all"), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 0)
 
     async def test_unauthorized_node_still_observed(self):
         """An unauthorized node is filtered from Hermes but still tracked (watch-only)."""

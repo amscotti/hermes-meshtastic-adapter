@@ -79,7 +79,7 @@ live in siblings so they can be unit-tested without hardware.
 | --- | --- | --- |
 | **Hub** | `adapter.py` | May import any sibling. |
 | **Siblings** | `inbound`, `ack_state`, `send_path`, `solicited`, `connection`, `transport`, `mesh_tools`, `mesh_helpers` | Never `import adapter`. Adapter-specific needs are injected or parameter-passed. |
-| **Leaves** | `chunking`, `schemas`, `telemetry_db`, `node_freshness`, `mock_interface` | Import no other repo modules (stdlib only, except as already established). |
+| **Leaves** | `chunking`, `forwarding`, `schemas`, `telemetry_db`, `node_freshness`, `mock_interface` | Import no other repo modules (stdlib only, except as already established). |
 
 Typical sibling edges today (directional, not exhaustive): `inbound` →
 `chunking` / `mesh_helpers` / `telemetry_db`; `mesh_tools` → helpers + schemas
@@ -154,6 +154,7 @@ Flat layout, dual-loadable. Names matter more than sizes.
 | **`mesh_tools.py`** | The thirteen `mesh_*` async handlers. Loaded as logical name **`meshtastic_tools`** (never `tools` — shadows Hermes). Singleton link to the adapter. |
 | **`mesh_helpers.py`** | Pure formatting and resolution helpers for tools (hops, signal provenance, history windows). Imports only `telemetry_db` among repo modules. |
 | **`telemetry_db.py`** | SQLite at `~/.hermes/meshtastic_telemetry.db` (telemetry / positions / signal_quality). Age retention + optional row ceiling. Express staleness in payloads; do not wipe history to “fix” age. |
+| **`forwarding.py`** | Opt-in relay of DMs from non-allowlisted nodes to the owner's node plus a rate-limited auto-reply: config, per-sender limits, message text. Pure; the adapter resolves names and sends. |
 | **`chunking.py`** | UTF-8-byte-bounded `[i/n]` chunks; 233-byte ceiling; env clamp. |
 | **`node_freshness.py`** | Live per-node overlay (`last_heard` / `snr` / `rssi`); SNR/RSSI only from direct (0-hop) packets. |
 | **`schemas.py`** | JSON function schemas for tools (airtime notes for the model). No logic. |
@@ -179,6 +180,8 @@ mesh packet (pubsub thread)
             ③ solicited maybe_resolve   (before TEXT auth drop)
             ④ TEXT + authorized → MessageEvent / handle_message
                else drop (channels still opt-in via MESHTASTIC_ALLOW_CHANNELS)
+            ⑤ unauthorized DM + MESHTASTIC_FORWARD_UNKNOWN → forwarding.py
+               relays it to the owner's node (never to the agent)
 ```
 
 **Do not** hold `_lifecycle_lock` across all of `_on_receive`: ACK recording
@@ -287,6 +290,7 @@ LoRa is shared medium. Features should prefer:
 - Short tool-progress blurbs over full tool chrome (both Hermes progress paths)
 - Successful no-op `edit_message` (never “fail the edit to skip progress”)
 - DMs by default; channels opt-in (`MESHTASTIC_ALLOW_CHANNELS`)
+- Forwarding of unknown DMs opt-in, rate limited per sender, DMs only
 - One-node solicited requests, no automatic mesh sweeps
 - Age/provenance in tool payloads (`heard_directly`, hops, stale position)
   instead of deleting history

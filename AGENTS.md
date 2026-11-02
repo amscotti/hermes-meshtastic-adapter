@@ -218,10 +218,10 @@ tests (`test_cc_gate.py` / `test_extraction_gate.py` / `test_layer_gate.py` /
     tasks via `call_soon_threadsafe`).
 - **Dual imports everywhere**: `try: from . import x / except ImportError: import x`
   so the plugin works both as a package (in Hermes) and flat modules (in tests).
-  Now covers fourteen modules — `adapter`, `mesh_tools`, `schemas`,
+  Now covers fifteen modules — `adapter`, `mesh_tools`, `schemas`,
   `telemetry_db`, `chunking`, `mock_interface`, `node_freshness`, `transport`,
   `ack_state`, `inbound`, `mesh_helpers`, `send_path`, `connection`,
-  `solicited`.
+  `solicited`, `forwarding`.
 - **Adapter↔tools link is a module-level singleton** (`mesh_tools.set_adapter` /
   `_get_adapter`). Handlers return `{"error": ...}` JSON when no adapter is
   active. Node IDs are `!`-prefixed 8-hex; the allowlist matches with/without
