@@ -720,8 +720,9 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         )
         payload = json.loads(raw)
         self.assertTrue(payload["success"])
-        # Hermes flags any tool result containing "error" (even null) as failed.
-        self.assertNotIn('"error"', raw)
+        # Hermes flags any tool result containing "error" (even null) as
+        # failed; assert the key itself is absent, not just the substring.
+        self.assertNotIn("error", payload)
         self.assertEqual(payload["message_id"], "msg-1")
         self.assertEqual(payload["target_node"], "!aaaa1111")
         self.assertEqual(self.adapter.send_calls, [("meshtastic:!aaaa1111", "hello")])
@@ -817,7 +818,7 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         raw = await meshtastic_tools.handle_mesh_send_broadcast({"message": "hi"})
         payload = json.loads(raw)
         self.assertEqual(payload["channel"], "0")
-        self.assertNotIn('"error"', raw)
+        self.assertNotIn("error", payload)
         self.assertEqual(self.adapter.send_calls, [("meshtastic:channel:0", "hi")])
 
         payload = json.loads(

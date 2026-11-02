@@ -116,7 +116,7 @@ growing hub methods.
 
 | Put it here | Kind of change |
 | --- | --- |
-| `send_path.py` | Retry budget, chunk pacing, ACK-outcome classification, DM/channel target resolution |
+| `send_path.py` | Retry budget, chunk pacing, ACK-outcome classification, DM/channel target resolution, tool-progress chrome classification |
 | `connection.py` | Backoff, reconnect/poll/pause classification, link-drop class, teardown plan |
 | `ack_state.py` | ACK/NACK state machine, real vs implicit ACK, `onAckNak` |
 | `solicited.py` | Telemetry / position / traceroute waiters |
@@ -147,7 +147,7 @@ Flat layout, dual-loadable. Names matter more than sizes.
 | **`adapter.py`** | Orchestrator only. Wire Hermes APIs to siblings; own loops and lifecycle; do not re-absorb domain policy. |
 | **`inbound.py`** | Receive pipeline (`InboundProcessor`): normalize envelope, classify portnum, freshness, telemetry/position routing, TEXT authz pre-check → `InboundResult`. New portnums and receive stages land here with constructor DI. |
 | **`ack_state.py`** | ACK/NACK state machine (`AckTracker`): pending waiters, real vs implicit ACK, pubsub upgrade, pruning. Magic callback name `onAckNak`. Extend pure helpers before growing the tracker’s adapter surface. |
-| **`send_path.py`** | Pure outbound *decisions*: retries, pacing, transport-error mapping, ACK-outcome classification, chat-id → DM/channel targets. Keep adapter-free. |
+| **`send_path.py`** | Pure outbound *decisions*: retries, pacing, transport-error mapping, ACK-outcome classification, chat-id → DM/channel targets, tool-progress chrome classification. Keep adapter-free. |
 | **`solicited.py`** | Response-waiter registry for the three transmit tools. Inject normalize / interfaces / executor / link-lost; never import the adapter. |
 | **`connection.py`** | Pure lifecycle *decisions*: backoff, reconnect step, pause UX, link-drop classification, teardown planning. Orchestration stays on the adapter. |
 | **`transport.py`** | Blocking I/O: daemon executor, open serial/TCP/mock, serialized close, liveness, library autoinstall. Fail loud for real targets when the library is missing. |
@@ -237,7 +237,7 @@ radio for the phone app without killing the gateway process.
 | A new agent tool | `schemas.py` + `mesh_tools.py` handler + `__init__.py` registration; pure bits in `mesh_helpers` / `telemetry_db` as needed |
 | A new packet type / portnum | `inbound.py` (+ thin adapter handoff only) |
 | ACK / NACK behavior | `ack_state.py` (extend `LifecycleHost` only if the tracker needs more of the adapter) |
-| Send / retry / pacing / target policy | `send_path.py` |
+| Send / retry / pacing / target / tool-progress policy | `send_path.py` |
 | Solicited request / waiter policy | `solicited.py` |
 | Reconnect / pause / teardown policy | `connection.py` |
 | Serial/TCP/mock open or serialized close | `transport.py` |

@@ -56,10 +56,16 @@ class ForwardConfig:
 
 @dataclass(frozen=True)
 class ForwardDecision:
-    """What to transmit for one unauthorized DM."""
+    """What to transmit for one unauthorized DM.
+
+    ``reason`` is ``""`` when forwarding, otherwise why it declined:
+    ``disabled``, ``broadcast``, ``self``, ``self_target`` or ``hourly_cap``.
+    The adapter logs only the last one as a rate limit.
+    """
 
     forward: bool
     auto_reply: bool
+    reason: str = ""
 
 
 def _truthy(value: Any) -> bool:
@@ -141,9 +147,16 @@ class ForwardGate:
     ) -> ForwardDecision:
         """Decide what to send for one unauthorized text and record it."""
         cfg = self._config
-        nothing = ForwardDecision(forward=False, auto_reply=False)
-        if not cfg.enabled or is_broadcast or sender in (cfg.target, my_node_id):
-            return nothing
+        if not cfg.enabled:
+            return ForwardDecision(False, False, "disabled")
+        # Never relay to ourselves: a misconfigured MESHTASTIC_FORWARD_TO that
+        # points at our own node would otherwise put a DM back on the air.
+        if cfg.target == my_node_id:
+            return ForwardDecision(False, False, "self_target")
+        if is_broadcast:
+            return ForwardDecision(False, False, "broadcast")
+        if sender in (cfg.target, my_node_id):
+            return ForwardDecision(False, False, "self")
 
         now = self._clock()
         sent = self._forwards.get(sender)
@@ -155,6 +168,8 @@ class ForwardGate:
         forward = len(sent) < cfg.forwards_per_hour
         if forward:
             sent.append(now)
+        else:
+            return ForwardDecision(False, False, "hourly_cap")
 
         # The notice says the message was forwarded, so it never goes out for
         # one the hourly cap held back. The cooldown starts only once the
@@ -182,6 +197,23 @@ class ForwardGate:
             self._last_reply.move_to_end(sender)
             while len(self._last_reply) > SENDER_LIMIT:
                 self._last_reply.popitem(last=False)
+
+    def forward_cancelled(self, sender: str) -> None:
+        """Undo the last recorded forward when its task never started."""
+        sent = self._forwards.get(sender)
+        if sent:
+            sent.pop()
+
+
+def send_reached_radio(success: bool, message_id: str | None, *, queued_id: str = "queued") -> bool:
+    """Whether a forward actually left the queue for the radio.
+
+    ``send()`` reports success for a message queued while disconnected
+    (``message_id == "queued"``); the auto-reply must not claim that message
+    was forwarded before it has gone out. ``queued_id`` lets the adapter pass
+    the canonical send-path marker instead of duplicating the literal.
+    """
+    return success and message_id != queued_id
 
 
 def confirmed_delivery(success: bool, raw_response: Any) -> bool:

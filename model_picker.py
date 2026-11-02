@@ -101,6 +101,9 @@ class ModelPicker:
         by number. With a single provider the menu starts at its models.
         """
         usable = [p for p in providers if _models(p)]
+        # A new /model attempt invalidates any older picker in this chat, even
+        # when there is nothing new to pick (Hermes then falls back to text).
+        self.close(chat_id)
         if not usable:
             return None
         pending = _Pending(
@@ -109,7 +112,6 @@ class ModelPicker:
             on_selected=on_selected,
             expires_at=self.clock() + PICKER_TTL_SECS,
         )
-        self._pending.pop(chat_id, None)
         self._pending[chat_id] = pending
         while len(self._pending) > PICKER_LIMIT:
             self._pending.pop(next(iter(self._pending)))
@@ -117,6 +119,14 @@ class ModelPicker:
             pending.provider = usable[0]
             return model_menu(usable[0], current_model)
         return provider_menu(usable, current_model)
+
+    def close(self, chat_id: str) -> None:
+        """Drop the pending picker for one chat, if any."""
+        self._pending.pop(chat_id, None)
+
+    def clear(self) -> None:
+        """Drop every pending picker (used when the link is torn down)."""
+        self._pending.clear()
 
     def answer(self, chat_id: str, text: str) -> PickerReply:
         """Route an inbound text from ``chat_id`` through its pending picker."""

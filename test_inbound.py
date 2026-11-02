@@ -464,6 +464,64 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.success)
 
+    async def test_model_picker_failed_menu_send_drops_pending_picker(self):
+        send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        self.adapter.send = send
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=[
+                {"slug": "local", "name": "localhost:8080", "models": ["qwen"], "is_current": True}
+            ],
+            current_model="qwen",
+            current_provider="local",
+            session_key="s",
+            on_model_selected=AsyncMock(),
+        )
+        self.assertFalse(result.success)
+        # Hermes falls back to the text list; the old menu must not stay armed.
+        self.assertFalse(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+
+    async def test_model_picker_switch_failure_reports_to_user(self):
+        send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="1"))
+        self.adapter.send = send
+        on_selected = AsyncMock(side_effect=RuntimeError("boom"))
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=[{"slug": "local", "name": "Local", "models": ["qwen"], "is_current": True}],
+            current_model="qwen",
+            current_provider="local",
+            session_key="s",
+            on_model_selected=on_selected,
+        )
+        self.assertTrue(result.success)
+        self.adapter._on_receive(self._owner_dm("1"), self.adapter.get_interfaces()[0])
+        await self._poll_calls(send, 2)
+        self.assertEqual(send.call_args.args[1], "Model switch failed; try again.")
+
+    async def test_model_picker_answer_is_processed_at_task_limit(self):
+        send, _ = await self._open_model_picker()
+        iface = self.adapter.get_interfaces()[0]
+        blocker = asyncio.create_task(asyncio.sleep(60))
+        self.adapter._message_tasks.add(blocker)
+        try:
+            with patch.object(self.adapter, "MESSAGE_TASK_LIMIT", 1):
+                self.adapter._on_receive(self._owner_dm("1"), iface)
+                await self._poll_calls(send, 2)
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+            self.adapter._message_tasks.discard(blocker)
+        # The picker reply is processed even at the inbound task cap, and the
+        # bare number is not also delivered to the agent.
+        self.assertTrue(send.call_args.args[1].startswith("localhost:8080"))
+        await self._assert_handle_message_never_called()
+
+    async def test_model_picker_state_is_cleared_on_disconnect(self):
+        await self._open_model_picker()
+        self.assertTrue(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+        await self.adapter.disconnect()
+        self.assertFalse(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node
@@ -627,6 +685,50 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         await self._poll_send_calls(send, 1)
         self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
         # The sender stays eligible for a notice with its next message.
+        self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
+        self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
+
+    async def test_forward_to_our_own_node_warns_once_and_sends_nothing(self):
+        iface = self.adapter.get_interfaces()[0]
+        my_node_id = self.adapter._get_interface_node_id(iface)
+        self.assertIsNotNone(my_node_id)
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=True, target=my_node_id)
+        )
+        send = AsyncMock()
+        self.adapter.send = send
+        with self.assertLogs("adapter", level="WARNING") as logs:
+            self.adapter._on_receive(self._stranger_dm(), iface)
+            self.adapter._on_receive(self._stranger_dm(), iface)
+        await self._poll_send_calls(send, 0)
+        self.assertEqual(
+            sum("MESHTASTIC_FORWARD_TO points at this node" in line for line in logs.output), 1
+        )
+
+    async def test_disabled_forwarding_does_not_warn_about_a_self_target(self):
+        iface = self.adapter.get_interfaces()[0]
+        my_node_id = self.adapter._get_interface_node_id(iface)
+        self.assertIsNotNone(my_node_id)
+        self.adapter._forward_gate = forwarding.ForwardGate(
+            forwarding.ForwardConfig(enabled=False, target=my_node_id)
+        )
+        send = AsyncMock()
+        self.adapter.send = send
+        with self.assertLogs("adapter", level="WARNING") as logs:
+            self.adapter._on_receive(self._stranger_dm(), iface)
+        await self._poll_send_calls(send, 0)
+        self.assertFalse(
+            any("MESHTASTIC_FORWARD_TO points at this node" in line for line in logs.output)
+        )
+
+    async def test_no_auto_reply_when_the_forward_was_only_queued(self):
+        send = self._enable_forwarding()
+        send.return_value = SendResult(success=True, message_id="queued")
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 1)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+        # Queued while disconnected is not "forwarded": no notice, and the
+        # sender remains eligible for one with its next message.
         self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
         self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
 
