@@ -423,15 +423,16 @@ async def handle_mesh_send_dm(args: dict, **kwargs) -> str:
             "and wait for node info to propagate."
         )
 
-    return json.dumps(
-        {
-            "success": res.success,
-            "message_id": res.message_id,
-            "error": error,
-            "target_node": target_node_id,
-        },
-        indent=2,
-    )
+    payload = {
+        "success": res.success,
+        "message_id": res.message_id,
+        "target_node": target_node_id,
+    }
+    # Only a real failure carries "error": Hermes reads any result containing
+    # that key — even "error": null — as a failed tool call.
+    if error:
+        payload["error"] = error
+    return json.dumps(payload, indent=2)
 
 
 async def handle_mesh_send_broadcast(args: dict, **kwargs) -> str:
@@ -477,9 +478,10 @@ async def handle_mesh_send_broadcast(args: dict, **kwargs) -> str:
     payload = {
         "success": res.success,
         "message_id": res.message_id,
-        "error": res.error,
         "channel": channel_query,
     }
+    if res.error:  # see handle_mesh_send_dm: a present "error" key reads as failure
+        payload["error"] = res.error
     if channel_index is not None:
         payload["channel_index"] = channel_index
     return json.dumps(payload, indent=2)

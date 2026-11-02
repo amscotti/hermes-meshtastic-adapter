@@ -715,10 +715,13 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         node = _make_node("!aaaa1111", "Alpha Node", "ALPH", user_extra={"publicKey": "0x1234"})
         self._install_nodes(_make_iface({"!aaaa1111": node}))
 
-        payload = json.loads(
-            await meshtastic_tools.handle_mesh_send_dm({"node_id": "!aaaa1111", "message": "hello"})
+        raw = await meshtastic_tools.handle_mesh_send_dm(
+            {"node_id": "!aaaa1111", "message": "hello"}
         )
+        payload = json.loads(raw)
         self.assertTrue(payload["success"])
+        # Hermes flags any tool result containing "error" (even null) as failed.
+        self.assertNotIn('"error"', raw)
         self.assertEqual(payload["message_id"], "msg-1")
         self.assertEqual(payload["target_node"], "!aaaa1111")
         self.assertEqual(self.adapter.send_calls, [("meshtastic:!aaaa1111", "hello")])
@@ -811,8 +814,10 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Parameters 'node_id' and 'message' are required.", payload["error"])
 
     async def test_send_broadcast_uses_channel_chat_id(self) -> None:
-        payload = json.loads(await meshtastic_tools.handle_mesh_send_broadcast({"message": "hi"}))
+        raw = await meshtastic_tools.handle_mesh_send_broadcast({"message": "hi"})
+        payload = json.loads(raw)
         self.assertEqual(payload["channel"], "0")
+        self.assertNotIn('"error"', raw)
         self.assertEqual(self.adapter.send_calls, [("meshtastic:channel:0", "hi")])
 
         payload = json.loads(
