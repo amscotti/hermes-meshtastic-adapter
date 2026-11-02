@@ -14,7 +14,6 @@ import socket
 import sys
 import threading
 import time
-import unicodedata
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import InvalidStateError as ConcurrentInvalidStateError
@@ -892,7 +891,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         decision = gate.decide(sender, is_broadcast=is_broadcast, my_node_id=my_node_id)
         target = gate.config.target
         if not decision.forward or target is None:
-            if gate.config.enabled and not is_broadcast:
+            if (
+                gate.config.enabled
+                and not is_broadcast
+                and target != my_node_id
+                and sender not in (target, my_node_id)
+            ):
                 logger.info("Not forwarding DM from %s: hourly forward limit reached", sender)
             return
         logger.info("Forwarding DM from unauthorized node %s to %s", sender, target)
@@ -927,8 +931,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
             if notice is None:
                 return
-            if not forwarded.success:
-                logger.info("No auto-reply to %s: forwarding to %s failed", sender, target)
+            if not forwarding.send_reached_radio(forwarded.success, forwarded.message_id):
+                reason = "queued while disconnected" if forwarded.success else "failed"
+                logger.info("No auto-reply to %s: forwarding to %s %s", sender, target, reason)
                 return
             await asyncio.sleep(forwarding.AUTO_REPLY_DELAY_SECS)
             delivered = await self._send_auto_reply(sender, notice)
@@ -1759,6 +1764,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 self._fail_pending_acks(reason="DISCONNECTED")
                 # Solicited waiters die with the link; abandon is idempotent.
                 self._abandon_response_waiters("disconnect")
+                # A pending /model picker must not survive into a new link.
+                self._model_picker.clear()
                 lifecycle_tasks = connection.teardown_task_list(
                     self._reconnect_tasks, self._queue_drain_task, self._incoming_consumer_task
                 )
@@ -1983,23 +1990,34 @@ class MeshtasticAdapter(BasePlatformAdapter):
         menu = self._model_picker.open(chat_id, providers, current_model, on_model_selected)
         if menu is None:
             return SendResult(success=False, error="No models to pick from")
-        return await self.send(chat_id, menu, metadata=metadata)
+        result = await self.send(chat_id, menu, metadata=metadata)
+        if not result.success:
+            # Hermes will fall back to its text list; a pending picker would
+            # otherwise swallow the user's next numeric message.
+            self._model_picker.close(chat_id)
+        return result
 
     def _answer_model_picker(self, chat_id: str, text: str) -> bool:
         """Handle ``text`` as a picker answer; True when it was one."""
         reply = self._model_picker.answer(chat_id, text)
         if not reply.handled:
             return False
-        task = asyncio.create_task(self._finish_model_pick(chat_id, reply))
-        self._message_tasks.add(task)
-        task.add_done_callback(self._handle_message_done)
+        if not self._spawn_send_task(self._finish_model_pick(chat_id, reply)):
+            # Under task pressure, let the text reach the agent instead of
+            # silently swallowing it.
+            self._model_picker.close(chat_id)
+            return False
         return True
 
     async def _finish_model_pick(self, chat_id: str, reply: Any) -> None:
         """Send the next menu, or run Hermes' switch and send its confirmation."""
         text = reply.text
         if reply.model is not None:
-            text = await reply.on_selected(chat_id, reply.model, reply.provider_slug)
+            try:
+                text = await reply.on_selected(chat_id, reply.model, reply.provider_slug)
+            except Exception as e:
+                logger.error("Model switch failed for %s: %s", chat_id, e, exc_info=True)
+                text = "Model switch failed; try again."
         if text:
             await self.send(chat_id, text)
 
@@ -2297,21 +2315,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a message, queueing if not connected; oversized payloads are chunked."""
         # Gateway tool-progress path bypasses format_tool_event and builds long
-        # verb+preview lines; compact those to a short emoji blurb before chunking.
-        # Only rewrite single-line chrome that starts with a symbol (emoji,
-        # Unicode category "So"). Anything else is a plausible single-line agent
-        # reply that _compact_tool_progress_line's " for " / ": " splits would
-        # mangle: ASCII punctuation (markdown bullets "-", "*", quotes, parens),
-        # a letter in any script (a Russian reply starts with a non-ASCII
-        # letter), and non-ASCII punctuation such as «, • or —.
-        # Adapter-composed messages (forwarding) opt out via meshtastic_verbatim.
-        verbatim = bool(metadata and metadata.get("meshtastic_verbatim"))
-        if not verbatim and content and "\n" not in content and content.strip():
-            lead = content.strip()[0]
-            if unicodedata.category(lead) == "So":
-                compacted = self._compact_tool_progress_line(content)
-                if compacted != content and len(compacted) < len(content):
-                    content = compacted
+        # verb+preview lines; compact those to a short emoji blurb before
+        # chunking. send_path decides what counts as chrome (single-line,
+        # emoji-led, not adapter-verbatim); everything else is delivered intact.
+        if send_path.is_tool_progress_chrome(content, metadata):
+            compacted = self._compact_tool_progress_line(content)
+            if compacted != content and len(compacted) < len(content):
+                content = compacted
         # reply_to is a prior packet id; only valid integer ids become threaded replies.
         reply_id = self._parse_reply_id(reply_to)
         wait_for_ack, ack_timeout = self._ack_wait_config(metadata)

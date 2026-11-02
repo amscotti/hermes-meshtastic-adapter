@@ -464,6 +464,53 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(result.success)
 
+    async def test_model_picker_failed_menu_send_drops_pending_picker(self):
+        send = AsyncMock(return_value=SendResult(success=False, error="offline"))
+        self.adapter.send = send
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=[
+                {"slug": "local", "name": "localhost:8080", "models": ["qwen"], "is_current": True}
+            ],
+            current_model="qwen",
+            current_provider="local",
+            session_key="s",
+            on_model_selected=AsyncMock(),
+        )
+        self.assertFalse(result.success)
+        # Hermes falls back to the text list; the old menu must not stay armed.
+        self.assertFalse(self.adapter._model_picker.answer("meshtastic:!ab12cd34", "1").handled)
+
+    async def test_model_picker_switch_failure_reports_to_user(self):
+        send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="1"))
+        self.adapter.send = send
+        on_selected = AsyncMock(side_effect=RuntimeError("boom"))
+        result = await self.adapter.send_model_picker(
+            chat_id="meshtastic:!ab12cd34",
+            providers=[{"slug": "local", "name": "Local", "models": ["qwen"], "is_current": True}],
+            current_model="qwen",
+            current_provider="local",
+            session_key="s",
+            on_model_selected=on_selected,
+        )
+        self.assertTrue(result.success)
+        self.adapter._on_receive(self._owner_dm("1"), self.adapter.get_interfaces()[0])
+        await self._poll_calls(send, 2)
+        self.assertEqual(send.call_args.args[1], "Model switch failed; try again.")
+
+    async def test_model_picker_task_pressure_lets_the_number_reach_the_agent(self):
+        await self._open_model_picker()
+        iface = self.adapter.get_interfaces()[0]
+
+        def drop(coro):
+            coro.close()  # the real helper closes a coroutine it cannot run
+            return False
+
+        with patch.object(self.adapter, "_spawn_send_task", side_effect=drop):
+            self.adapter._on_receive(self._owner_dm("1"), iface)
+        await self._poll_handle_message_calls(1)
+        self.assertEqual(self.adapter.handle_message.call_args[0][0].text, "1")
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node
@@ -627,6 +674,17 @@ class TestReceivePath(unittest.IsolatedAsyncioTestCase):
         await self._poll_send_calls(send, 1)
         self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
         # The sender stays eligible for a notice with its next message.
+        self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
+        self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
+
+    async def test_no_auto_reply_when_the_forward_was_only_queued(self):
+        send = self._enable_forwarding()
+        send.return_value = SendResult(success=True, message_id="queued")
+        self.adapter._on_receive(self._stranger_dm(), self.adapter.get_interfaces()[0])
+        await self._poll_send_calls(send, 1)
+        self.assertEqual(send.call_args.args[0], "meshtastic:!ab12cd34")
+        # Queued while disconnected is not "forwarded": no notice, and the
+        # sender remains eligible for one with its next message.
         self.assertEqual(self.adapter._forward_gate._reply_inflight, set())
         self.assertNotIn("!bad55555", self.adapter._forward_gate._last_reply)
 

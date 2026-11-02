@@ -93,6 +93,14 @@ class TestForwardGate(unittest.TestCase):
             self.assertFalse(decision.forward, sender)
             self.assertFalse(decision.auto_reply, sender)
 
+    def test_target_that_is_our_own_node_is_ignored(self) -> None:
+        # A misconfigured FORWARD_TO pointing at us must never put a DM back
+        # on the air (the notice would otherwise answer our own packet).
+        gate, _ = _gate()
+        decision = gate.decide("!stranger", is_broadcast=False, my_node_id="!0wner000")
+        self.assertFalse(decision.forward)
+        self.assertFalse(decision.auto_reply)
+
     def test_auto_reply_once_per_cooldown(self) -> None:
         gate, clock = _gate(reply_cooldown_secs=3600)
         self.assertTrue(gate.decide("!stranger", is_broadcast=False).auto_reply)
@@ -152,6 +160,13 @@ class TestForwardGate(unittest.TestCase):
         self.assertEqual(len(gate._forwards), forwarding.SENDER_LIMIT)
         self.assertEqual(len(gate._last_reply), forwarding.SENDER_LIMIT)
         self.assertEqual(gate._reply_inflight, set())
+
+
+class TestSendReachedRadio(unittest.TestCase):
+    def test_queued_send_is_not_a_forward(self) -> None:
+        self.assertFalse(forwarding.send_reached_radio(True, "queued"))
+        self.assertTrue(forwarding.send_reached_radio(True, "42"))
+        self.assertFalse(forwarding.send_reached_radio(False, None))
 
 
 class TestConfirmedDelivery(unittest.TestCase):

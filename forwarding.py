@@ -142,6 +142,10 @@ class ForwardGate:
         """Decide what to send for one unauthorized text and record it."""
         cfg = self._config
         nothing = ForwardDecision(forward=False, auto_reply=False)
+        # Never relay to ourselves: a misconfigured MESHTASTIC_FORWARD_TO that
+        # points at our own node would otherwise put a DM back on the air.
+        if cfg.target == my_node_id:
+            return nothing
         if not cfg.enabled or is_broadcast or sender in (cfg.target, my_node_id):
             return nothing
 
@@ -182,6 +186,16 @@ class ForwardGate:
             self._last_reply.move_to_end(sender)
             while len(self._last_reply) > SENDER_LIMIT:
                 self._last_reply.popitem(last=False)
+
+
+def send_reached_radio(success: bool, message_id: str | None) -> bool:
+    """Whether a forward actually left the queue for the radio.
+
+    ``send()`` reports success for a message queued while disconnected
+    (``message_id == "queued"``); the auto-reply must not claim that message
+    was forwarded before it has gone out.
+    """
+    return success and message_id != "queued"
 
 
 def confirmed_delivery(success: bool, raw_response: Any) -> bool:

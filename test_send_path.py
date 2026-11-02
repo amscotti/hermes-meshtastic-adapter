@@ -37,6 +37,32 @@ class TestChatIdParsing(unittest.TestCase):
         self.assertEqual(send_path.dest_from_chat_id(""), "")
 
 
+class TestToolProgressChrome(unittest.TestCase):
+    def test_emoji_led_single_line_is_chrome(self):
+        self.assertTrue(send_path.is_tool_progress_chrome("🔍 Searching the web"))
+        self.assertTrue(send_path.is_tool_progress_chrome("⚙️ tool_name: preview"))
+
+    def test_text_symbols_and_letters_are_not_chrome(self):
+        # So covers ©/®/°/™, but those are plausible reply leads, not chrome.
+        for lead in "©®°™":
+            with self.subTest(lead=lead):
+                self.assertFalse(send_path.is_tool_progress_chrome(f"{lead} 2026: full reply text"))
+        self.assertFalse(send_path.is_tool_progress_chrome("Погода: ясно"))
+        self.assertFalse(send_path.is_tool_progress_chrome("«Цитата: текст»"))
+
+    def test_multiline_and_empty_content_are_not_chrome(self):
+        self.assertFalse(send_path.is_tool_progress_chrome(""))
+        self.assertFalse(send_path.is_tool_progress_chrome("   "))
+        self.assertFalse(send_path.is_tool_progress_chrome("🔍 line one\nline two"))
+
+    def test_verbatim_metadata_opts_out(self):
+        self.assertFalse(
+            send_path.is_tool_progress_chrome("🔍 Searching the web", {"meshtastic_verbatim": True})
+        )
+        # A false/absent flag leaves normal chrome detection in place.
+        self.assertTrue(send_path.is_tool_progress_chrome("🔍 Searching the web", {}))
+
+
 class TestRetryConfig(unittest.TestCase):
     """Decision tables for the retry/attempt-budget computations."""
 

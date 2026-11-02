@@ -16,7 +16,8 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Any
 
@@ -36,6 +37,27 @@ AckStatus = ack_state.AckStatus
 DEFAULT_CHUNK_DELAY = 4.0
 # ACK timeout forced on when delivery retries are enabled without one.
 DEFAULT_RETRY_ACK_TIMEOUT = 30.0
+
+# Unicode category "So" also covers ordinary text symbols (©, ®, °, ™), which
+# can legitimately lead a one-line reply. They are not tool-progress chrome.
+NON_CHROME_SYMBOL_LEADS = frozenset("©®°™")
+
+
+def is_tool_progress_chrome(content: str, metadata: Mapping[str, Any] | None = None) -> bool:
+    """Whether single-line content is gateway tool-progress chrome to compact.
+
+    Chrome is a single line led by an emoji/symbol (Unicode ``So``), excluding
+    text symbols such as © and ®. Adapter-composed messages opt out with
+    ``metadata["meshtastic_verbatim"]``. Everything else is a plausible agent
+    reply and must be delivered intact.
+    """
+    if metadata and metadata.get("meshtastic_verbatim"):
+        return False
+    if not content or "\n" in content or not content.strip():
+        return False
+    lead = content.strip()[0]
+    return unicodedata.category(lead) == "So" and lead not in NON_CHROME_SYMBOL_LEADS
+
 
 # Canonical "no interface" token. The longer user-facing variants in the adapter
 # (``...; cannot wait for ACK`` / ``... and queueing disabled``) are built from

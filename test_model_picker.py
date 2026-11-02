@@ -48,6 +48,24 @@ class TestMenus(unittest.TestCase):
         self.assertIsNone(picker.open("c", PROVIDERS[2:], "qwen", CALLBACK))
         self.assertFalse(picker.answer("c", "1").handled)
 
+    def test_nothing_pickable_clears_the_previous_picker(self) -> None:
+        # A second /model that cannot build a menu must not leave the old
+        # menu armed to swallow the next numeric message.
+        picker, _ = _picker()
+        self.assertIsNotNone(picker.open("c", PROVIDERS, "qwen", CALLBACK))
+        self.assertIsNone(picker.open("c", PROVIDERS[2:], "qwen", CALLBACK))
+        self.assertFalse(picker.answer("c", "1").handled)
+
+    def test_close_and_clear_drop_pending_pickers(self) -> None:
+        picker, _ = _picker()
+        picker.open("c", PROVIDERS, "qwen", CALLBACK)
+        picker.close("c")
+        self.assertFalse(picker.answer("c", "1").handled)
+
+        picker.open("c", PROVIDERS, "qwen", CALLBACK)
+        picker.clear()
+        self.assertFalse(picker.answer("c", "1").handled)
+
 
 class TestAnswers(unittest.TestCase):
     def test_provider_then_model_selects(self) -> None:
