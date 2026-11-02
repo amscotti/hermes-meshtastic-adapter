@@ -4,8 +4,9 @@ Parses every import statement (including the ``try/except ImportError``
 dual-import pattern) in the repo's top-level ``.py`` modules and enforces the
 dependency direction:
 
-  (a) leaf modules (chunking, schemas, telemetry_db, node_freshness,
-      mock_interface) must NOT import any of the fourteen repo modules;
+  (a) leaf modules (chunking, forwarding, model_picker, schemas,
+      telemetry_db, node_freshness, mock_interface) must NOT import any of
+      the sixteen repo modules;
   (b) the eight mid-tier modules — ack_state, mesh_tools, inbound,
       mesh_helpers, send_path, connection, solicited, transport — must NOT
       import adapter (they take adapter state as parameters, never as
@@ -39,6 +40,7 @@ REPO_MODULES = {
     "telemetry_db",
     "chunking",
     "forwarding",
+    "model_picker",
     "mock_interface",
     "node_freshness",
     "transport",
@@ -49,6 +51,7 @@ REPO_MODULES = {
 LEAF_MODULES = {
     "chunking",
     "forwarding",
+    "model_picker",
     "schemas",
     "telemetry_db",
     "node_freshness",
